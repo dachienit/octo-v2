@@ -1,5 +1,5 @@
 import "@mariozechner/mini-lit/dist/ThemeToggle.js";
-import { CoreServiceChatPanel, CoreServiceClient, translations, type AuthUser, type SessionInfo, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTree } from "@mariozechner/pi-web-ui";
+import { CoreServiceChatPanel, CoreServiceClient, translations, type AuthUser, type SessionInfo, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTree } from "@octo/web-ui";
 import { setTranslations } from "@mariozechner/mini-lit";
 import { html, render } from "lit";
 import { icon } from "@mariozechner/mini-lit";

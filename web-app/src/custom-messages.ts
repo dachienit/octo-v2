@@ -1,7 +1,7 @@
 import { Alert } from "@mariozechner/mini-lit/dist/Alert.js";
 import type { Message } from "@octo/core";
-import type { AgentMessage, MessageRenderer } from "@mariozechner/pi-web-ui";
-import { defaultConvertToLlm, registerMessageRenderer } from "@mariozechner/pi-web-ui";
+import type { AgentMessage, MessageRenderer } from "@octo/web-ui";
+import { defaultConvertToLlm, registerMessageRenderer } from "@octo/web-ui";
 import { html } from "lit";
 
 // ============================================================================
