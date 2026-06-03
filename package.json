@@ -1,0 +1,16 @@
+{
+	"name": "octo-monorepo",
+	"private": true,
+	"workspaces": [
+		"core-agent",
+		"core-service",
+		"web-app",
+		"web-ui-component"
+	],
+	"overrides": {
+		"xlsx": "^0.18.5"
+	},
+	"dependencies": {
+		"undici": "^8.3.0"
+	}
+}

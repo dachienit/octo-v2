@@ -1,0 +1,43 @@
+{
+	"name": "@octo/core",
+	"version": "0.0.1",
+	"description": "Core agent \u2014 session management, agentic loop, and primitive tools",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"import": "./dist/index.js",
+			"types": "./dist/index.d.ts"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"scripts": {
+		"clean": "rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json",
+		"dev": "tsgo -p tsconfig.build.json --watch --preserveWatchOutput"
+	},
+	"dependencies": {
+		"@earendil-works/pi-agent-core": "^0.75.3",
+		"@earendil-works/pi-ai": "^0.75.3",
+		"@earendil-works/pi-coding-agent": "^0.75.3",
+		"typebox": "^1.0.0",
+		"diff": "^8.0.2"
+	},
+	"devDependencies": {
+		"@types/diff": "^7.0.2",
+		"@types/node": "^24.3.0",
+		"@typescript/native-preview": "^7.0.0-dev.20260120.1",
+		"typescript": "^5.7.3"
+	},
+	"keywords": [
+		"agent",
+		"ai"
+	],
+	"license": "MIT",
+	"engines": {
+		"node": ">=20.0.0"
+	}
+}
