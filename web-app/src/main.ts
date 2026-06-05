@@ -1,5 +1,5 @@
 import "@mariozechner/mini-lit/dist/ThemeToggle.js";
-import { CoreServiceChatPanel, CoreServiceClient, translations, type AuthUser, type SessionInfo, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTree } from "@octo/web-ui";
+import { CoreServiceChatPanel, CoreServiceClient, translations, type AuthUser, type SessionInfo, type SsoConfig, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTree } from "@octo/web-ui";
 import { setTranslations } from "@mariozechner/mini-lit";
 import { html, render } from "lit";
 import { icon } from "@mariozechner/mini-lit";
@@ -21,6 +21,7 @@ let currentUser: AuthUser | null = null;
 let userName = urlParams.get("userName") || "user";
 let authMode: "login" | "register" = "login";
 let authError = "";
+let ssoConfig: SsoConfig = { enabled: false }; //IYH1HC add
 let userMenuOpen = false;
 let providerDialogOpen = false;
 let workspaceSettingsDialogOpen = false;
@@ -211,6 +212,29 @@ async function newSession() {
 function toggleSidebar() {
 	sidebarOpen = !sidebarOpen;
 	renderApp();
+}
+
+//IYH1HC add: pick up the session token handed back by the SSO callback via the
+// URL hash fragment (kept out of server logs), then strip it from the address bar.
+function consumeSsoHash() {
+	if (!window.location.hash) return;
+	const params = new URLSearchParams(window.location.hash.slice(1));
+	const token = params.get("sso_token");
+	const error = params.get("sso_error");
+	if (token) {
+		authToken = token;
+		localStorage.setItem(authTokenKey, token);
+	}
+	if (error) authError = error;
+	if (token || error) {
+		window.history.replaceState(null, "", window.location.pathname + window.location.search);
+	}
+}
+
+//IYH1HC add: discover whether SSO is enabled so the login button can be shown.
+async function refreshSsoConfig() {
+	ssoConfig = await client.getSsoConfig();
+	if (!currentUser) renderApp();
 }
 
 async function initializeAuth() {
@@ -507,6 +531,20 @@ function formatTime(ms: number): string {
 	return `${Math.floor(diff / 86_400_000)}d ago`;
 }
 
+//IYH1HC add: render the user's avatar (GitHub SSO) with graceful fallback to the
+// default icon if there is no avatar or the image fails to load (e.g. off-network).
+function renderUserAvatar(sizeClass: string) {
+	if (currentUser?.avatarUrl) {
+		return html`<img
+			src=${currentUser.avatarUrl}
+			alt=${currentUser.displayName}
+			class="${sizeClass} rounded-full object-cover"
+			@error=${() => { if (currentUser) { currentUser = { ...currentUser, avatarUrl: undefined }; renderApp(); } }}
+		/>`;
+	}
+	return icon(CircleUser, "sm");
+}
+
 function renderUserMenu() {
 	if (!currentUser) return "";
 	return html`
@@ -514,16 +552,19 @@ function renderUserMenu() {
 			${Button({
 				variant: "ghost",
 				size: "icon",
-				children: icon(CircleUser, "sm"),
+				children: renderUserAvatar("h-6 w-6"), //IYH1HC add
 				onClick: () => { userMenuOpen = !userMenuOpen; renderApp(); },
 				title: "User menu",
 			})}
 			${userMenuOpen
 				? html`
 					<div class="absolute right-0 top-10 z-50 w-56 rounded border border-border bg-background shadow-lg">
-						<div class="border-b border-border px-3 py-2">
-							<div class="truncate text-sm font-medium">${currentUser.displayName}</div>
-							<div class="truncate text-xs text-muted-foreground">${currentUser.email}</div>
+						<div class="flex items-center gap-2 border-b border-border px-3 py-2">
+							${renderUserAvatar("h-8 w-8")}
+							<div class="min-w-0">
+								<div class="truncate text-sm font-medium">${currentUser.displayName}</div>
+								<div class="truncate text-xs text-muted-foreground">${currentUser.email}</div>
+							</div>
 						</div>
 						<button class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-accent" @click=${openProviderDialog}>
 							${icon(KeyRound, "xs")}
@@ -735,6 +776,22 @@ function renderApp() {
 						>
 							${authMode === "login" ? "Create an account" : "Use an existing account"}
 						</button>
+						${ssoConfig.enabled
+							? html`
+								<div class="flex items-center gap-2 my-1">
+									<div class="h-px flex-1 bg-border"></div>
+									<span class="text-xs text-muted-foreground">or</span>
+									<div class="h-px flex-1 bg-border"></div>
+								</div>
+								${Button({
+									variant: "outline",
+									size: "sm",
+									type: "button",
+									className: "w-full justify-center",
+									children: html`${icon(KeyRound, "xs")}<span>${`Sign in with ${ssoConfig.label ?? "SSO"}`}</span>`,
+									onClick: () => { window.location.href = client.ssoLoginHref(); },
+								})}`
+							: ""}
 					</form>
 				</div>
 			`,
@@ -895,5 +952,7 @@ function renderApp() {
 }
 
 // Initial render then load workspaces/sessions
+consumeSsoHash(); //IYH1HC add
+void refreshSsoConfig(); //IYH1HC add
 renderApp();
 void initializeAuth();

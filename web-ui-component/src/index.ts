@@ -1,9 +1,11 @@
 // Core service HTTP SSE adapter
 export {
 	CoreServiceClient,
+	type AuthUser,
 	type SseEvent,
 	type SessionInfo,
 	type SessionRecord,
+	type SsoConfig,
 	type WorkspaceInfo,
 	type WorkspaceSettings,
 	type WorkspaceTableRows,

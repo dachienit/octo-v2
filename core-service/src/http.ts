@@ -3,6 +3,7 @@ import { basename, extname, isAbsolute, join, resolve } from "path";
 import { getProviderAuthStatus, loginProvider } from "@octo/core";
 import express from "express";
 import { CoreServiceAuth } from "./auth.js";
+import { GithubSsoProvider, loadSsoConfig } from "./sso.js"; //IYH1HC add
 import * as log from "./log.js";
 import type { BotContext, BotHandler } from "./types.js";
 import { WorkspaceDatabase } from "./workspace-database.js";
@@ -143,6 +144,7 @@ export class HttpServer {
 	private workspaceStore: WorkspaceStore;
 	private auth: CoreServiceAuth;
 	private pendingAuthLogins = new Map<string, PendingAuthLogin>();
+	private sso: GithubSsoProvider | null; //IYH1HC add
 
 	constructor(config: { port: number; workingDir: string; handler: BotHandler; workspaceStore: WorkspaceStore }) {
 		this.port = config.port;
@@ -150,6 +152,10 @@ export class HttpServer {
 		this.handler = config.handler;
 		this.workspaceStore = config.workspaceStore;
 		this.auth = new CoreServiceAuth(config.workingDir);
+		//IYH1HC add: build the SSO provider from env (null when SSO is disabled).
+		const ssoConfig = loadSsoConfig();
+		this.sso = ssoConfig ? new GithubSsoProvider(ssoConfig) : null;
+		if (this.sso) log.logInfo(`SSO enabled: ${ssoConfig?.provider} (${ssoConfig?.label})`);
 	}
 
 	start(): void {
@@ -175,6 +181,11 @@ export class HttpServer {
 		app.post("/auth/login", (req, res, next) => this.auth.login(req, res, next));
 		app.get("/auth/me", (req, res, next) => this.auth.requireAuth(req, res, next), (req, res) => this.auth.me(req, res));
 		app.post("/auth/logout", (req, res, next) => this.auth.requireAuth(req, res, next), (req, res) => this.auth.logout(req, res));
+
+		//IYH1HC add: external SSO (GHES) — public endpoints, must be before requireAuth.
+		app.get("/auth/sso/config", (req, res) => this.handleSsoConfig(req, res));
+		app.get("/auth/sso/login", (req, res) => this.handleSsoLogin(req, res));
+		app.get("/auth/sso/callback", (req, res) => { void this.handleSsoCallback(req, res); });
 
 		app.use((req, res, next) => this.auth.requireAuth(req, res, next));
 		app.use("/artifacts", express.static(artifactsDir, { fallthrough: false }));
@@ -262,6 +273,50 @@ export class HttpServer {
 		const userId = this.getUserId(req);
 		const status = getProviderAuthStatus(this.getUserAuthFilePath(userId), "openai-codex");
 		res.json({ provider: "openai-codex", configured: status.configured, source: status.source, label: status.label });
+	}
+
+	//IYH1HC add: public SSO config so the web app knows whether to show the button.
+	private handleSsoConfig(_req: express.Request, res: express.Response): void {
+		if (!this.sso) {
+			res.json({ enabled: false });
+			return;
+		}
+		res.json({ enabled: true, provider: this.sso.config.provider, label: this.sso.config.label, loginUrl: "/auth/sso/login" });
+	}
+
+	//IYH1HC add: start the SSO flow — redirect the browser to the GHES authorize URL.
+	private handleSsoLogin(_req: express.Request, res: express.Response): void {
+		if (!this.sso) {
+			res.status(404).json({ error: "SSO is not enabled" });
+			return;
+		}
+		res.redirect(this.sso.createAuthorizeUrl());
+	}
+
+	//IYH1HC add: SSO callback — validate state, exchange code, upsert the federated
+	// user, issue the standard session token, and hand it to the web app via the URL
+	// hash fragment (not logged server-side) alongside the HttpOnly cookie.
+	private async handleSsoCallback(req: express.Request, res: express.Response): Promise<void> {
+		if (!this.sso) {
+			res.status(404).json({ error: "SSO is not enabled" });
+			return;
+		}
+		const redirectBase = this.sso.config.postLoginRedirect;
+		try {
+			const code = String(req.query.code ?? "");
+			const state = req.query.state ? String(req.query.state) : undefined;
+			if (req.query.error) throw new Error(String(req.query.error_description || req.query.error));
+			if (!code) throw new Error("Missing authorization code");
+			if (!this.sso.consumeState(state)) throw new Error("Invalid or expired state");
+
+			const identity = await this.sso.resolveIdentity(code);
+			const session = this.auth.completeFederatedLogin(res, identity);
+			res.redirect(`${redirectBase}/#sso_token=${encodeURIComponent(session.token)}`);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			log.logWarning("[sso] callback failed", message);
+			res.redirect(`${redirectBase}/#sso_error=${encodeURIComponent(message)}`);
+		}
 	}
 
 	private async handleCodexLogin(req: express.Request, res: express.Response): Promise<void> {

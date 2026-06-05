@@ -10,6 +10,7 @@ export interface AuthUser {
 	id: string;
 	email: string;
 	displayName: string;
+	avatarUrl?: string; //IYH1HC add: profile picture (e.g. GitHub avatar from SSO)
 }
 
 declare global {
@@ -25,6 +26,7 @@ type UserRow = {
 	password_hash: string;
 	password_salt: string;
 	created_at: string;
+	avatar_url?: string | null; //IYH1HC add
 };
 
 type TokenUserRow = {
@@ -32,6 +34,7 @@ type TokenUserRow = {
 	email: string;
 	display_name: string | null;
 	expires_at: string;
+	avatar_url?: string | null; //IYH1HC add
 };
 
 function createId(prefix: string): string {
@@ -54,11 +57,12 @@ function hashToken(token: string): string {
 	return createHash("sha256").update(token).digest("base64url");
 }
 
-function toAuthUser(row: Pick<UserRow, "id" | "email" | "display_name">): AuthUser {
+function toAuthUser(row: Pick<UserRow, "id" | "email" | "display_name"> & { avatar_url?: string | null }): AuthUser {
 	return {
 		id: row.id,
 		email: row.email,
 		displayName: row.display_name || row.email,
+		avatarUrl: row.avatar_url || undefined, //IYH1HC add
 	};
 }
 
@@ -103,7 +107,27 @@ export class AuthStore {
 			);
 			CREATE INDEX IF NOT EXISTS idx_auth_tokens_user_id ON auth_tokens(user_id);
 			CREATE INDEX IF NOT EXISTS idx_auth_tokens_expires_at ON auth_tokens(expires_at);
+			-- IYH1HC add: external identity providers (e.g. GHES SSO) mapped to local users.
+			-- SSO users live in the users table with empty password hash/salt (never password-loginnable).
+			CREATE TABLE IF NOT EXISTS federated_identities (
+				provider TEXT NOT NULL,
+				subject TEXT NOT NULL,
+				user_id TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				PRIMARY KEY (provider, subject),
+				FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+			);
+			CREATE INDEX IF NOT EXISTS idx_federated_identities_user_id ON federated_identities(user_id);
 		`);
+		this.ensureColumn("users", "avatar_url", "TEXT"); //IYH1HC add
+	}
+
+	//IYH1HC add: idempotent column migration for the already-created `users` table.
+	private ensureColumn(table: string, column: string, type: string): void {
+		const cols = this.all<{ name: string }>(`PRAGMA table_info(${table})`);
+		if (!cols.some((c) => c.name === column)) {
+			this.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+		}
 	}
 
 	userCount(): number {
@@ -132,7 +156,7 @@ export class AuthStore {
 
 	findUserByEmail(email: string): UserRow | undefined {
 		return this.all<UserRow>(`
-			SELECT id, email, display_name, password_hash, password_salt, created_at
+			SELECT id, email, display_name, password_hash, password_salt, created_at, avatar_url
 			FROM users
 			WHERE email = ${sqlString(normalizeEmail(email))}
 			LIMIT 1
@@ -141,7 +165,7 @@ export class AuthStore {
 
 	findUserById(id: string): AuthUser | undefined {
 		const row = this.all<UserRow>(`
-			SELECT id, email, display_name, password_hash, password_salt, created_at
+			SELECT id, email, display_name, password_hash, password_salt, created_at, avatar_url
 			FROM users
 			WHERE id = ${sqlString(id)}
 			LIMIT 1
@@ -173,7 +197,7 @@ export class AuthStore {
 	getUserByToken(token: string): AuthUser | undefined {
 		const tokenHash = hashToken(token);
 		const row = this.all<TokenUserRow>(`
-			SELECT users.id, users.email, users.display_name, auth_tokens.expires_at
+			SELECT users.id, users.email, users.display_name, users.avatar_url, auth_tokens.expires_at
 			FROM auth_tokens
 			JOIN users ON users.id = auth_tokens.user_id
 			WHERE auth_tokens.token_hash = ${sqlString(tokenHash)}
@@ -189,6 +213,57 @@ export class AuthStore {
 
 	revokeToken(token: string): void {
 		this.run(`DELETE FROM auth_tokens WHERE token_hash = ${sqlString(hashToken(token))}`);
+	}
+
+	//IYH1HC add: find a user previously linked to an external identity.
+	findUserByFederated(provider: string, subject: string): AuthUser | undefined {
+		const row = this.all<{ user_id: string }>(`
+			SELECT user_id FROM federated_identities
+			WHERE provider = ${sqlString(provider)} AND subject = ${sqlString(subject)}
+			LIMIT 1
+		`)[0];
+		return row ? this.findUserById(row.user_id) : undefined;
+	}
+
+	//IYH1HC add: resolve (or provision) the local user for an external SSO identity.
+	// Resolution order: (1) existing federated link, (2) link to an existing user
+	// with the same email (corporate email is trusted/verified), (3) create a new
+	// SSO-only user (empty password hash/salt → cannot password-login).
+	upsertFederatedUser(opts: { provider: string; subject: string; email: string; displayName?: string; avatarUrl?: string }): AuthUser {
+		const provider = opts.provider;
+		const subject = opts.subject;
+		const email = normalizeEmail(opts.email || "");
+		const avatarUrl = opts.avatarUrl; //IYH1HC add
+
+		const createdAt = new Date().toISOString();
+		let userId: string;
+		const linked = this.findUserByFederated(provider, subject);
+		if (linked) {
+			userId = linked.id;
+		} else {
+			const existing = email ? this.findUserByEmail(email) : undefined;
+			if (existing) {
+				userId = existing.id;
+			} else {
+				userId = createId("u");
+				const displayName = opts.displayName?.trim() || email || subject;
+				this.run(`
+					INSERT INTO users (id, email, display_name, password_hash, password_salt, created_at, avatar_url)
+					VALUES (${sqlString(userId)}, ${sqlString(email || `${subject}@${provider}`)}, ${sqlString(displayName)}, '', '', ${sqlString(createdAt)}, ${avatarUrl ? sqlString(avatarUrl) : "NULL"})
+				`);
+			}
+			this.run(`
+				INSERT INTO federated_identities (provider, subject, user_id, created_at)
+				VALUES (${sqlString(provider)}, ${sqlString(subject)}, ${sqlString(userId)}, ${sqlString(createdAt)})
+			`);
+		}
+
+		//IYH1HC add: refresh the avatar on every login so it stays current.
+		if (avatarUrl) {
+			this.run(`UPDATE users SET avatar_url = ${sqlString(avatarUrl)} WHERE id = ${sqlString(userId)}`);
+		}
+
+		return this.findUserById(userId) ?? { id: userId, email, displayName: opts.displayName || email, avatarUrl };
 	}
 }
 
@@ -239,6 +314,19 @@ export class CoreServiceAuth {
 			this.setAuthCookie(res, session.token, session.expiresAt);
 			res.json({ user, token: session.token, expiresAt: session.expiresAt });
 		})(req, res, next);
+	}
+
+	//IYH1HC add: complete an external SSO login — upsert the user, issue the
+	// standard opaque session token, and set the auth cookie. Used by the SSO
+	// callback so the rest of the app keeps using bearer/cookie auth unchanged.
+	completeFederatedLogin(
+		res: express.Response,
+		identity: { provider: string; subject: string; email: string; displayName?: string; avatarUrl?: string },
+	): { user: AuthUser; token: string; expiresAt: string } {
+		const user = this.store.upsertFederatedUser(identity);
+		const session = this.store.createToken(user.id);
+		this.setAuthCookie(res, session.token, session.expiresAt);
+		return { user, token: session.token, expiresAt: session.expiresAt };
 	}
 
 	logout(req: express.Request, res: express.Response): void {

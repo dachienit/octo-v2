@@ -12,6 +12,15 @@ export type AuthUser = {
 	id: string;
 	email: string;
 	displayName: string;
+	avatarUrl?: string; // IYH1HC add: profile picture (GitHub avatar from SSO)
+};
+
+// IYH1HC add: external SSO (GHES) config exposed to the web app.
+export type SsoConfig = {
+	enabled: boolean;
+	provider?: string;
+	label?: string;
+	loginUrl?: string;
 };
 
 export type ProviderAuthStatus = {
@@ -175,6 +184,22 @@ export class CoreServiceClient {
 		} catch {
 			return null;
 		}
+	}
+
+	// IYH1HC add: read SSO availability (public endpoint).
+	async getSsoConfig(): Promise<SsoConfig> {
+		try {
+			const response = await this.fetch("/auth/sso/config");
+			if (!response.ok) return { enabled: false };
+			return await response.json() as SsoConfig;
+		} catch {
+			return { enabled: false };
+		}
+	}
+
+	// IYH1HC add: full-page navigation target that starts the SSO flow.
+	ssoLoginHref(): string {
+		return `${this.baseUrl}/auth/sso/login`;
 	}
 
 	async getCodexAuthStatus(): Promise<ProviderAuthStatus | null> {
