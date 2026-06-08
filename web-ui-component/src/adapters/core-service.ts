@@ -46,6 +46,30 @@ export type ProviderLoginStatus = {
 	createdAt: number;
 };
 
+// IYH1HC add: per-user LLM provider key + model selection.
+export type LlmModelOption = {
+	id: string;
+	name: string;
+	active: boolean;
+};
+
+export type LlmProviderConfig = {
+	id: string;
+	label: string;
+	hasKey: boolean;
+	models: LlmModelOption[];
+};
+
+export type LlmConfig = {
+	providers: LlmProviderConfig[];
+};
+
+export type ActiveModel = {
+	provider: string;
+	modelId: string;
+	label: string;
+};
+
 export type WorkspaceNode = {
 	name: string;
 	path: string;
@@ -241,12 +265,71 @@ export class CoreServiceClient {
 		if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
 	}
 
-	async *chat(channelId: string, text: string, userName?: string, signal?: AbortSignal, attachments?: AttachmentPayload[]): AsyncGenerator<SseEvent> {
+	// IYH1HC add: read per-provider config (key presence + model list with active flags).
+	async getLlmConfig(): Promise<LlmConfig> {
+		try {
+			const response = await this.fetch("/llm/config");
+			if (!response.ok) return { providers: [] };
+			return await response.json() as LlmConfig;
+		} catch {
+			return { providers: [] };
+		}
+	}
+
+	// IYH1HC add: flat list of active models across providers (for the chatbox listbox).
+	async getActiveModels(): Promise<ActiveModel[]> {
+		try {
+			const response = await this.fetch("/llm/active-models");
+			if (!response.ok) return [];
+			const data = await response.json() as { models?: ActiveModel[] };
+			return data.models ?? [];
+		} catch {
+			return [];
+		}
+	}
+
+	// IYH1HC add: store (encrypt server-side) the API key for a provider.
+	async saveProviderKey(provider: string, apiKey: string): Promise<boolean> {
+		const response = await this.fetch(`/llm/providers/${encodeURIComponent(provider)}/key`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ apiKey }),
+		});
+		if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+		return true;
+	}
+
+	// IYH1HC add: forget the stored API key for a provider.
+	async deleteProviderKey(provider: string): Promise<boolean> {
+		const response = await this.fetch(`/llm/providers/${encodeURIComponent(provider)}/key`, { method: "DELETE" });
+		if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+		return true;
+	}
+
+	// IYH1HC add: replace the active-model set for a provider.
+	async setActiveModels(provider: string, modelIds: string[]): Promise<boolean> {
+		const response = await this.fetch(`/llm/providers/${encodeURIComponent(provider)}/models`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ modelIds }),
+		});
+		if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+		return true;
+	}
+
+	async *chat(
+		channelId: string,
+		text: string,
+		userName?: string,
+		signal?: AbortSignal,
+		attachments?: AttachmentPayload[],
+		model?: { provider: string; modelId: string }, //IYH1HC add: per-run model override
+	): AsyncGenerator<SseEvent> {
 		const userQuery = userName ? `?userId=${encodeURIComponent(userName)}` : "";
 		const response = await this.fetch(`/sessions/${encodeURIComponent(channelId)}/messages${userQuery}`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ text, userName, attachments }),
+			body: JSON.stringify({ text, userName, attachments, model }), //IYH1HC comment: forward selected model
 			signal,
 		});
 

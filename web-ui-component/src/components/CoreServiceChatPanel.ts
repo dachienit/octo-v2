@@ -2,7 +2,7 @@ import { html, LitElement } from "lit";
 import { customElement, property, query, state } from "lit/decorators.js";
 import { createRef, ref } from "lit/directives/ref.js";
 import type { MessageEditor } from "./MessageEditor.js";
-import { CoreServiceClient, type AttachmentPayload, type SseEvent, type WorkspaceTableRows } from "../adapters/core-service.js";
+import { CoreServiceClient, type ActiveModel, type AttachmentPayload, type SseEvent, type WorkspaceTableRows } from "../adapters/core-service.js";
 import type { Attachment } from "../utils/attachment-utils.js";
 import "./MessageEditor.js";
 import "./SandboxedIframe.js";
@@ -285,6 +285,9 @@ export class CoreServiceChatPanel extends LitElement {
 	@state() private declare rightPanelTable: TableRef | null;
 	@state() private declare rightPanelArtifactUrl: string | null;
 	@state() private declare rightPanelWidth: number;
+	//IYH1HC add: active models for the listbox + the user's current selection.
+	@state() private declare activeModels: ActiveModel[];
+	@state() private declare selectedModel: string;
 
 	@query("message-editor") private declare _editor: MessageEditor;
 
@@ -310,6 +313,8 @@ export class CoreServiceChatPanel extends LitElement {
 		this.rightPanelTable = null;
 		this.rightPanelArtifactUrl = null;
 		this.rightPanelWidth = Number(sessionStorage.getItem("core-service-preview-width") || "") || 480;
+		this.activeModels = []; //IYH1HC add
+		this.selectedModel = localStorage.getItem("core-service-selected-model") || ""; //IYH1HC add
 	}
 
 	protected override createRenderRoot(): HTMLElement | DocumentFragment {
@@ -326,6 +331,56 @@ export class CoreServiceChatPanel extends LitElement {
 		this.style.height = "100%";
 		this.style.minHeight = "0";
 		this.loadHistory();
+		this.loadActiveModels(); //IYH1HC add
+	}
+
+	//IYH1HC add: fetch the user's active models; drop a stale selection if it vanished.
+	private async loadActiveModels() {
+		if (!this.client) return;
+		this.activeModels = await this.client.getActiveModels();
+		if (this.selectedModel && !this.activeModels.some((m) => `${m.provider}:${m.modelId}` === this.selectedModel)) {
+			this.selectedModel = "";
+			localStorage.removeItem("core-service-selected-model");
+		}
+	}
+
+	//IYH1HC add: public hook so the app shell can refresh the listbox right after the
+	// user edits active models in the LLM provider dialog (no full page reload needed).
+	async refreshActiveModels(): Promise<void> {
+		await this.loadActiveModels();
+		this.requestUpdate();
+	}
+
+	//IYH1HC add: parse the "provider:modelId" listbox value into a chat() model arg.
+	private parseSelectedModel(): { provider: string; modelId: string } | undefined {
+		if (!this.selectedModel) return undefined;
+		const found = this.activeModels.find((m) => `${m.provider}:${m.modelId}` === this.selectedModel);
+		return found ? { provider: found.provider, modelId: found.modelId } : undefined;
+	}
+
+	private onSelectModel(value: string) {
+		this.selectedModel = value;
+		if (value) localStorage.setItem("core-service-selected-model", value);
+		else localStorage.removeItem("core-service-selected-model");
+	}
+
+	//IYH1HC add: the model listbox shown next to the message editor.
+	private renderModelSelector() {
+		if (this.activeModels.length === 0) return html``;
+		return html`
+			<div class="flex items-center gap-2 px-1 pb-1">
+				<select
+					class="h-7 max-w-[16rem] rounded border border-border bg-background px-2 text-xs text-foreground"
+					.value=${this.selectedModel}
+					@change=${(e: Event) => this.onSelectModel((e.target as HTMLSelectElement).value)}
+				>
+					<option value="">Default model</option>
+					${this.activeModels.map((m) => html`
+						<option value=${`${m.provider}:${m.modelId}`}>${m.label} (${m.provider})</option>
+					`)}
+				</select>
+			</div>
+		`;
 	}
 
 	override disconnectedCallback() {
@@ -398,7 +453,7 @@ export class CoreServiceChatPanel extends LitElement {
 
 		this.abortController = new AbortController();
 		try {
-			for await (const event of this.client.chat(this.channelId, text, this.userName, this.abortController.signal, attachmentPayloads)) {
+			for await (const event of this.client.chat(this.channelId, text, this.userName, this.abortController.signal, attachmentPayloads, this.parseSelectedModel())) {
 				this.handleSseEvent(event);
 			}
 		} catch (err: any) {
@@ -474,6 +529,7 @@ export class CoreServiceChatPanel extends LitElement {
 								<div class="absolute inset-0 flex items-center justify-center px-6">
 									<div class="w-full max-w-3xl -translate-y-12">
 										<div class="text-center text-2xl md:text-3xl font-medium mb-8">What's can I help?</div>
+										${this.renderModelSelector()}
 										<message-editor
 											.isStreaming=${this.isStreaming}
 											.showAttachmentButton=${true}
@@ -497,6 +553,7 @@ export class CoreServiceChatPanel extends LitElement {
 								<!-- Input Area -->
 								<div class="mt-auto shrink-0">
 									<div class="max-w-3xl mx-auto px-2 pb-4">
+										${this.renderModelSelector()}
 										<message-editor
 											.isStreaming=${this.isStreaming}
 											.showAttachmentButton=${true}

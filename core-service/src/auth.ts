@@ -118,6 +118,23 @@ export class AuthStore {
 				FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 			);
 			CREATE INDEX IF NOT EXISTS idx_federated_identities_user_id ON federated_identities(user_id);
+			-- IYH1HC add: per-user LLM provider API keys (AES-256-GCM encrypted) and
+			-- the set of models each user marked active per provider.
+			CREATE TABLE IF NOT EXISTS provider_keys (
+				user_id TEXT NOT NULL,
+				provider TEXT NOT NULL,
+				encrypted_key TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (user_id, provider),
+				FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+			);
+			CREATE TABLE IF NOT EXISTS active_models (
+				user_id TEXT NOT NULL,
+				provider TEXT NOT NULL,
+				model_id TEXT NOT NULL,
+				PRIMARY KEY (user_id, provider, model_id),
+				FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+			);
 		`);
 		this.ensureColumn("users", "avatar_url", "TEXT"); //IYH1HC add
 	}
@@ -265,10 +282,79 @@ export class AuthStore {
 
 		return this.findUserById(userId) ?? { id: userId, email, displayName: opts.displayName || email, avatarUrl };
 	}
+
+	//IYH1HC add: store (or replace) the encrypted API key for a user/provider.
+	setProviderKey(userId: string, provider: string, encryptedKey: string): void {
+		const updatedAt = new Date().toISOString();
+		this.run(`
+			INSERT INTO provider_keys (user_id, provider, encrypted_key, updated_at)
+			VALUES (${sqlString(userId)}, ${sqlString(provider)}, ${sqlString(encryptedKey)}, ${sqlString(updatedAt)})
+			ON CONFLICT(user_id, provider) DO UPDATE SET
+				encrypted_key = excluded.encrypted_key,
+				updated_at = excluded.updated_at
+		`);
+	}
+
+	//IYH1HC add: whether the user has a key stored for a provider (no value leaked).
+	hasProviderKey(userId: string, provider: string): boolean {
+		const row = this.all<{ n: number }>(`
+			SELECT count(*) AS n FROM provider_keys
+			WHERE user_id = ${sqlString(userId)} AND provider = ${sqlString(provider)}
+		`)[0];
+		return Number(row?.n ?? 0) > 0;
+	}
+
+	//IYH1HC add: return the encrypted key blob (caller decrypts), or undefined.
+	getProviderKey(userId: string, provider: string): string | undefined {
+		const row = this.all<{ encrypted_key: string }>(`
+			SELECT encrypted_key FROM provider_keys
+			WHERE user_id = ${sqlString(userId)} AND provider = ${sqlString(provider)}
+			LIMIT 1
+		`)[0];
+		return row?.encrypted_key;
+	}
+
+	//IYH1HC add: remove a stored key.
+	deleteProviderKey(userId: string, provider: string): void {
+		this.run(`
+			DELETE FROM provider_keys
+			WHERE user_id = ${sqlString(userId)} AND provider = ${sqlString(provider)}
+		`);
+	}
+
+	//IYH1HC add: replace the active-model set for a user/provider (delete + re-insert).
+	setActiveModels(userId: string, provider: string, modelIds: string[]): void {
+		this.run(`
+			DELETE FROM active_models
+			WHERE user_id = ${sqlString(userId)} AND provider = ${sqlString(provider)}
+		`);
+		const unique = Array.from(new Set(modelIds.filter((id) => id && id.trim())));
+		for (const modelId of unique) {
+			this.run(`
+				INSERT OR IGNORE INTO active_models (user_id, provider, model_id)
+				VALUES (${sqlString(userId)}, ${sqlString(provider)}, ${sqlString(modelId)})
+			`);
+		}
+	}
+
+	//IYH1HC add: all active models for a user across providers.
+	getActiveModels(userId: string): Array<{ provider: string; modelId: string }> {
+		return this.all<{ provider: string; model_id: string }>(`
+			SELECT provider, model_id FROM active_models
+			WHERE user_id = ${sqlString(userId)}
+			ORDER BY provider, model_id
+		`).map((row) => ({ provider: row.provider, modelId: row.model_id }));
+	}
 }
 
 export class CoreServiceAuth {
 	private readonly store: AuthStore;
+
+	//IYH1HC add: expose the underlying store so the HTTP layer can read/write
+	// per-user provider keys and active models.
+	getStore(): AuthStore {
+		return this.store;
+	}
 
 	constructor(dataRoot: string) {
 		this.store = new AuthStore(dataRoot);

@@ -1,4 +1,7 @@
 export { CoreAgent, getMemory, loadSkills, formatSkillsForPrompt } from "./agent.js";
+//IYH1HC add: re-export pi-ai model registry so the service layer can list models
+// without depending on @earendil-works/pi-ai directly.
+export { getModels, getModel } from "@earendil-works/pi-ai";
 export { getProviderAuthStatus, loginProvider } from "./auth.js";
 export type {
 	CoreAgentAuthStatus,

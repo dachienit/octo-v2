@@ -100,14 +100,15 @@ export function createEditTool(executor: Executor): AgentTool<typeof editSchema>
 		execute: async (
 			_toolCallId: string,
 			{ path, oldText, newText }: { label: string; path: string; oldText: string; newText: string },
-			signal?: AbortSignal,
+			_signal?: AbortSignal,
 		) => {
-			const readResult = await executor.exec(`cat ${shellEscape(path)}`, { signal });
-			if (readResult.code !== 0) {
-				throw new Error(readResult.stderr || `File not found: ${path}`);
+			//IYH1HC add: read via the executor (Node fs on host, shell inside Docker) — cross-platform.
+			let content: string;
+			try {
+				content = (await executor.readFile(path)).toString("utf-8");
+			} catch (err) {
+				throw new Error(err instanceof Error ? err.message : `File not found: ${path}`);
 			}
-
-			const content = readResult.stdout;
 
 			if (!content.includes(oldText)) {
 				throw new Error(
@@ -131,12 +132,8 @@ export function createEditTool(executor: Executor): AgentTool<typeof editSchema>
 				);
 			}
 
-			const writeResult = await executor.exec(`printf '%s' ${shellEscape(newContent)} > ${shellEscape(path)}`, {
-				signal,
-			});
-			if (writeResult.code !== 0) {
-				throw new Error(writeResult.stderr || `Failed to write file: ${path}`);
-			}
+			//IYH1HC add: write via the executor — cross-platform, preserves Docker isolation.
+			await executor.writeFile(path, newContent);
 
 			return {
 				content: [
@@ -149,8 +146,4 @@ export function createEditTool(executor: Executor): AgentTool<typeof editSchema>
 			};
 		},
 	};
-}
-
-function shellEscape(s: string): string {
-	return `'${s.replace(/'/g, "'\\''")}'`;
 }

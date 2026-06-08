@@ -1,8 +1,9 @@
 import { Dirent, appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { basename, extname, isAbsolute, join, resolve } from "path";
-import { getProviderAuthStatus, loginProvider } from "@octo/core";
+import { getModel, getModels, getProviderAuthStatus, loginProvider } from "@octo/core"; //IYH1HC comment: added getModel/getModels
 import express from "express";
 import { CoreServiceAuth } from "./auth.js";
+import { decryptSecret, encryptSecret } from "./crypto.js"; //IYH1HC add
 import { GithubSsoProvider, loadSsoConfig } from "./sso.js"; //IYH1HC add
 import * as log from "./log.js";
 import type { BotContext, BotHandler } from "./types.js";
@@ -28,6 +29,14 @@ interface PendingAuthLogin {
 	rejectManualCode?: (err: Error) => void;
 }
 
+//IYH1HC add: providers that use the per-user key + model-selection flow.
+// (openai-codex keeps OAuth; sap-* keep service-key-from-env.)
+const LLM_KEY_PROVIDERS: ReadonlyArray<{ id: string; label: string }> = [
+	{ id: "openai", label: "OpenAI" },
+	{ id: "google", label: "Google Gemini" },
+	{ id: "anthropic", label: "Anthropic" },
+];
+
 const BINARY_MIME_TYPES: Record<string, string> = {
 	doc: "application/msword",
 	docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -48,8 +57,9 @@ function createHttpContext(opts: {
 	attachments?: Array<{ local: string }>;
 	userId?: string;
 	authFilePath?: string;
+	model?: { provider: string; modelId: string; apiKey?: string; baseUrl?: string; apiType?: string }; //IYH1HC add
 }): BotContext {
-	const { channelId, userName, text, ts, send, workingDir, attachments = [], userId = "web-user", authFilePath } = opts;
+	const { channelId, userName, text, ts, send, workingDir, attachments = [], userId = "web-user", authFilePath, model } = opts; //IYH1HC comment: added `model`
 
 	const logToFile = (entry: object) => {
 		const dir = join(workingDir, "sessions", channelId);
@@ -68,6 +78,7 @@ function createHttpContext(opts: {
 			attachments,
 		},
 		authFilePath,
+		model, //IYH1HC add
 		channelName: channelId,
 		channels: [{ id: channelId, name: channelId }],
 		users: [{ id: userId, userName, displayName: userName }],
@@ -166,7 +177,7 @@ export class HttpServer {
 		app.use((_req, res, next) => {
 			const origin = _req.header("Origin");
 			res.setHeader("Access-Control-Allow-Origin", origin || "*");
-			res.setHeader("Access-Control-Allow-Methods", "POST, GET, PATCH, OPTIONS");
+			res.setHeader("Access-Control-Allow-Methods", "POST, GET, PATCH, PUT, DELETE, OPTIONS"); //IYH1HC comment: added PUT/DELETE for LLM key endpoints
 			res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-User-Id, Authorization");
 			res.setHeader("Access-Control-Allow-Credentials", "true");
 			next();
@@ -201,6 +212,12 @@ export class HttpServer {
 		app.post("/auth/openai-codex/login", (req, res) => { void this.handleCodexLogin(req, res); });
 		app.get("/auth/openai-codex/login/:loginId", (req, res) => this.handleCodexLoginStatus(req, res));
 		app.post("/auth/openai-codex/login/:loginId/code", (req, res) => this.handleCodexLoginCode(req, res));
+		//IYH1HC add: per-user LLM provider key + active-model management.
+		app.get("/llm/config", (req, res) => this.handleLlmConfig(req, res));
+		app.get("/llm/active-models", (req, res) => this.handleLlmActiveModels(req, res));
+		app.put("/llm/providers/:provider/key", (req, res) => this.handleSetProviderKey(req, res));
+		app.delete("/llm/providers/:provider/key", (req, res) => this.handleDeleteProviderKey(req, res));
+		app.put("/llm/providers/:provider/models", (req, res) => this.handleSetActiveModels(req, res));
 		app.get("/workspaces/:workspaceId/sessions", (req, res) => this.handleWorkspaceSessions(req, res));
 		app.post("/workspaces/:workspaceId/sessions", (req, res) => this.handleCreateSession(req, res));
 		app.post("/sessions/:sessionId/messages", (req, res) => { void this.handleChat(req, res, req.params.sessionId); });
@@ -419,6 +436,102 @@ export class HttpServer {
 		res.json({ ok: true, status: "pending" });
 	}
 
+	// ==========================================================================
+	// IYH1HC add: per-user LLM provider key + model selection
+	// ==========================================================================
+
+	private isAllowedLlmProvider(provider: string): boolean {
+		return LLM_KEY_PROVIDERS.some((p) => p.id === provider);
+	}
+
+	private modelLabel(provider: string, modelId: string): string {
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const m = getModel(provider as any, modelId) as any;
+			if (m?.name) return String(m.name);
+		} catch { /* unknown model — fall back to id */ }
+		return modelId;
+	}
+
+	// GET /llm/config → per-provider { id, label, hasKey, models:[{id,name,active}] }. Never returns keys.
+	private handleLlmConfig(req: express.Request, res: express.Response): void {
+		const userId = this.getUserId(req);
+		const store = this.auth.getStore();
+		const active = new Set(store.getActiveModels(userId).map((m) => `${m.provider}:${m.modelId}`));
+		const providers = LLM_KEY_PROVIDERS.map((p) => {
+			let models: Array<{ id: string; name: string; active: boolean }> = [];
+			try {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				models = (getModels(p.id as any) as any[]).map((m) => ({
+					id: String(m.id),
+					name: String(m.name ?? m.id),
+					active: active.has(`${p.id}:${m.id}`),
+				}));
+			} catch { models = []; }
+			return { id: p.id, label: p.label, hasKey: store.hasProviderKey(userId, p.id), models };
+		});
+		res.json({ providers });
+	}
+
+	// GET /llm/active-models → flat [{ provider, modelId, label }] for the chatbox listbox.
+	private handleLlmActiveModels(req: express.Request, res: express.Response): void {
+		const userId = this.getUserId(req);
+		const models = this.auth.getStore().getActiveModels(userId).map((m) => ({
+			provider: m.provider,
+			modelId: m.modelId,
+			label: this.modelLabel(m.provider, m.modelId),
+		}));
+		res.json({ models });
+	}
+
+	// PUT /llm/providers/:provider/key  body { apiKey } → encrypt + store.
+	private handleSetProviderKey(req: express.Request, res: express.Response): void {
+		const provider = String(req.params.provider);
+		if (!this.isAllowedLlmProvider(provider)) {
+			res.status(400).json({ error: "Unsupported provider" });
+			return;
+		}
+		const { apiKey } = req.body as { apiKey?: string };
+		if (!apiKey || !apiKey.trim()) {
+			res.status(400).json({ error: "Missing apiKey" });
+			return;
+		}
+		try {
+			const encrypted = encryptSecret(apiKey.trim());
+			this.auth.getStore().setProviderKey(this.getUserId(req), provider, encrypted);
+			res.json({ ok: true, hasKey: true });
+		} catch (err) {
+			res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+
+	// DELETE /llm/providers/:provider/key → forget the stored key.
+	private handleDeleteProviderKey(req: express.Request, res: express.Response): void {
+		const provider = String(req.params.provider);
+		if (!this.isAllowedLlmProvider(provider)) {
+			res.status(400).json({ error: "Unsupported provider" });
+			return;
+		}
+		this.auth.getStore().deleteProviderKey(this.getUserId(req), provider);
+		res.json({ ok: true, hasKey: false });
+	}
+
+	// PUT /llm/providers/:provider/models  body { modelIds: string[] } → replace active set.
+	private handleSetActiveModels(req: express.Request, res: express.Response): void {
+		const provider = String(req.params.provider);
+		if (!this.isAllowedLlmProvider(provider)) {
+			res.status(400).json({ error: "Unsupported provider" });
+			return;
+		}
+		const { modelIds } = req.body as { modelIds?: unknown };
+		if (!Array.isArray(modelIds) || modelIds.some((id) => typeof id !== "string")) {
+			res.status(400).json({ error: "modelIds must be a string array" });
+			return;
+		}
+		this.auth.getStore().setActiveModels(this.getUserId(req), provider, modelIds as string[]);
+		res.json({ ok: true });
+	}
+
 	private handleWorkspaces(req: express.Request, res: express.Response): void {
 		const userId = this.getUserId(req);
 		this.workspaceStore.ensureDefaultWorkspace(userId);
@@ -508,11 +621,27 @@ export class HttpServer {
 
 	private async handleChat(req: express.Request, res: express.Response, routeSessionId?: string): Promise<void> {
 		type AttachmentPayload = { fileName: string; mimeType: string; content: string };
-		const { channelId, sessionId: bodySessionId, workspaceId, text, userName = "user", attachments = [] } = req.body as {
+		const { channelId, sessionId: bodySessionId, workspaceId, text, userName = "user", attachments = [], model: modelSel } = req.body as {
 			channelId?: string; sessionId?: string; workspaceId?: string; text?: string; userName?: string; attachments?: AttachmentPayload[];
+			model?: { provider?: string; modelId?: string }; //IYH1HC add
 		};
 		const sessionId = routeSessionId || bodySessionId || channelId;
 		const userId = this.getUserId(req, userName);
+
+		//IYH1HC add: resolve the per-run model override (decrypt the user's key here).
+		let resolvedModel: BotContext["model"];
+		if (modelSel?.provider && modelSel?.modelId && this.isAllowedLlmProvider(modelSel.provider)) {
+			const encrypted = this.auth.getStore().getProviderKey(userId, modelSel.provider);
+			let apiKey: string | undefined;
+			if (encrypted) {
+				try {
+					apiKey = decryptSecret(encrypted);
+				} catch (err) {
+					log.logWarning("[llm] failed to decrypt provider key", err instanceof Error ? err.message : String(err));
+				}
+			}
+			resolvedModel = { provider: modelSel.provider, modelId: modelSel.modelId, apiKey };
+		}
 
 		if (!sessionId || !text) {
 			res.status(400).json({ error: "Missing sessionId or text" });
@@ -564,6 +693,7 @@ export class HttpServer {
 			attachments: savedAttachments,
 			userId,
 			authFilePath: this.getUserAuthFilePath(userId),
+			model: resolvedModel, //IYH1HC add
 		});
 
 		appendFileSync(

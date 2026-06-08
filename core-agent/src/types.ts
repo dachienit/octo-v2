@@ -24,6 +24,12 @@ export interface CoreAgentRunInput {
 	systemPrompt: string;
 	/** User-specific auth JSON path for this run */
 	authFilePath?: string;
+	/**
+	 * IYH1HC add: per-run model override. When present, the agent runs this model
+	 * (resolved via pi-ai getModel, falling back to a stub) and uses `apiKey`
+	 * instead of the env/auth-file key. Absent → legacy env-driven behavior.
+	 */
+	model?: { provider: string; modelId: string; apiKey?: string; baseUrl?: string; apiType?: string };
 	/** Called by the attach tool — path is already translated to host path */
 	uploadFile?: (path: string, title?: string) => Promise<void>;
 	/** Per-run event callbacks */

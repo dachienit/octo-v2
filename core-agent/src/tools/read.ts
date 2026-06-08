@@ -38,16 +38,16 @@ export function createReadTool(executor: Executor): AgentTool<typeof readSchema>
 		execute: async (
 			_toolCallId: string,
 			{ path, offset, limit }: { label: string; path: string; offset?: number; limit?: number },
-			signal?: AbortSignal,
+			_signal?: AbortSignal,
 		): Promise<{ content: (TextContent | ImageContent)[]; details: ReadToolDetails | undefined }> => {
 			const mimeType = isImageFile(path);
 
+			//IYH1HC add: read the file once via the executor (Node fs on host, shell inside Docker).
+			// Replaces the POSIX-only base64/wc/cat/tail shell calls so this works on Windows host.
+			const buffer = await executor.readFile(path);
+
 			if (mimeType) {
-				const result = await executor.exec(`base64 < ${shellEscape(path)}`, { signal });
-				if (result.code !== 0) {
-					throw new Error(result.stderr || `Failed to read file: ${path}`);
-				}
-				const base64 = result.stdout.replace(/\s/g, "");
+				const base64 = buffer.toString("base64");
 				return {
 					content: [
 						{ type: "text", text: `Read image file [${mimeType}]` },
@@ -57,11 +57,10 @@ export function createReadTool(executor: Executor): AgentTool<typeof readSchema>
 				};
 			}
 
-			const countResult = await executor.exec(`wc -l < ${shellEscape(path)}`, { signal });
-			if (countResult.code !== 0) {
-				throw new Error(countResult.stderr || `Failed to read file: ${path}`);
-			}
-			const totalFileLines = Number.parseInt(countResult.stdout.trim(), 10) + 1;
+			//IYH1HC add: line accounting and offset/limit done in JS (cross-platform).
+			const fileContent = buffer.toString("utf-8");
+			const allLines = fileContent.split("\n");
+			const totalFileLines = allLines.length;
 
 			const startLine = offset ? Math.max(1, offset) : 1;
 			const startLineDisplay = startLine;
@@ -70,27 +69,16 @@ export function createReadTool(executor: Executor): AgentTool<typeof readSchema>
 				throw new Error(`Offset ${offset} is beyond end of file (${totalFileLines} lines total)`);
 			}
 
-			let cmd: string;
-			if (startLine === 1) {
-				cmd = `cat ${shellEscape(path)}`;
-			} else {
-				cmd = `tail -n +${startLine} ${shellEscape(path)}`;
-			}
-
-			const result = await executor.exec(cmd, { signal });
-			if (result.code !== 0) {
-				throw new Error(result.stderr || `Failed to read file: ${path}`);
-			}
-
-			let selectedContent = result.stdout;
+			let selectedLines = allLines.slice(startLine - 1);
 			let userLimitedLines: number | undefined;
 
 			if (limit !== undefined) {
-				const lines = selectedContent.split("\n");
-				const endLine = Math.min(limit, lines.length);
-				selectedContent = lines.slice(0, endLine).join("\n");
+				const endLine = Math.min(limit, selectedLines.length);
+				selectedLines = selectedLines.slice(0, endLine);
 				userLimitedLines = endLine;
 			}
+
+			const selectedContent = selectedLines.join("\n");
 
 			const truncation = truncateHead(selectedContent);
 
@@ -130,8 +118,4 @@ export function createReadTool(executor: Executor): AgentTool<typeof readSchema>
 			return { content: [{ type: "text", text: outputText }], details };
 		},
 	};
-}
-
-function shellEscape(s: string): string {
-	return `'${s.replace(/'/g, "'\\''")}'`;
 }

@@ -18,15 +18,11 @@ export function createWriteTool(executor: Executor): AgentTool<typeof writeSchem
 		execute: async (
 			_toolCallId: string,
 			{ path, content }: { label: string; path: string; content: string },
-			signal?: AbortSignal,
+			_signal?: AbortSignal,
 		) => {
-			const dir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : ".";
-			const cmd = `mkdir -p ${shellEscape(dir)} && printf '%s' ${shellEscape(content)} > ${shellEscape(path)}`;
-
-			const result = await executor.exec(cmd, { signal });
-			if (result.code !== 0) {
-				throw new Error(result.stderr || `Failed to write file: ${path}`);
-			}
+			//IYH1HC add: write via the executor (Node fs on host, shell inside Docker).
+			// Creates parent directories; cross-platform (replaces POSIX mkdir -p && printf).
+			await executor.writeFile(path, content);
 
 			return {
 				content: [{ type: "text", text: `Successfully wrote ${content.length} bytes to ${path}` }],
@@ -34,8 +30,4 @@ export function createWriteTool(executor: Executor): AgentTool<typeof writeSchem
 			};
 		},
 	};
-}
-
-function shellEscape(s: string): string {
-	return `'${s.replace(/'/g, "'\\''")}'`;
 }

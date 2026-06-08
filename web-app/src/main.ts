@@ -1,5 +1,5 @@
 import "@mariozechner/mini-lit/dist/ThemeToggle.js";
-import { CoreServiceChatPanel, CoreServiceClient, translations, type AuthUser, type SessionInfo, type SsoConfig, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTree } from "@octo/web-ui";
+import { CoreServiceChatPanel, CoreServiceClient, translations, type AuthUser, type LlmConfig, type SessionInfo, type SsoConfig, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTree } from "@octo/web-ui";
 import { setTranslations } from "@mariozechner/mini-lit";
 import { html, render } from "lit";
 import { icon } from "@mariozechner/mini-lit";
@@ -33,6 +33,15 @@ let codexLoginUrl = "";
 let codexLoginCode = "";
 let codexAuthError = "";
 let codexAuthBusy = false;
+//IYH1HC add: per-user LLM key + model selection state for the provider dialog.
+let llmConfig: LlmConfig = { providers: [] };
+let llmConfigLoading = false;
+let providerKeyInput = "";
+let providerKeySaving = false;
+let providerKeyError = "";
+let providerSavedNotice = ""; //IYH1HC add: transient "Saved" confirmation
+let modelFilter = ""; //IYH1HC add: model list search box
+let apiKeysExpanded = false; //IYH1HC add: collapsible "API Keys" section state
 
 // App state
 let sidebarOpen = true;
@@ -298,7 +307,12 @@ function openProviderDialog() {
 	providerDialogOpen = true;
 	codexAuthError = "";
 	codexLoginCode = "";
+	providerKeyInput = ""; //IYH1HC add
+	providerKeyError = ""; //IYH1HC add
+	providerSavedNotice = ""; //IYH1HC add
+	modelFilter = ""; //IYH1HC add
 	void refreshCodexStatus();
+	void loadLlmConfig(); //IYH1HC add
 	renderApp();
 }
 
@@ -369,6 +383,11 @@ function setProvider(provider: string) {
 	selectedProvider = provider;
 	localStorage.setItem(providerKey, provider);
 	codexAuthError = "";
+	providerKeyInput = ""; //IYH1HC add
+	providerKeyError = ""; //IYH1HC add
+	providerSavedNotice = ""; //IYH1HC add
+	modelFilter = ""; //IYH1HC add
+	apiKeysExpanded = !llmConfig.providers.find((p) => p.id === provider)?.hasKey; //IYH1HC add
 	if (provider === "openai-codex") void refreshCodexStatus();
 	renderApp();
 }
@@ -377,6 +396,103 @@ async function refreshCodexStatus() {
 	const status = await client.getCodexAuthStatus();
 	codexConfigured = status?.configured === true;
 	renderApp();
+}
+
+//IYH1HC add: providers that use the key + model-selection flow (mirrors the backend allowlist).
+const LLM_KEY_PROVIDERS = new Set(["openai", "anthropic", "google"]);
+
+//IYH1HC add: load per-provider key/model config for the dialog.
+async function loadLlmConfig() {
+	llmConfigLoading = true;
+	providerKeyError = "";
+	renderApp();
+	llmConfig = await client.getLlmConfig();
+	llmConfigLoading = false;
+	//IYH1HC add: expand the API Keys section automatically when no key is stored yet.
+	apiKeysExpanded = !currentProviderConfig()?.hasKey;
+	renderApp();
+}
+
+function currentProviderConfig() {
+	return llmConfig.providers.find((p) => p.id === selectedProvider);
+}
+
+//IYH1HC add: forget the stored API key for the selected provider.
+async function deleteProviderKey() {
+	if (!LLM_KEY_PROVIDERS.has(selectedProvider)) return;
+	providerKeySaving = true;
+	providerKeyError = "";
+	providerSavedNotice = "";
+	renderApp();
+	try {
+		await client.deleteProviderKey(selectedProvider);
+		await loadLlmConfig();
+	} catch (err) {
+		providerKeyError = err instanceof Error ? err.message : String(err);
+	} finally {
+		providerKeySaving = false;
+		renderApp();
+	}
+}
+
+//IYH1HC add: models for the current provider matching the search box.
+function filteredModels() {
+	const provider = currentProviderConfig();
+	if (!provider) return [];
+	const q = modelFilter.trim().toLowerCase();
+	if (!q) return provider.models;
+	return provider.models.filter((m) => m.name.toLowerCase().includes(q) || m.id.toLowerCase().includes(q));
+}
+
+//IYH1HC add: toggle a model and auto-save immediately (no Save button). Optimistic
+// local update, then persist the full active set and refresh the chatbox listbox.
+async function toggleModelActive(modelId: string, active: boolean) {
+	const provider = currentProviderConfig();
+	if (!provider) return;
+	const model = provider.models.find((m) => m.id === modelId);
+	if (!model) return;
+	model.active = active;
+	providerKeyError = "";
+	providerSavedNotice = "";
+	renderApp();
+	try {
+		const activeIds = provider.models.filter((m) => m.active).map((m) => m.id);
+		await client.setActiveModels(selectedProvider, activeIds);
+		void chatPanel.refreshActiveModels();
+	} catch (err) {
+		model.active = !active; // revert on failure
+		providerKeyError = err instanceof Error ? err.message : String(err);
+		renderApp();
+	}
+}
+
+//IYH1HC add: persist the typed API key on Enter/blur (no Save button). No-op when empty.
+async function commitProviderKey() {
+	if (!LLM_KEY_PROVIDERS.has(selectedProvider) || !providerKeyInput.trim()) return;
+	providerKeySaving = true;
+	providerKeyError = "";
+	providerSavedNotice = "";
+	renderApp();
+	try {
+		await client.saveProviderKey(selectedProvider, providerKeyInput.trim());
+		providerKeyInput = "";
+		await loadLlmConfig();
+		providerSavedNotice = "Saved";
+	} catch (err) {
+		providerKeyError = err instanceof Error ? err.message : String(err);
+	} finally {
+		providerKeySaving = false;
+		renderApp();
+	}
+}
+
+//IYH1HC add: API-key toggle handler. On → save typed key (no-op if empty); off → forget key.
+async function toggleProviderKey(enabled: boolean) {
+	if (enabled) {
+		await commitProviderKey();
+	} else {
+		await deleteProviderKey();
+	}
 }
 
 async function startCodexLogin() {
@@ -586,13 +702,14 @@ function renderProviderDialog() {
 	const providers = [
 		{ id: "openai-codex", label: "Codex" },
 		{ id: "openai", label: "OpenAI" },
+		{ id: "google", label: "Google Gemini" }, //IYH1HC add
 		{ id: "anthropic", label: "Anthropic" },
 		{ id: "sap-openai", label: "SAP OpenAI" },
 		{ id: "sap-claude", label: "SAP Claude" },
 	];
 	return html`
 		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4" @click=${closeProviderDialog}>
-			<div class="w-full max-w-md rounded border border-border bg-background shadow-xl" @click=${(e: Event) => e.stopPropagation()}>
+			<div class="w-full max-w-[34rem] rounded border border-border bg-background shadow-xl" @click=${(e: Event) => e.stopPropagation()}>
 				<div class="flex items-center justify-between border-b border-border px-4 py-3">
 					<div class="text-sm font-semibold">LLM provider</div>
 					${Button({ variant: "ghost", size: "icon", children: icon(X, "xs"), onClick: closeProviderDialog, title: "Close" })}
@@ -602,10 +719,9 @@ function renderProviderDialog() {
 						<span class="text-xs font-medium text-muted-foreground">Provider</span>
 						<select
 							class="h-9 rounded border border-border bg-background px-2 text-sm"
-							.value=${selectedProvider}
 							@change=${(e: Event) => setProvider((e.target as HTMLSelectElement).value)}
 						>
-							${providers.map((provider) => html`<option value=${provider.id}>${provider.label}</option>`)}
+							${providers.map((provider) => html`<option value=${provider.id} ?selected=${provider.id === selectedProvider}>${provider.label}</option>`)}
 						</select>
 					</label>
 
@@ -649,8 +765,141 @@ function renderProviderDialog() {
 							</div>
 						`
 						: ""}
+
+					${LLM_KEY_PROVIDERS.has(selectedProvider) ? renderLlmKeyAndModels() : ""}
 				</div>
 			</div>
+		</div>
+	`;
+}
+
+//IYH1HC add: local pill toggle. mini-lit's Switch uses `data-[state=checked]:bg-primary`
+// classes that live in node_modules and aren't scanned by the web-app Tailwind build,
+// so they never get the color. We render the toggle inline with first-party classes.
+function pillToggle(checked: boolean, onChange: (checked: boolean) => void, disabled = false) {
+	return html`
+		<button
+			type="button"
+			role="switch"
+			aria-checked=${checked ? "true" : "false"}
+			?disabled=${disabled}
+			class="relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border-2 border-transparent transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${checked ? "bg-green-600" : "bg-gray-300 dark:bg-gray-600"}"
+			@click=${() => { if (!disabled) onChange(!checked); }}
+		>
+			<span class="inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${checked ? "translate-x-5" : "translate-x-0"}"></span>
+		</button>
+	`;
+}
+
+//IYH1HC add: provider setup — toggle-switch model list (search) + collapsible
+// API Keys section. Everything auto-saves: flipping a model toggle persists the
+// active set; typing a key + Enter/blur (or flipping the key toggle on) stores it.
+function renderLlmKeyAndModels() {
+	const provider = currentProviderConfig();
+	const hasKey = provider?.hasKey === true;
+	const label = provider?.label ?? selectedProvider;
+	const allModels = provider?.models ?? [];
+	const visible = filteredModels();
+	const enabledCount = allModels.filter((m) => m.active).length;
+
+	const keyDocsUrl = selectedProvider === "google"
+		? "https://aistudio.google.com/apikey"
+		: selectedProvider === "openai"
+			? "https://platform.openai.com/api-keys"
+			: "https://console.anthropic.com/settings/keys";
+
+	return html`
+		<div class="flex flex-col gap-3">
+			<!-- Models -->
+			<div class="rounded-lg border border-border">
+				<div class="flex items-center gap-2 px-3 py-2">
+					<span class="text-sm font-semibold">Models</span>
+					<span class="text-xs text-muted-foreground">${enabledCount} enabled</span>
+					<button
+						type="button"
+						class="ml-auto flex h-7 w-7 items-center justify-center rounded hover:bg-accent disabled:opacity-50"
+						title="Refresh models"
+						?disabled=${llmConfigLoading}
+						@click=${() => void loadLlmConfig()}
+					>${icon(RefreshCw, "xs")}</button>
+				</div>
+				<div class="px-3 pb-2">
+					<input
+						class="h-8 w-full rounded border border-border bg-background px-2 text-sm"
+						type="search"
+						placeholder="Add or search model"
+						.value=${modelFilter}
+						@input=${(e: Event) => { modelFilter = (e.target as HTMLInputElement).value; renderApp(); }}
+					/>
+				</div>
+				${llmConfigLoading
+					? html`<div class="px-3 py-4 text-center text-xs italic text-muted-foreground">Loading models...</div>`
+					: allModels.length === 0
+						? html`<div class="px-3 py-4 text-center text-xs italic text-muted-foreground">No models available for this provider.</div>`
+						: html`
+							<div class="max-h-64 overflow-y-auto">
+								${visible.length === 0
+									? html`<div class="px-3 py-3 text-center text-xs italic text-muted-foreground">No match.</div>`
+									: visible.map((model) => html`
+										<div class="flex items-center gap-3 border-t border-border px-3 py-2">
+											<div class="min-w-0 flex-1">
+												<div class="truncate text-sm">${model.name}</div>
+												<div class="truncate font-mono text-xs text-muted-foreground">${model.id}</div>
+											</div>
+											${pillToggle(model.active, (checked) => void toggleModelActive(model.id, checked), providerKeySaving)}
+										</div>
+									`)}
+							</div>
+						`}
+			</div>
+
+			<!-- API Keys (collapsible) -->
+			<div class="rounded-lg border border-border">
+				<button
+					type="button"
+					class="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-accent"
+					@click=${() => { apiKeysExpanded = !apiKeysExpanded; renderApp(); }}
+				>
+					${icon(apiKeysExpanded ? ChevronDown : ChevronRight, "xs")}
+					<span class="text-sm font-semibold">API Keys</span>
+					${hasKey
+						? html`<span class="ml-auto inline-flex items-center rounded-full bg-green-600/10 px-2 py-0.5 text-xs font-medium text-green-700">Stored</span>`
+						: html`<span class="ml-auto text-xs text-muted-foreground">Required</span>`}
+				</button>
+				${apiKeysExpanded
+					? html`
+						<div class="flex flex-col gap-2 border-t border-border px-3 py-3">
+							<div class="flex items-center gap-2">
+								<div class="min-w-0 flex-1">
+									<div class="text-sm font-medium">${label} API Key</div>
+									<div class="text-xs text-muted-foreground">
+										${hasKey ? "A key is stored (encrypted)." : "You can put in your own key to use these models at cost."}
+									</div>
+								</div>
+								${pillToggle(hasKey, (checked) => void toggleProviderKey(checked), providerKeySaving)}
+							</div>
+							<input
+								class="h-9 w-full rounded border border-border bg-background px-2 text-sm"
+								type="password"
+								placeholder=${hasKey ? `Replace your ${label} API Key` : `Enter your ${label} API Key`}
+								.value=${providerKeyInput}
+								?disabled=${providerKeySaving}
+								@input=${(e: Event) => { providerKeyInput = (e.target as HTMLInputElement).value; providerSavedNotice = ""; }}
+								@keydown=${(e: KeyboardEvent) => { if (e.key === "Enter") { e.preventDefault(); void commitProviderKey(); } }}
+								@blur=${() => void commitProviderKey()}
+							/>
+							<div class="flex items-center gap-2">
+								<span class="text-xs text-muted-foreground">
+									Get a key at <a class="text-primary underline" href=${keyDocsUrl} target="_blank" rel="noopener noreferrer">${new URL(keyDocsUrl).host}</a>.
+								</span>
+								${providerSavedNotice ? html`<span class="ml-auto text-xs font-medium text-green-700">${providerSavedNotice}</span>` : ""}
+							</div>
+						</div>
+					`
+					: ""}
+			</div>
+
+			${providerKeyError ? html`<div class="text-xs text-destructive">${providerKeyError}</div>` : ""}
 		</div>
 	`;
 }

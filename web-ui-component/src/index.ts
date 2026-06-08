@@ -12,6 +12,10 @@ export {
 	type WorkspaceTableSummary,
 	type WorkspaceTree,
 	type WorkspaceNode,
+	type LlmConfig, // IYH1HC add
+	type LlmProviderConfig, // IYH1HC add
+	type LlmModelOption, // IYH1HC add
+	type ActiveModel, // IYH1HC add
 } from "./adapters/core-service.js";
 export { CoreServiceChatPanel } from "./components/CoreServiceChatPanel.js";
 
