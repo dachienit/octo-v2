@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -e
 
-CONTAINER_NAME="mom-sandbox"
+CONTAINER_NAME="octo-sandbox"
+IMAGE="octo/sandbox:local"
 DATA_DIR="$(pwd)/data"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Create data directory if it doesn't exist
 mkdir -p "$DATA_DIR"
@@ -17,12 +19,16 @@ if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         echo "Container $CONTAINER_NAME already running"
     fi
 else
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        echo "Building sandbox image: $IMAGE"
+        docker build -f "$SCRIPT_DIR/Dockerfile.sandbox" -t "$IMAGE" "$SCRIPT_DIR"
+    fi
+
     echo "Creating container: $CONTAINER_NAME"
     docker run -d \
         --name "$CONTAINER_NAME" \
         -v "$DATA_DIR:/workspace" \
-        alpine:latest \
-        tail -f /dev/null
+        "$IMAGE"
 fi
 
 # Run mom with tsx watch mode
