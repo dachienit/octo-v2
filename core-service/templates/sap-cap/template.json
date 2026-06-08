@@ -1,0 +1,21 @@
+{
+  "id": "sap-cap",
+  "label": "SAP CAP",
+  "description": "SAP Cloud Application Programming Model workspace with vendored CAP development skills.",
+  "sandboxImage": "octo/sandbox:local",
+  "settings": {
+    "tools": {
+      "enabled": ["shell", "code", "tests"]
+    },
+    "connectors": {
+      "allowed": ["github", "sap-adt", "codex", "claude", "gemini"]
+    }
+  },
+  "skills": [
+    {
+      "name": "sap-cap-capire",
+      "label": "SAP CAP",
+      "description": "SAP CAP development guidance, CDS modeling, service implementation, Fiori annotations, and deployment references."
+    }
+  ]
+}

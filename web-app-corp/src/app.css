@@ -1,0 +1,57 @@
+@import "../../web-ui-corp/src/app.css";
+
+ui5-button.corp-ui5-button {
+	max-width: 100%;
+	vertical-align: middle;
+}
+
+ui5-button.corp-icon-button {
+	height: 2rem;
+	width: 2rem;
+	min-width: 2rem;
+}
+
+ui5-button.corp-tight-icon-button {
+	height: 1.5rem;
+	width: 1.5rem;
+	min-width: 1.5rem;
+	--_ui5_button_icon_font_size: 1rem;
+	--sapButton_IconSize: 1rem;
+}
+
+ui5-button.corp-tight-icon-button::part(icon) {
+	height: 1rem;
+	width: 1rem;
+	font-size: 1rem;
+}
+
+ui5-button.corp-wide-button,
+ui5-button.corp-menu-button,
+ui5-button.corp-tab-button {
+	width: 100%;
+}
+
+ui5-button.corp-menu-button {
+	display: block;
+	text-align: left;
+}
+
+ui5-input.corp-ui5-input,
+ui5-textarea.corp-ui5-textarea,
+ui5-select.corp-ui5-select {
+	width: 100%;
+}
+
+ui5-textarea.corp-agent-instructions-editor {
+	min-height: 420px;
+}
+
+ui5-checkbox.corp-ui5-checkbox {
+	min-width: max-content;
+}
+
+ui5-button.corp-ui5-button svg,
+ui5-button.corp-ui5-button::part(icon) {
+	display: inline-block;
+	vertical-align: middle;
+}

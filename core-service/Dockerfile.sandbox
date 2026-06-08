@@ -1,0 +1,30 @@
+FROM alpine:3.22
+
+RUN apk add --no-cache \
+	bash \
+	bubblewrap \
+	ca-certificates \
+	curl \
+	git \
+	jq \
+	nodejs \
+	npm \
+	python3 \
+	py3-pip \
+	shadow \
+	tini
+
+RUN npm install -g \
+	@agentclientprotocol/codex-acp@0.0.45 \
+	@google/gemini-cli@0.45.2 \
+	&& npm cache clean --force \
+	&& node --version \
+	&& npm --version \
+	&& npx --version \
+	&& codex-acp --version \
+	&& gemini --version
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["tail", "-f", "/dev/null"]

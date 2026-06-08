@@ -1,5 +1,5 @@
 {
-	"name": "@octo/core",
+	"name": "@octo/core-agent",
 	"version": "0.0.1",
 	"description": "Core agent \u2014 session management, agentic loop, and primitive tools",
 	"type": "module",
@@ -9,6 +9,10 @@
 		".": {
 			"import": "./dist/index.js",
 			"types": "./dist/index.d.ts"
+		},
+		"./web": {
+			"import": "./dist/web.js",
+			"types": "./dist/web.d.ts"
 		}
 	},
 	"files": [
@@ -36,7 +40,7 @@
 		"agent",
 		"ai"
 	],
-	"license": "MIT",
+	"license": "UNLICENSED",
 	"engines": {
 		"node": ">=20.0.0"
 	}

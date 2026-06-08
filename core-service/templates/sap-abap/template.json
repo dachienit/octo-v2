@@ -1,0 +1,26 @@
+{
+  "id": "sap-abap",
+  "label": "SAP ABAP",
+  "description": "SAP ABAP and ABAP CDS workspace with vendored ABAP development skills.",
+  "sandboxImage": "octo/sandbox:local",
+  "settings": {
+    "tools": {
+      "enabled": ["shell", "code", "tests"]
+    },
+    "connectors": {
+      "allowed": ["sap-adt", "github", "codex", "claude", "gemini"]
+    }
+  },
+  "skills": [
+    {
+      "name": "sap-abap",
+      "label": "SAP ABAP",
+      "description": "ABAP development guidance covering syntax, SQL, RAP, ABAP Cloud, testing, performance, and integration topics."
+    },
+    {
+      "name": "sap-abap-cds",
+      "label": "SAP ABAP CDS",
+      "description": "ABAP CDS view, association, annotation, access control, expression, and troubleshooting guidance."
+    }
+  ]
+}

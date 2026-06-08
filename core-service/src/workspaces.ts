@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "fs";
-import { join } from "path";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 
 export type WorkspaceRole = "owner" | "admin" | "editor" | "viewer";
 
@@ -8,7 +9,12 @@ export interface WorkspaceInfo {
 	name: string;
 	createdBy: string;
 	createdAt: string;
+	type?: WorkspaceTemplateId;
+	templateId?: WorkspaceTemplateId;
 	sandboxId?: string;
+	sandbox?: {
+		image?: string;
+	};
 	defaultAgentProfileId?: string;
 	settings?: WorkspaceSettings;
 }
@@ -28,6 +34,9 @@ export interface WorkspaceSettings {
 	};
 	tools?: {
 		enabled?: string[];
+	};
+	connectors?: {
+		allowed?: string[];
 	};
 	mcp?: {
 		servers?: Array<{ name: string; command: string; enabled?: boolean }>;
@@ -62,6 +71,72 @@ export interface SessionInfo {
 	lastModified: number;
 }
 
+export type WorkspaceTemplateId = "sap-cap" | "sap-abap";
+
+export interface WorkspaceTemplate {
+	id: WorkspaceTemplateId;
+	label: string;
+	description: string;
+	sandboxImage: string;
+	skills: Array<{
+		name: string;
+		label: string;
+		description: string;
+		content: string;
+	}>;
+	settings: WorkspaceSettings;
+	agentPrompt: string;
+}
+
+const DEFAULT_SANDBOX_IMAGE = "octo/sandbox:local";
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const packageRoot = join(__dirname, "..");
+
+export const WORKSPACE_TEMPLATES: WorkspaceTemplate[] = [
+	{
+		id: "sap-cap",
+		label: "SAP CAP",
+		description: "SAP Cloud Application Programming Model workspace with CAP development skills.",
+		sandboxImage: DEFAULT_SANDBOX_IMAGE,
+		skills: [
+			{
+				name: "sap-cap-capire",
+				label: "SAP CAP",
+				description: "SAP CAP development guidance, CDS modeling, services, Fiori annotations, and deployment references.",
+				content: "",
+			},
+		],
+		settings: { tools: { enabled: ["shell", "code", "tests"] }, connectors: { allowed: ["github", "sap-adt", "codex", "claude", "gemini"] } },
+		agentPrompt: "This is an SAP CAP workspace. Use the vendored SAP CAP skills under skills/sap-cap-capire for CAP modeling, services, handlers, Fiori annotations, deployment, and troubleshooting.",
+	},
+	{
+		id: "sap-abap",
+		label: "SAP ABAP",
+		description: "SAP ABAP and ABAP CDS workspace with ABAP development skills.",
+		sandboxImage: DEFAULT_SANDBOX_IMAGE,
+		skills: [
+			{
+				name: "sap-abap",
+				label: "SAP ABAP",
+				description: "ABAP development guidance covering syntax, SQL, RAP, ABAP Cloud, testing, performance, and integration topics.",
+				content: "",
+			},
+			{
+				name: "sap-abap-cds",
+				label: "SAP ABAP CDS",
+				description: "ABAP CDS view, association, annotation, access control, expression, and troubleshooting guidance.",
+				content: "",
+			},
+		],
+		settings: { tools: { enabled: ["shell", "code", "tests"] }, connectors: { allowed: ["sap-adt", "github", "codex", "claude", "gemini"] } },
+		agentPrompt: "This is an SAP ABAP workspace. Use the vendored SAP ABAP skills under skills/sap-abap and skills/sap-abap-cds for ABAP development, ABAP Cloud, RAP, CDS views, SQL, testing, and performance work.",
+	},
+];
+
+function getWorkspaceTemplate(templateId?: string): WorkspaceTemplate {
+	return WORKSPACE_TEMPLATES.find((template) => template.id === templateId) ?? WORKSPACE_TEMPLATES[0]!;
+}
+
 function createId(prefix: string): string {
 	return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -84,37 +159,126 @@ const AGENT_PROMPT_FILES = ["AGENTS.md", "agents.md", "CLAUDE.md", "claude.md"];
 export class WorkspaceStore {
 	readonly dataRoot: string;
 	readonly workspacesRoot: string;
+	readonly templatesRoot: string;
 
 	constructor(dataRoot: string) {
 		this.dataRoot = dataRoot;
 		this.workspacesRoot = join(dataRoot, "workspaces");
+		this.templatesRoot = join(dataRoot, "templates");
 		mkdirSync(this.workspacesRoot, { recursive: true });
+		mkdirSync(this.templatesRoot, { recursive: true });
+		this.ensureDefaultTemplates();
 	}
 
 	ensureDefaultWorkspace(userId: string): WorkspaceSummary {
 		const existing = this.listWorkspaces(userId)[0];
 		if (existing) return existing;
-		return this.createWorkspace({ name: "Default workspace", userId });
+		return this.createWorkspace({ name: "Default workspace", userId, templateId: "sap-cap" });
 	}
 
-	createWorkspace(opts: { name: string; userId: string }): WorkspaceSummary {
+	listWorkspaceTemplates(): WorkspaceTemplate[] {
+		return WORKSPACE_TEMPLATES.map((template) => this.getWorkspaceTemplate(template.id));
+	}
+
+	createWorkspace(opts: { name: string; userId: string; templateId?: string }): WorkspaceSummary {
+		const template = this.getWorkspaceTemplate(opts.templateId);
 		const id = createId("ws");
 		const root = this.getWorkspaceRoot(id);
 		mkdirSync(join(root, "sessions"), { recursive: true });
 		mkdirSync(join(root, "artifacts"), { recursive: true });
 		mkdirSync(join(root, "skills"), { recursive: true });
 		mkdirSync(join(root, "events"), { recursive: true });
+		this.copyTemplateContent(template.id, root);
 
 		const workspace: WorkspaceInfo = {
 			id,
 			name: opts.name.trim() || "Untitled workspace",
 			createdBy: opts.userId,
 			createdAt: new Date().toISOString(),
+			type: template.id,
+			templateId: template.id,
+			sandboxId: template.id,
+			sandbox: {
+				image: template.sandboxImage,
+			},
+			settings: {
+				...template.settings,
+				agent: {
+					...template.settings.agent,
+					promptFile: "AGENTS.md",
+				},
+			},
 		};
 		const members: WorkspaceMember[] = [{ userId: opts.userId, role: "owner" }];
 		writeJson(join(root, "workspace.json"), workspace);
 		writeJson(join(root, "members.json"), members);
 		return { ...workspace, role: "owner" };
+	}
+
+	private ensureDefaultTemplates(): void {
+		for (const template of WORKSPACE_TEMPLATES) {
+			const root = this.getTemplateRoot(template.id);
+			const bundledRoot = join(packageRoot, "templates", template.id);
+			if (!existsSync(root) && existsSync(bundledRoot)) {
+				cpSync(bundledRoot, root, { recursive: true });
+			}
+			mkdirSync(join(root, "skills"), { recursive: true });
+			const metadataPath = join(root, "template.json");
+			if (!existsSync(metadataPath)) {
+				writeJson(metadataPath, {
+					id: template.id,
+					label: template.label,
+					description: template.description,
+					sandboxImage: template.sandboxImage,
+					settings: template.settings,
+					skills: template.skills.map(({ name, label, description }) => ({ name, label, description })),
+				});
+			}
+			const promptPath = join(root, "AGENTS.md");
+			if (!existsSync(promptPath)) {
+				writeFileSync(promptPath, `${template.agentPrompt.trim()}\n`, "utf-8");
+			}
+			for (const skill of template.skills) {
+				const skillRoot = join(root, "skills", skill.name);
+				mkdirSync(skillRoot, { recursive: true });
+				const skillPath = join(skillRoot, "SKILL.md");
+				if (!existsSync(skillPath)) {
+					writeFileSync(skillPath, `${skill.content.trim()}\n`, "utf-8");
+				}
+			}
+		}
+	}
+
+	private getWorkspaceTemplate(templateId?: string): WorkspaceTemplate {
+		const fallback = getWorkspaceTemplate(templateId);
+		const metadata = readJson<Partial<WorkspaceTemplate>>(join(this.getTemplateRoot(fallback.id), "template.json")) ?? {};
+		return {
+			...fallback,
+			...metadata,
+			id: fallback.id,
+			sandboxImage: metadata.sandboxImage ?? fallback.sandboxImage,
+			settings: metadata.settings ?? fallback.settings,
+			skills: metadata.skills?.map((skill) => ({
+				name: skill.name,
+				label: skill.label,
+				description: skill.description,
+				content: "content" in skill ? String(skill.content ?? "") : "",
+			})) ?? fallback.skills,
+			agentPrompt: metadata.agentPrompt ?? fallback.agentPrompt,
+		};
+	}
+
+	private copyTemplateContent(templateId: WorkspaceTemplateId, workspaceRoot: string): void {
+		const templateRoot = this.getTemplateRoot(templateId);
+		if (!existsSync(templateRoot)) return;
+		cpSync(templateRoot, workspaceRoot, {
+			recursive: true,
+			force: true,
+			filter: (source) => {
+				const name = source.split(/[\\/]/).pop();
+				return name !== "template.json" && name !== "workspace.json" && name !== "members.json";
+			},
+		});
 	}
 
 	listWorkspaces(userId: string): WorkspaceSummary[] {
@@ -133,6 +297,14 @@ export class WorkspaceStore {
 
 	getWorkspace(workspaceId: string): WorkspaceInfo | undefined {
 		return readJson<WorkspaceInfo>(join(this.getWorkspaceRoot(workspaceId), "workspace.json"));
+	}
+
+	getWorkspaceSandboxImage(workspaceId: string): string | undefined {
+		return this.getWorkspace(workspaceId)?.sandbox?.image;
+	}
+
+	getWorkspaceMembers(workspaceId: string): WorkspaceMember[] {
+		return readJson<WorkspaceMember[]>(join(this.getWorkspaceRoot(workspaceId), "members.json")) ?? [];
 	}
 
 	getWorkspaceSettings(userId: string, workspaceId: string): WorkspaceSettings {
@@ -164,6 +336,7 @@ export class WorkspaceStore {
 			agent: { promptFile },
 			sapConnection: settings.sapConnection ?? {},
 			tools: settings.tools ?? {},
+			connectors: settings.connectors ?? {},
 			mcp: settings.mcp ?? {},
 		};
 		writeJson(join(root, "workspace.json"), { ...workspace, settings: nextSettings });
@@ -186,7 +359,7 @@ export class WorkspaceStore {
 	}
 
 	assertWorkspaceAccess(userId: string, workspaceId: string): WorkspaceRole {
-		const members = readJson<WorkspaceMember[]>(join(this.getWorkspaceRoot(workspaceId), "members.json")) ?? [];
+		const members = this.getWorkspaceMembers(workspaceId);
 		const member = members.find((m) => m.userId === userId);
 		if (!member) throw new Error("Workspace not found or access denied");
 		return member.role;
@@ -269,6 +442,10 @@ export class WorkspaceStore {
 
 	getWorkspaceRoot(workspaceId: string): string {
 		return join(this.workspacesRoot, workspaceId);
+	}
+
+	getTemplateRoot(templateId: WorkspaceTemplateId): string {
+		return join(this.templatesRoot, templateId);
 	}
 
 	getSessionRoot(workspaceId: string, sessionId: string): string {

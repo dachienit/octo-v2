@@ -1,0 +1,67 @@
+{
+	"name": "@octo/web-ui-corp",
+	"version": "0.0.1",
+	"description": "Corporate Fiori-based web UI components for AI chat interfaces powered by @octo/core-agent",
+	"type": "module",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./app.css": "./dist/app.css",
+		"./fiori": {
+			"types": "./dist/fiori.d.ts",
+			"default": "./dist/fiori.js"
+		}
+	},
+	"scripts": {
+		"clean": "rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json && tailwindcss -i ./src/app.css -o ./dist/app.css --minify",
+		"dev": "concurrently --names \"build,example\" --prefix-colors \"cyan,green\" \"tsc -p tsconfig.build.json --watch --preserveWatchOutput\" \"tailwindcss -i ./src/app.css -o ./dist/app.css --watch\" \"npm run dev --prefix example\"",
+		"dev:tsc": "concurrently --names \"build\" --prefix-colors \"cyan\" \"tsc -p tsconfig.build.json --watch --preserveWatchOutput\" \"tailwindcss -i ./src/app.css -o ./dist/app.css --watch\"",
+		"check": "biome check --write --error-on-warnings . && tsc --noEmit && cd example && biome check --write --error-on-warnings . && tsc --noEmit"
+	},
+	"dependencies": {
+		"@octo/core-agent": "*",
+		"typebox": "^1.1.24",
+		"@tiptap/core": "^2.26.1",
+		"@tiptap/starter-kit": "^2.26.1",
+		"@ui5/webcomponents": "2.22.0",
+		"@ui5/webcomponents-base": "2.22.0",
+		"@ui5/webcomponents-fiori": "2.22.0",
+		"@ui5/webcomponents-icons": "2.22.0",
+		"@ui5/webcomponents-react": "2.22.2",
+		"lucide": "^0.544.0",
+		"marked": "^16.3.0",
+		"monaco-editor": "^0.54.0",
+		"pdfjs-dist": "5.4.394",
+		"react-datasheet-grid": "^4.11.6"
+	},
+	"peerDependencies": {
+		"@mariozechner/mini-lit": "^0.2.1",
+		"lit": "^3.3.1",
+		"react": "^18.3.1 || ^19.0.0",
+		"react-dom": "^18.3.1 || ^19.0.0"
+	},
+	"devDependencies": {
+		"@mariozechner/mini-lit": "^0.2.1",
+		"@tailwindcss/cli": "^4.0.0-beta.14",
+		"@typescript/native-preview": "^7.0.0-dev.20260120.1",
+		"concurrently": "^9.2.1",
+		"react": "^18.3.1",
+		"react-dom": "^18.3.1",
+		"typescript": "^5.7.3"
+	},
+	"keywords": [
+		"ai",
+		"chat",
+		"ui",
+		"components",
+		"llm",
+		"web-components",
+		"mini-lit"
+	],
+	"license": "UNLICENSED"
+}

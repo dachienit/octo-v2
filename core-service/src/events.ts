@@ -374,10 +374,89 @@ export class EventsWatcher {
 	}
 }
 
+export class WorkspaceEventsWatcher {
+	private workspacesWatcher: FSWatcher | null = null;
+	private watchers: Map<string, EventsWatcher> = new Map();
+	private debounceTimer: NodeJS.Timeout | null = null;
+
+	constructor(
+		private workspacesDir: string,
+		private router: EventRouter,
+	) {}
+
+	start(): void {
+		if (!existsSync(this.workspacesDir)) {
+			mkdirSync(this.workspacesDir, { recursive: true });
+		}
+
+		log.logInfo(`Workspace events watcher starting, dir: ${this.workspacesDir}`);
+		this.scanWorkspaces();
+		this.workspacesWatcher = watch(this.workspacesDir, () => this.debounceScan());
+		log.logInfo(`Workspace events watcher started, tracking ${this.watchers.size} workspaces`);
+	}
+
+	stop(): void {
+		if (this.workspacesWatcher) {
+			this.workspacesWatcher.close();
+			this.workspacesWatcher = null;
+		}
+		if (this.debounceTimer) {
+			clearTimeout(this.debounceTimer);
+			this.debounceTimer = null;
+		}
+		for (const watcher of this.watchers.values()) {
+			watcher.stop();
+		}
+		this.watchers.clear();
+		log.logInfo("Workspace events watcher stopped");
+	}
+
+	private debounceScan(): void {
+		if (this.debounceTimer) clearTimeout(this.debounceTimer);
+		this.debounceTimer = setTimeout(() => {
+			this.debounceTimer = null;
+			this.scanWorkspaces();
+		}, DEBOUNCE_MS);
+	}
+
+	private scanWorkspaces(): void {
+		let entries;
+		try {
+			entries = readdirSync(this.workspacesDir, { withFileTypes: true });
+		} catch (err) {
+			log.logWarning("Failed to read workspaces directory for events", String(err));
+			return;
+		}
+
+		const active = new Set<string>();
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			const workspaceRoot = join(this.workspacesDir, entry.name);
+			const eventsDir = join(workspaceRoot, "events");
+			active.add(entry.name);
+			if (this.watchers.has(entry.name)) continue;
+
+			const watcher = new EventsWatcher(eventsDir, this.router);
+			watcher.start();
+			this.watchers.set(entry.name, watcher);
+		}
+
+		for (const [workspaceId, watcher] of this.watchers) {
+			if (active.has(workspaceId)) continue;
+			watcher.stop();
+			this.watchers.delete(workspaceId);
+		}
+	}
+}
+
 /**
  * Create and start an events watcher.
  */
 export function createEventsWatcher(workspaceDir: string, router: EventRouter): EventsWatcher {
 	const eventsDir = join(workspaceDir, "events");
 	return new EventsWatcher(eventsDir, router);
+}
+
+export function createWorkspaceEventsWatcher(workspaceDir: string, router: EventRouter): WorkspaceEventsWatcher {
+	return new WorkspaceEventsWatcher(join(workspaceDir, "workspaces"), router);
 }

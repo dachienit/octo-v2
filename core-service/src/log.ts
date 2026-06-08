@@ -25,9 +25,10 @@ function formatContext(ctx: LogContext): string {
 	return `[${channel.startsWith("#") ? channel : `#${channel}`}:${user}]`;
 }
 
-function truncate(text: string, maxLen: number): string {
-	if (text.length <= maxLen) return text;
-	return `${text.substring(0, maxLen)}\n(truncated at ${maxLen} chars)`;
+function truncate(text: any, maxLen: number): string {
+	const str = typeof text === "string" ? text : String(text ?? "");
+	if (str.length <= maxLen) return str;
+	return `${str.substring(0, maxLen)}\n(truncated at ${maxLen} chars)`;
 }
 
 function formatToolArgs(args: Record<string, unknown>): string {

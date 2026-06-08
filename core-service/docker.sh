@@ -3,16 +3,27 @@
 # Mom Docker Sandbox Management Script
 # Usage:
 #   ./docker.sh create <data-dir>   - Create and start the container
+#   ./docker.sh build               - Build the sandbox image
 #   ./docker.sh start               - Start the container
 #   ./docker.sh stop                - Stop the container
 #   ./docker.sh remove              - Remove the container
 #   ./docker.sh status              - Check container status
 #   ./docker.sh shell               - Open a shell in the container
 
-CONTAINER_NAME="mom-sandbox"
-IMAGE="alpine:latest"
+CONTAINER_NAME="octo-sandbox"
+IMAGE="octo/sandbox:local"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+build_image() {
+    echo "Building sandbox image '${IMAGE}'..."
+    docker build -f "${SCRIPT_DIR}/Dockerfile.sandbox" -t "${IMAGE}" "${SCRIPT_DIR}"
+}
 
 case "$1" in
+  build)
+    build_image
+    ;;
+
   create)
     if [ -z "$2" ]; then
       echo "Usage: $0 create <data-dir>"
@@ -27,14 +38,17 @@ case "$1" in
       exit 1
     fi
     
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+      build_image
+    fi
+
     echo "Creating container '${CONTAINER_NAME}'..."
     echo "  Data dir: ${DATA_DIR} -> /workspace"
     
     docker run -d \
       --name "$CONTAINER_NAME" \
       -v "${DATA_DIR}:/workspace" \
-      "$IMAGE" \
-      tail -f /dev/null
+      "$IMAGE"
     
     if [ $? -eq 0 ]; then
       echo "Container created and running."
@@ -85,6 +99,7 @@ case "$1" in
     echo "Usage: $0 <command> [args]"
     echo ""
     echo "Commands:"
+    echo "  build              - Build the sandbox image"
     echo "  create <data-dir>  - Create and start the container"
     echo "  start              - Start the container"
     echo "  stop               - Stop the container"  
