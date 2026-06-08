@@ -1613,7 +1613,7 @@ function renderApp() {
 							onClick: toggleSidebar,
 							title: sidebarOpen ? "Collapse sessions" : "Expand sessions",
 						})}
-						<span class="text-base font-semibold text-foreground">Bot Chat</span>
+						<span class="text-base font-semibold text-foreground">Octo Chat</span>
 					</div>
 					<div class="flex items-center gap-2">
 						${Ui5Button({

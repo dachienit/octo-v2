@@ -50,6 +50,9 @@ const CODE_EXTENSIONS = [
 	"perl",
 	"vue",
 	"svelte",
+	"abap",
+	"cds",
+	"csn",
 ];
 
 @customElement("text-artifact")
@@ -90,6 +93,8 @@ export class TextArtifact extends ArtifactElement {
 			yml: "yaml",
 			ps1: "powershell",
 			bat: "batch",
+			cds: "sql",
+			csn: "json",
 		};
 		return languageMap[ext] || ext;
 	}
