@@ -3,6 +3,7 @@ export { configureFioriTheme, CORPORATE_FIORI_DARK_THEME, CORPORATE_FIORI_THEME 
 // Core service HTTP SSE adapter
 export {
 	CoreServiceClient,
+	type AuthUser,
 	type AcpJob,
 	type AgentWorkerLoginStart,
 	type AgentWorkerLoginStatus,
@@ -12,6 +13,7 @@ export {
 	type SseEvent,
 	type SessionInfo,
 	type SessionRecord,
+	type SsoConfig,
 	type WorkspaceInfo,
 	type WorkspaceSandboxStatus,
 	type WorkspaceScheduledEvent,
@@ -21,6 +23,10 @@ export {
 	type WorkspaceTemplate,
 	type WorkspaceTree,
 	type WorkspaceNode,
+	type LlmConfig, // IYH1HC add
+	type LlmProviderConfig, // IYH1HC add
+	type LlmModelOption, // IYH1HC add
+	type ActiveModel, // IYH1HC add
 } from "./adapters/core-service.js";
 export { CoreServiceChatPanel } from "./components/CoreServiceChatPanel.js";
 

@@ -523,6 +523,7 @@ function createRunner(
 				attachments: ctx.message.attachments,
 				systemPrompt,
 				authFilePath: ctx.authFilePath,
+				model: ctx.model, //IYH1HC add: per-run model override from the web UI
 				uploadFile: async (hostPath, title) => {
 					await ctx.uploadFile(hostPath, title);
 				},

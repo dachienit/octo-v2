@@ -49,6 +49,11 @@ export interface BotContext {
 	};
 	/** Auth JSON path for the user who sent this message */
 	authFilePath?: string;
+	/**
+	 * IYH1HC add: per-run LLM model override selected by the user in the web UI.
+	 * `apiKey` is already decrypted here. Absent → env-driven default model.
+	 */
+	model?: { provider: string; modelId: string; apiKey?: string; baseUrl?: string; apiType?: string };
 	channelName?: string;
 	channels: ChannelInfo[];
 	users: UserInfo[];

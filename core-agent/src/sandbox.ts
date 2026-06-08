@@ -1,3 +1,7 @@
+import { spawn } from "child_process";
+//IYH1HC add: Node fs/path APIs for cross-platform file I/O on the host
+import { mkdir, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs/promises";
+import { dirname, isAbsolute, posix, resolve } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 
 export type ContainerRuntime = "docker" | "podman";
@@ -90,6 +94,10 @@ export interface Executor {
 	exec(command: string, options?: ExecOptions): Promise<ExecResult>;
 	spawn(command: string, args?: string[], options?: SpawnOptions): ChildProcessWithoutNullStreams;
 	getWorkspacePath(hostPath: string): string;
+	//IYH1HC add: sandbox-aware file I/O so tools never depend on a POSIX shell.
+	// Host: Node fs (cross-platform). Docker: shell commands inside the container.
+	readFile(path: string): Promise<Buffer>;
+	writeFile(path: string, content: string): Promise<void>;
 }
 
 export interface ExecOptions {
@@ -187,6 +195,20 @@ class HostExecutor implements Executor {
 		return hostPath;
 	}
 
+	//IYH1HC add: cross-platform file I/O via Node fs (works on Windows + Linux host).
+	private resolvePath(path: string): string {
+		return isAbsolute(path) ? path : resolve(this.cwd ?? process.cwd(), path);
+	}
+
+	async readFile(path: string): Promise<Buffer> {
+		return fsReadFile(this.resolvePath(path));
+	}
+
+	async writeFile(path: string, content: string): Promise<void> {
+		const resolved = this.resolvePath(path);
+		await mkdir(dirname(resolved), { recursive: true });
+		await fsWriteFile(resolved, content, "utf-8");
+	}
 	spawn(command: string, args: string[] = [], options?: SpawnOptions): ChildProcessWithoutNullStreams {
 		const child = spawn(command, args, {
 			cwd: options?.cwd ?? this.cwd,
@@ -214,6 +236,34 @@ class ContainerExecutor implements Executor {
 		return "/workspace";
 	}
 
+	//IYH1HC add: file I/O that runs *inside* the container so Docker isolation is preserved.
+	// Relative paths resolve as POSIX against the container cwd (e.g. /workspace/artifacts).
+	private resolvePath(path: string): string {
+		return path.startsWith("/") ? path : posix.join(this.cwd ?? "/workspace", path);
+	}
+
+	async readFile(path: string): Promise<Buffer> {
+		const resolved = this.resolvePath(path);
+		// base64 keeps binary (e.g. images) intact across the shell boundary.
+		const result = await this.exec(`base64 < ${shellEscape(resolved)}`);
+		if (result.code !== 0) {
+			throw new Error(result.stderr || `Failed to read file: ${path}`);
+		}
+		return Buffer.from(result.stdout.replace(/\s/g, ""), "base64");
+	}
+
+	async writeFile(path: string, content: string): Promise<void> {
+		const resolved = this.resolvePath(path);
+		const dir = posix.dirname(resolved);
+		// Base64-encode on the host and decode in the container: avoids all shell
+		// escaping/binary pitfalls (the b64 payload contains no shell metacharacters).
+		const b64 = Buffer.from(content, "utf-8").toString("base64");
+		const cmd = `mkdir -p ${shellEscape(dir)} && printf '%s' ${shellEscape(b64)} | base64 -d > ${shellEscape(resolved)}`;
+		const result = await this.exec(cmd);
+		if (result.code !== 0) {
+			throw new Error(result.stderr || `Failed to write file: ${path}`);
+		}
+	}
 	spawn(command: string, args: string[] = [], options?: SpawnOptions): ChildProcessWithoutNullStreams {
 		const cwd = options?.cwd ?? this.cwd;
 		const commandLine = [command, ...args].map(shellEscape).join(" ");

@@ -50,6 +50,8 @@ function getDefaultModelId(provider: string): string {
 
 function getDefaultApiType(provider: string): string {
 	if (provider === "openai-codex") return "openai-codex-responses";
+	if (provider === "openai") return "openai-responses"; //IYH1HC add
+	if (provider === "google") return "google-generative-ai"; //IYH1HC add
 	return "anthropic-messages";
 }
 
@@ -201,24 +203,26 @@ function extractToolResultText(result: unknown): string {
 	return JSON.stringify(result);
 }
 
-async function getLlmApiKey(authStorage: AuthStorage, authFilePath: string): Promise<string> {
+//IYH1HC comment: signature gained a `provider` param (defaults to env llmProvider)
+// so per-run model overrides can resolve a key for a different provider.
+async function getLlmApiKey(authStorage: AuthStorage, authFilePath: string, provider: string = llmProvider): Promise<string> {
 	if (process.env.LLM_API_KEY) return process.env.LLM_API_KEY;
 	// SAP providers use extension-level auth/token handling; use sentinel key for runtime checks.
-	if (llmProvider.startsWith("sap-")) return "sap-orchestration";
-	const key = await authStorage.getApiKey(llmProvider);
+	if (provider.startsWith("sap-")) return "sap-orchestration";
+	const key = await authStorage.getApiKey(provider);
 	if (!key) {
-		if (llmProvider === "openai-codex") {
+		if (provider === "openai-codex") {
 			throw new Error(
-				`No OAuth token found for provider "${llmProvider}".\n\n` +
+				`No OAuth token found for provider "${provider}".\n\n` +
 					`Log in with the pi coding agent so it writes ${authFilePath}, ` +
 					`or set LLM_AUTH_FILE to an auth.json that contains openai-codex credentials.`,
 			);
 		}
 		throw new Error(
-			`No API key found for provider "${llmProvider}".\n\n` +
+			`No API key found for provider "${provider}".\n\n` +
 				`Set LLM_API_KEY env var, or store the key in ` +
 				authFilePath +
-				` as { "${llmProvider}": "your-key" }`,
+				` as { "${provider}": "your-key" }`,
 		);
 	}
 	return key;
@@ -270,6 +274,10 @@ export class CoreAgent {
 	private currentEvents: CoreAgentEventHandlers | null = null;
 	private pendingTools = new Map<string, { toolName: string; args: unknown; startTime: number }>();
 
+	//IYH1HC add: per-run model override state (set in run() when input.model present)
+	private runProvider: string | undefined;
+	private runApiKey: string | undefined;
+
 	// Per-run result state
 	private runStopReason = "stop";
 	private runErrorMessage: string | undefined;
@@ -298,7 +306,10 @@ export class CoreAgent {
 			? containerWorkspacePath
 			: this.executor.getWorkspacePath(hostWorkspacePath);
 
-		const primitiveTools = createPrimitiveTools(this.executor, () => this.currentUploadFn, executorCwd);
+		//IYH1HC add: attach uploads from the HOST fs, so it must use the host artifacts dir
+		//IYH1HC add: (executorCwd is a container path like /workspace/artifacts in Docker mode).
+		const primitiveTools = createPrimitiveTools(this.executor, () => this.currentUploadFn, hostArtifactsDir);
+		//IYH1HC comment const primitiveTools = createPrimitiveTools(this.executor, () => this.currentUploadFn, executorCwd);
 		const tools = options.extraTools ? [...primitiveTools, ...options.extraTools] : primitiveTools;
 
 		const contextFile = join(options.channelDir, "context.jsonl");
@@ -312,7 +323,10 @@ export class CoreAgent {
 		this.agentInstance = new Agent({
 			initialState: { systemPrompt: "", model, thinkingLevel: "off", tools },
 			convertToLlm,
-			getApiKey: async () => getLlmApiKey(this.authStorage, this.authFilePath),
+			//IYH1HC comment: use the per-run override key when one is set; otherwise
+			// fall back to env/auth-file resolution for the active provider.
+			getApiKey: async () =>
+				this.runApiKey ?? getLlmApiKey(this.authStorage, this.authFilePath, this.runProvider ?? llmProvider),
 		});
 
 		const loadedSession = this.sessionManager.buildSessionContext();
@@ -534,6 +548,39 @@ export class CoreAgent {
 		if (!this.resourcesLoaded) {
 			await this.session.reload();
 			this.resourcesLoaded = true;
+		}
+
+		//IYH1HC add: apply a per-run model override coming from the web UI. When absent,
+		// restore the env-driven default so reused instances (Slack/cron) stay backward-compatible.
+		if (input.model) {
+			const provider = input.model.provider;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const rawModel = (getModel as (p: string, m: string) => any)(provider, input.model.modelId);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const runModel: any = rawModel ?? {
+				id: input.model.modelId,
+				name: input.model.modelId,
+				provider,
+				baseUrl: "",
+				api: getDefaultApiType(provider),
+				input: ["text", "image"],
+				contextWindow: 200000,
+				maxTokens: 8192,
+			};
+			if (input.model.baseUrl) runModel.baseUrl = input.model.baseUrl;
+			if (input.model.apiType) runModel.api = input.model.apiType;
+			(this.session.agent.state as any).model = runModel;
+			this.runProvider = provider;
+			this.runApiKey = input.model.apiKey;
+			// pi's AgentSession/ModelRegistry resolves the key via AuthStorage (not the
+			// Agent.getApiKey callback), so inject the per-user key as a runtime override.
+			if (input.model.apiKey) {
+				this.authStorage.setRuntimeApiKey(provider, input.model.apiKey);
+			}
+		} else {
+			(this.session.agent.state as any).model = model;
+			this.runProvider = undefined;
+			this.runApiKey = undefined;
 		}
 
 		// Sync any offline messages from log.jsonl
