@@ -80,7 +80,7 @@ export class TextArtifact extends ArtifactElement {
 	}
 
 	private isCode(): boolean {
-		const ext = this.filename.split(".").pop()?.toLowerCase() || "";
+		const ext = this.filename.split(/[?#]/)[0].split(".").pop()?.toLowerCase() || "";
 		return CODE_EXTENSIONS.includes(ext);
 	}
 

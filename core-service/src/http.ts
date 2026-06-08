@@ -1148,6 +1148,8 @@ export class HttpServer {
 		const mimeType = BINARY_MIME_TYPES[ext];
 		if (mimeType) {
 			res.type(mimeType);
+		} else if (["abap", "cds", "csn"].includes(ext)) {
+			res.type("text/plain");
 		}
 		if (req.query.download === "1") {
 			res.attachment(basename(resolved));

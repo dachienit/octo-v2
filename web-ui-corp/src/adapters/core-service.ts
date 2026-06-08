@@ -214,6 +214,7 @@ const TEXT_FILE_EXTENSIONS = new Set([
 	"json", "jsonl", "xml", "yaml", "yml", "toml", "ini", "env",
 	"sql", "r", "lua", "pl", "pm", "jl",
 	"md", "markdown", "txt", "csv", "tsv", "log",
+	"abap", "cds", "csn"
 ]);
 
 const BINARY_FILE_EXTENSIONS = new Set([

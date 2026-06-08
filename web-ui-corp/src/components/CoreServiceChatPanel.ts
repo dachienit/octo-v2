@@ -23,6 +23,7 @@ const TEXT_PREVIEW_EXTENSIONS = new Set([
 	"json", "jsonl", "xml", "yaml", "yml", "toml", "ini", "env",
 	"sql", "r", "lua", "pl", "pm", "jl",
 	"txt", "csv", "tsv", "log",
+	"abap", "cds", "csn"
 ]);
 
 const BINARY_PREVIEW_UNSUPPORTED_EXTENSIONS = new Set([
@@ -165,17 +166,18 @@ class CoreServiceFileViewer extends LitElement {
 			const src = `${this.baseUrl}/file?path=${encodeURIComponent(this.path)}`;
 			return html`<img src=${src} class="max-w-full" alt=${name} />`;
 		}
+		const actualFilename = this.path.split("/").pop() || this.path;
 		if (this.isPdf) {
-			return html`<pdf-artifact class="block h-full" .filename=${name} .content=${this.content}></pdf-artifact>`;
+			return html`<pdf-artifact class="block h-full" .filename=${actualFilename} .content=${this.content}></pdf-artifact>`;
 		}
 		if (this.isMarkdown) {
-			return html`<markdown-artifact class="block h-full" .filename=${name} .content=${this.content}></markdown-artifact>`;
+			return html`<markdown-artifact class="block h-full" .filename=${actualFilename} .content=${this.content}></markdown-artifact>`;
 		}
 		if (this.isCsv) {
-			return html`<csv-artifact class="block h-full" .filename=${name} .content=${this.content}></csv-artifact>`;
+			return html`<csv-artifact class="block h-full" .filename=${actualFilename} .content=${this.content}></csv-artifact>`;
 		}
 		if (this.isTextPreview) {
-			return html`<text-artifact class="block h-full" .filename=${name} .content=${this.content}></text-artifact>`;
+			return html`<text-artifact class="block h-full" .filename=${actualFilename} .content=${this.content}></text-artifact>`;
 		}
 		return html`
 			<div class="flex h-full items-center justify-center p-6">
