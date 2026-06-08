@@ -1,14 +1,30 @@
-import { Dirent, appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
+import { Dirent, appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { basename, extname, isAbsolute, join, resolve } from "path";
 import { getModel, getModels, getProviderAuthStatus, loginProvider } from "@octo/core"; //IYH1HC comment: added getModel/getModels
+import {
+	cancelAcpJob,
+	connectorHomeHasFiles,
+	ensureConnectorHome,
+	getConnectorHome,
+	getConnectorRuntime,
+	getProviderAuthStatus,
+	listAcpJobs,
+	listConnectorRuntimes,
+	loginProvider,
+	safeConnectorUserId,
+	type ConnectorRuntime,
+} from "@octo/core-agent";
 import express from "express";
 import { CoreServiceAuth } from "./auth.js";
 import { decryptSecret, encryptSecret } from "./crypto.js"; //IYH1HC add
 import { GithubSsoProvider, loadSsoConfig } from "./sso.js"; //IYH1HC add
 import * as log from "./log.js";
+import { getWorkspaceSandboxStatus } from "./sandbox-manager.js";
 import type { BotContext, BotHandler } from "./types.js";
 import { WorkspaceDatabase } from "./workspace-database.js";
 import { WorkspaceStore } from "./workspaces.js";
+import type { SandboxConfig } from "@octo/core-agent";
 
 // ============================================================================
 // HTTP context adapter
@@ -36,6 +52,16 @@ const LLM_KEY_PROVIDERS: ReadonlyArray<{ id: string; label: string }> = [
 	{ id: "google", label: "Google Gemini" },
 	{ id: "anthropic", label: "Anthropic" },
 ];
+interface PendingAgentWorkerLogin {
+	userId: string;
+	connectorId: string;
+	status: "pending" | "complete" | "error";
+	createdAt: number;
+	output: string;
+	url?: string;
+	error?: string;
+	child?: ChildProcessWithoutNullStreams;
+}
 
 const BINARY_MIME_TYPES: Record<string, string> = {
 	doc: "application/msword",
@@ -47,7 +73,7 @@ const BINARY_MIME_TYPES: Record<string, string> = {
 	zip: "application/zip",
 };
 
-function createHttpContext(opts: {
+export function createHttpContext(opts: {
 	channelId: string;
 	userName: string;
 	text: string;
@@ -153,15 +179,23 @@ export class HttpServer {
 	private workingDir: string;
 	private handler: BotHandler;
 	private workspaceStore: WorkspaceStore;
+	private sandboxConfig: SandboxConfig;
+	private features: { agentWorkers: boolean; reminders: boolean };
 	private auth: CoreServiceAuth;
 	private pendingAuthLogins = new Map<string, PendingAuthLogin>();
 	private sso: GithubSsoProvider | null; //IYH1HC add
+	private pendingAgentWorkerLogins = new Map<string, PendingAgentWorkerLogin>();
 
-	constructor(config: { port: number; workingDir: string; handler: BotHandler; workspaceStore: WorkspaceStore }) {
+	constructor(config: { port: number; workingDir: string; handler: BotHandler; workspaceStore: WorkspaceStore; sandboxConfig: SandboxConfig; features?: { agentWorkers?: boolean; reminders?: boolean } }) {
 		this.port = config.port;
 		this.workingDir = config.workingDir;
 		this.handler = config.handler;
 		this.workspaceStore = config.workspaceStore;
+		this.sandboxConfig = config.sandboxConfig;
+		this.features = {
+			agentWorkers: config.features?.agentWorkers !== false,
+			reminders: config.features?.reminders !== false,
+		};
 		this.auth = new CoreServiceAuth(config.workingDir);
 		//IYH1HC add: build the SSO provider from env (null when SSO is disabled).
 		const ssoConfig = loadSsoConfig();
@@ -202,10 +236,15 @@ export class HttpServer {
 		app.use("/artifacts", express.static(artifactsDir, { fallthrough: false }));
 
 		// API routes
+		app.get("/features", (_req, res) => this.handleFeatures(res));
 		app.get("/workspaces",      (req, res) => this.handleWorkspaces(req, res));
+		app.get("/workspace-templates", (_req, res) => res.json(this.workspaceStore.listWorkspaceTemplates()));
 		app.post("/workspaces",     (req, res) => this.handleCreateWorkspace(req, res));
 		app.get("/workspaces/:workspaceId/settings", (req, res) => this.handleWorkspaceSettings(req, res));
 		app.patch("/workspaces/:workspaceId/settings", (req, res) => this.handleUpdateWorkspaceSettings(req, res));
+		app.get("/workspaces/:workspaceId/sandbox", (req, res) => { void this.handleWorkspaceSandbox(req, res); });
+		app.get("/workspaces/:workspaceId/events", (req, res) => this.handleWorkspaceEvents(req, res));
+		app.delete("/workspaces/:workspaceId/events/:filename", (req, res) => this.handleDeleteWorkspaceEvent(req, res));
 		app.get("/database/tables", (req, res) => this.handleDatabaseTables(req, res));
 		app.get("/database/tables/:tableName/rows", (req, res) => this.handleDatabaseRows(req, res));
 		app.get("/auth/openai-codex/status", (req, res) => this.handleAuthStatus(req, res));
@@ -218,12 +257,27 @@ export class HttpServer {
 		app.put("/llm/providers/:provider/key", (req, res) => this.handleSetProviderKey(req, res));
 		app.delete("/llm/providers/:provider/key", (req, res) => this.handleDeleteProviderKey(req, res));
 		app.put("/llm/providers/:provider/models", (req, res) => this.handleSetActiveModels(req, res));
+		app.get("/auth/connectors", (req, res) => this.handleConnectors(req, res));
+		app.get("/auth/connectors/:connector/status", (req, res) => this.handleConnectorStatus(req, res));
+		app.post("/auth/connectors/:connector/login", (req, res) => this.handleConnectorLogin(req, res));
+		app.get("/auth/connectors/:connector/login/:loginId", (req, res) => this.handleConnectorLoginStatus(req, res));
+		app.post("/auth/connectors/:connector/login/:loginId/input", (req, res) => this.handleConnectorLoginInput(req, res));
+		app.post("/auth/connectors/:connector/logout", (req, res) => this.handleConnectorLogout(req, res));
+		app.post("/connectors/:connector/exec", (req, res) => this.handleConnectorExec(req, res));
+		app.get("/auth/agent-workers", (req, res) => this.handleAgentWorkers(req, res));
+		app.get("/auth/agent-workers/:agent/status", (req, res) => this.handleAgentWorkerStatus(req, res));
+		app.post("/auth/agent-workers/:agent/login", (req, res) => this.handleAgentWorkerLogin(req, res));
+		app.get("/auth/agent-workers/:agent/login/:loginId", (req, res) => this.handleAgentWorkerLoginStatus(req, res));
+		app.post("/auth/agent-workers/:agent/login/:loginId/input", (req, res) => this.handleAgentWorkerLoginInput(req, res));
+		app.post("/auth/agent-workers/:agent/logout", (req, res) => this.handleAgentWorkerLogout(req, res));
 		app.get("/workspaces/:workspaceId/sessions", (req, res) => this.handleWorkspaceSessions(req, res));
 		app.post("/workspaces/:workspaceId/sessions", (req, res) => this.handleCreateSession(req, res));
 		app.post("/sessions/:sessionId/messages", (req, res) => { void this.handleChat(req, res, req.params.sessionId); });
 		app.post("/chat",           (req, res) => { void this.handleChat(req, res); });
 		app.post("/stop",           (req, res) => { void this.handleStop(req, res); });
 		app.get("/status/:id",      (req, res) => this.handleStatus(req, req.params.id, res));
+		app.get("/sessions/:id/acp-jobs", (req, res) => this.handleAcpJobs(req, decodeURIComponent(req.params.id), res));
+		app.post("/sessions/:id/acp-jobs/:jobId/cancel", (req, res) => this.handleCancelAcpJob(req, decodeURIComponent(req.params.id), decodeURIComponent(req.params.jobId), res));
 		app.get("/sessions",        (req, res) => this.handleSessions(req, res));
 		app.get("/messages/:id",    (req, res) => this.handleMessages(req, decodeURIComponent(req.params.id), res));
 		app.get("/sessions/:id/messages", (req, res) => this.handleMessages(req, decodeURIComponent(req.params.id), res));
@@ -361,9 +415,9 @@ export class HttpServer {
 				entry.userCode = info.userCode;
 				entry.verificationUri = info.verificationUri;
 			},
+			onSelect: async () => undefined,
 			onPrompt: async () => manualCodePromise,
 			onManualCodeInput: async () => manualCodePromise,
-			onSelect: async () => undefined,
 			onProgress: (message) => {
 				log.logInfo(`[auth:${loginId}] ${message}`);
 			},
@@ -394,6 +448,8 @@ export class HttpServer {
 			provider: "openai-codex",
 			url: entry.url,
 			instructions: entry.instructions,
+			userCode: entry.userCode,
+			verificationUri: entry.verificationUri,
 			statusUrl: `/auth/openai-codex/login/${encodeURIComponent(loginId)}`,
 			codeUrl: `/auth/openai-codex/login/${encodeURIComponent(loginId)}/code`,
 		});
@@ -532,6 +588,319 @@ export class HttpServer {
 		res.json({ ok: true });
 	}
 
+	private safeUserId(userId: string): string {
+		return safeConnectorUserId(userId);
+	}
+
+	private getUsersRoot(): string {
+		return join(this.workingDir, "users");
+	}
+
+	private getConnectorEnv(userId: string, connector: ConnectorRuntime): NodeJS.ProcessEnv {
+		const usersRoot = this.getUsersRoot();
+		ensureConnectorHome(usersRoot, userId, connector.id);
+		return {
+			...process.env,
+			...connector.env({ userId, usersRoot }),
+		};
+	}
+
+	private resolveConnector(connectorId: string, kind?: "agent-runtime" | "business-connector"): ConnectorRuntime | undefined {
+		const connector = getConnectorRuntime(connectorId);
+		if (!connector) return undefined;
+		if (kind && connector.kind !== kind) return undefined;
+		if (!this.features.agentWorkers && connector.kind === "agent-runtime") return undefined;
+		return connector;
+	}
+
+	private extractUrl(text: string): string | undefined {
+		return text.match(/https?:\/\/[^\s)]+/)?.[0];
+	}
+
+	private serializeConnector(req: express.Request, connector: ConnectorRuntime) {
+		const userId = this.getUserId(req);
+		const usersRoot = this.getUsersRoot();
+		return {
+			id: connector.id,
+			label: connector.label,
+			kind: connector.kind,
+			authMode: connector.authMode,
+			connected: connectorHomeHasFiles(usersRoot, userId, connector.id),
+			usedByAgents: connector.usedByAgents ?? [],
+			accessPolicy: connector.accessPolicy,
+		};
+	}
+
+	private handleFeatures(res: express.Response): void {
+		res.json({ features: { agentWorkers: this.features.agentWorkers, reminders: this.features.reminders } });
+	}
+
+	private handleConnectors(req: express.Request, res: express.Response): void {
+		const kind = typeof req.query.kind === "string" ? req.query.kind : undefined;
+		if (kind === "agent-runtime" && !this.features.agentWorkers) {
+			res.json({ connectors: [] });
+			return;
+		}
+		const connectors = listConnectorRuntimes(kind === "agent-runtime" || kind === "business-connector" ? kind : undefined)
+			.filter((connector) => this.features.agentWorkers || connector.kind !== "agent-runtime")
+			.map((connector) => this.serializeConnector(req, connector));
+		res.json({ connectors });
+	}
+
+	private handleConnectorStatus(req: express.Request, res: express.Response): void {
+		const connector = this.resolveConnector(String(req.params.connector));
+		if (!connector) {
+			res.status(404).json({ error: "Unknown connector" });
+			return;
+		}
+		res.json(this.serializeConnector(req, connector));
+	}
+
+	private handleConnectorLogin(req: express.Request, res: express.Response): void {
+		const connector = this.resolveConnector(String(req.params.connector));
+		if (!connector?.command || !connector.loginCommand) {
+			res.status(404).json({ error: "Connector login is not configured" });
+			return;
+		}
+		this.startConnectorLogin(req, res, connector);
+	}
+
+	private handleConnectorLoginStatus(req: express.Request, res: express.Response): void {
+		this.writeConnectorLoginStatus(req, res, String(req.params.connector), "connector");
+	}
+
+	private handleConnectorLoginInput(req: express.Request, res: express.Response): void {
+		this.writeConnectorLoginInput(req, res, String(req.params.connector));
+	}
+
+	private handleConnectorLogout(req: express.Request, res: express.Response): void {
+		const connector = this.resolveConnector(String(req.params.connector));
+		if (!connector?.command || !connector.logoutCommand) {
+			res.status(404).json({ error: "Connector logout is not configured" });
+			return;
+		}
+		this.logoutConnector(req, res, connector);
+	}
+
+	private handleConnectorExec(req: express.Request, res: express.Response): void {
+		const connector = this.resolveConnector(String(req.params.connector), "business-connector");
+		if (!connector?.command || !connector.accessPolicy.allowedInHost) {
+			res.status(404).json({ error: "Connector command proxy is not configured" });
+			return;
+		}
+		const body = req.body as { argv?: unknown; cwd?: unknown; timeoutMs?: unknown };
+		const argv = Array.isArray(body.argv) ? body.argv.map(String) : [];
+		const timeoutMs = Math.min(Math.max(Number(body.timeoutMs ?? 120000) || 120000, 1000), 300000);
+		const cwd = this.resolveConnectorExecCwd(typeof body.cwd === "string" ? body.cwd : undefined);
+		if (!cwd) {
+			res.status(403).json({ error: "Connector cwd is outside the workspace root" });
+			return;
+		}
+		const userId = this.getUserId(req);
+		const child = spawn(connector.command, argv, {
+			env: this.getConnectorEnv(userId, connector),
+			cwd,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let stdout = "";
+		let stderr = "";
+		let responded = false;
+		const trim = (text: string) => text.length > 10 * 1024 * 1024 ? text.slice(-10 * 1024 * 1024) : text;
+		const timeout = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
+		child.stdout.on("data", (chunk: Buffer) => { stdout = trim(stdout + chunk.toString("utf-8")); });
+		child.stderr.on("data", (chunk: Buffer) => { stderr = trim(stderr + chunk.toString("utf-8")); });
+		child.on("error", (err) => {
+			clearTimeout(timeout);
+			responded = true;
+			res.status(500).json({ stdout, stderr: stderr || err.message, exitCode: 1, error: err.message });
+		});
+		child.on("close", (code) => {
+			clearTimeout(timeout);
+			if (responded) return;
+			res.json({ stdout, stderr, exitCode: code ?? 0 });
+		});
+	}
+
+	private resolveConnectorExecCwd(cwd?: string): string | undefined {
+		const root = resolve(this.workingDir);
+		const resolved = cwd
+			? resolve(cwd.startsWith("/") ? cwd : join(this.workingDir, cwd))
+			: root;
+		if (resolved !== root && !resolved.startsWith(`${root}/`)) return undefined;
+		return resolved;
+	}
+
+	private handleAgentWorkers(req: express.Request, res: express.Response): void {
+		if (!this.features.agentWorkers) {
+			res.json({ agents: [] });
+			return;
+		}
+		res.json({
+			agents: listConnectorRuntimes("agent-runtime").map((connector) => this.serializeConnector(req, connector)),
+		});
+	}
+
+	private handleAgentWorkerStatus(req: express.Request, res: express.Response): void {
+		if (!this.features.agentWorkers) {
+			res.status(404).json({ error: "Agent workers are disabled" });
+			return;
+		}
+		const agent = String(req.params.agent);
+		const connector = this.resolveConnector(agent, "agent-runtime");
+		if (!connector) {
+			res.status(404).json({ error: "Unknown agent worker" });
+			return;
+		}
+		const userId = this.getUserId(req);
+		const usersRoot = this.getUsersRoot();
+		res.json({
+			id: agent,
+			label: connector.label,
+			connected: connectorHomeHasFiles(usersRoot, userId, agent),
+			authMode: connector.authMode,
+			kind: connector.kind,
+			usedByAgents: connector.usedByAgents ?? [],
+		});
+	}
+
+	private startConnectorLogin(req: express.Request, res: express.Response, connector: ConnectorRuntime): void {
+		const userId = this.getUserId(req);
+		const loginId = this.createLoginId();
+		const entry: PendingAgentWorkerLogin = {
+			userId,
+			connectorId: connector.id,
+			status: "pending",
+			createdAt: Date.now(),
+			output: "",
+		};
+		this.pendingAgentWorkerLogins.set(loginId, entry);
+		const home = ensureConnectorHome(this.getUsersRoot(), userId, connector.id);
+
+		const child = spawn(connector.command!, connector.loginCommand!, {
+			env: this.getConnectorEnv(userId, connector),
+			cwd: home,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		entry.child = child;
+		const onData = (chunk: Buffer) => {
+			entry.output += chunk.toString("utf-8");
+			if (entry.output.length > 20000) entry.output = entry.output.slice(-20000);
+			entry.url = entry.url ?? this.extractUrl(entry.output);
+		};
+		child.stdout.on("data", onData);
+		child.stderr.on("data", onData);
+		child.on("error", (err) => {
+			entry.status = "error";
+			entry.error = err.message;
+		});
+		child.on("exit", (code) => {
+			entry.status = code === 0 ? "complete" : "error";
+			if (code !== 0) entry.error = `Login exited with code ${code}`;
+			entry.child = undefined;
+		});
+
+		res.status(201).json({
+			loginId,
+			agent: connector.id,
+			connector: connector.id,
+			label: connector.label,
+			status: entry.status,
+			url: entry.url,
+			output: entry.output,
+			statusUrl: `/auth/connectors/${encodeURIComponent(connector.id)}/login/${encodeURIComponent(loginId)}`,
+			inputUrl: `/auth/connectors/${encodeURIComponent(connector.id)}/login/${encodeURIComponent(loginId)}/input`,
+		});
+	}
+
+	private handleAgentWorkerLogin(req: express.Request, res: express.Response): void {
+		if (!this.features.agentWorkers) {
+			res.status(404).json({ error: "Agent workers are disabled" });
+			return;
+		}
+		const agent = String(req.params.agent);
+		const connector = this.resolveConnector(agent, "agent-runtime");
+		if (!connector?.command || !connector.loginCommand) {
+			res.status(404).json({ error: "Unknown agent worker" });
+			return;
+		}
+		this.startConnectorLogin(req, res, connector);
+	}
+
+	private writeConnectorLoginStatus(req: express.Request, res: express.Response, connectorId: string, fieldName: "agent" | "connector"): void {
+		const entry = this.pendingAgentWorkerLogins.get(String(req.params.loginId));
+		if (!entry || entry.connectorId !== connectorId) {
+			res.status(404).json({ error: "Login not found" });
+			return;
+		}
+		res.json({
+			status: entry.status,
+			[fieldName]: entry.connectorId,
+			url: entry.url,
+			output: entry.output,
+			error: entry.error,
+			createdAt: entry.createdAt,
+		});
+	}
+
+	private handleAgentWorkerLoginStatus(req: express.Request, res: express.Response): void {
+		if (!this.features.agentWorkers) {
+			res.status(404).json({ error: "Agent workers are disabled" });
+			return;
+		}
+		this.writeConnectorLoginStatus(req, res, String(req.params.agent), "agent");
+	}
+
+	private writeConnectorLoginInput(req: express.Request, res: express.Response, connectorId: string): void {
+		const entry = this.pendingAgentWorkerLogins.get(String(req.params.loginId));
+		if (!entry || entry.connectorId !== connectorId) {
+			res.status(404).json({ error: "Login not found" });
+			return;
+		}
+		const { input } = req.body as { input?: string };
+		if (entry.status !== "pending" || !entry.child || input === undefined) {
+			res.status(409).json({ error: `Login is ${entry.status}` });
+			return;
+		}
+		entry.child.stdin.write(`${input}\n`);
+		res.json({ ok: true, status: entry.status });
+	}
+
+	private handleAgentWorkerLoginInput(req: express.Request, res: express.Response): void {
+		if (!this.features.agentWorkers) {
+			res.status(404).json({ error: "Agent workers are disabled" });
+			return;
+		}
+		this.writeConnectorLoginInput(req, res, String(req.params.agent));
+	}
+
+	private logoutConnector(req: express.Request, res: express.Response, connector: ConnectorRuntime): void {
+		const userId = this.getUserId(req);
+		const home = getConnectorHome(this.getUsersRoot(), userId, connector.id);
+		const child = spawn(connector.command!, connector.logoutCommand!, {
+			env: this.getConnectorEnv(userId, connector),
+			cwd: home,
+			stdio: ["ignore", "ignore", "ignore"],
+		});
+		child.once("exit", () => {
+			try { rmSync(home, { recursive: true, force: true }); } catch { /* ignore */ }
+		});
+		res.json({ ok: true });
+	}
+
+	private handleAgentWorkerLogout(req: express.Request, res: express.Response): void {
+		if (!this.features.agentWorkers) {
+			res.status(404).json({ error: "Agent workers are disabled" });
+			return;
+		}
+		const agent = String(req.params.agent);
+		const connector = this.resolveConnector(agent, "agent-runtime");
+		if (!connector?.command || !connector.logoutCommand) {
+			res.status(404).json({ error: "Unknown agent worker" });
+			return;
+		}
+		this.logoutConnector(req, res, connector);
+	}
+
 	private handleWorkspaces(req: express.Request, res: express.Response): void {
 		const userId = this.getUserId(req);
 		this.workspaceStore.ensureDefaultWorkspace(userId);
@@ -539,9 +908,9 @@ export class HttpServer {
 	}
 
 	private handleCreateWorkspace(req: express.Request, res: express.Response): void {
-		const { name, userName } = req.body as { name?: string; userName?: string };
+		const { name, userName, templateId, type } = req.body as { name?: string; userName?: string; templateId?: string; type?: string };
 		const userId = this.getUserId(req, userName);
-		const workspace = this.workspaceStore.createWorkspace({ name: name || "New workspace", userId });
+		const workspace = this.workspaceStore.createWorkspace({ name: name || "New workspace", userId, templateId: templateId ?? type });
 		res.status(201).json(workspace);
 	}
 
@@ -556,6 +925,96 @@ export class HttpServer {
 	private handleUpdateWorkspaceSettings(req: express.Request, res: express.Response): void {
 		try {
 			res.json(this.workspaceStore.updateWorkspaceSettings(this.getUserId(req), String(req.params.workspaceId), req.body ?? {}));
+		} catch (err) {
+			res.status(403).json({ error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+
+	private async handleWorkspaceSandbox(req: express.Request, res: express.Response): Promise<void> {
+		try {
+			const userId = this.getUserId(req);
+			const workspaceId = String(req.params.workspaceId);
+			this.workspaceStore.assertWorkspaceAccess(userId, workspaceId);
+			const workspaceRoot = this.workspaceStore.getWorkspaceRoot(workspaceId);
+			res.json(await getWorkspaceSandboxStatus(this.sandboxConfig, {
+				workspaceId,
+				workspaceRoot,
+				dataRoot: this.workingDir,
+				usersRoot: join(this.workingDir, "users"),
+				memberUserIds: this.workspaceStore.getWorkspaceMembers(workspaceId).map((member) => member.userId),
+				image: this.workspaceStore.getWorkspaceSandboxImage(workspaceId),
+			}));
+		} catch (err) {
+			res.status(403).json({ error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+
+	private handleWorkspaceEvents(req: express.Request, res: express.Response): void {
+		if (!this.features.reminders) {
+			res.json({ events: [] });
+			return;
+		}
+		try {
+			const userId = this.getUserId(req);
+			const workspaceId = String(req.params.workspaceId);
+			this.workspaceStore.assertWorkspaceAccess(userId, workspaceId);
+			const eventsDir = join(this.workspaceStore.getWorkspaceRoot(workspaceId), "events");
+			if (!existsSync(eventsDir)) {
+				res.json({ events: [] });
+				return;
+			}
+
+			const events = readdirSync(eventsDir, { withFileTypes: true })
+				.filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+				.map((entry) => {
+					const filePath = join(eventsDir, entry.name);
+					const content = existsSync(filePath) ? readFileSync(filePath, "utf-8") : "";
+					let data: Record<string, unknown> = {};
+					let valid = true;
+					let error: string | undefined;
+					try {
+						data = JSON.parse(content) as Record<string, unknown>;
+					} catch (err) {
+						valid = false;
+						error = err instanceof Error ? err.message : String(err);
+					}
+					return {
+						filename: entry.name,
+						type: typeof data.type === "string" ? data.type : "unknown",
+						channelId: typeof data.channelId === "string" ? data.channelId : "",
+						text: typeof data.text === "string" ? data.text : "",
+						at: typeof data.at === "string" ? data.at : undefined,
+						schedule: typeof data.schedule === "string" ? data.schedule : undefined,
+						timezone: typeof data.timezone === "string" ? data.timezone : undefined,
+						modifiedAt: existsSync(filePath) ? Math.round(statSync(filePath).mtimeMs) : 0,
+						valid,
+						error,
+					};
+				})
+				.sort((a, b) => a.filename.localeCompare(b.filename));
+			res.json({ events });
+		} catch (err) {
+			res.status(403).json({ error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+
+	private handleDeleteWorkspaceEvent(req: express.Request, res: express.Response): void {
+		if (!this.features.reminders) {
+			res.status(403).json({ error: "Reminders are disabled" });
+			return;
+		}
+		try {
+			const userId = this.getUserId(req);
+			const workspaceId = String(req.params.workspaceId);
+			const filename = basename(decodeURIComponent(String(req.params.filename)));
+			if (!filename || filename !== decodeURIComponent(String(req.params.filename)) || !filename.endsWith(".json")) {
+				res.status(400).json({ error: "Invalid event filename" });
+				return;
+			}
+			this.workspaceStore.assertWorkspaceAccess(userId, workspaceId);
+			const filePath = join(this.workspaceStore.getWorkspaceRoot(workspaceId), "events", filename);
+			if (existsSync(filePath)) rmSync(filePath, { force: true });
+			res.json({ ok: true });
 		} catch (err) {
 			res.status(403).json({ error: err instanceof Error ? err.message : String(err) });
 		}
@@ -756,6 +1215,44 @@ export class HttpServer {
 		res.json({ running: this.handler.isRunning(channelId) });
 	}
 
+	private getAuthorizedSession(req: express.Request, channelId: string, res: express.Response) {
+		const session = this.workspaceStore.findSession(channelId);
+		if (!session) {
+			res.status(404).json({ error: "Session not found" });
+			return undefined;
+		}
+		try {
+			this.workspaceStore.assertWorkspaceAccess(this.getUserId(req), session.workspaceId);
+		} catch (err) {
+			res.status(403).json({ error: err instanceof Error ? err.message : String(err) });
+			return undefined;
+		}
+		return session;
+	}
+
+	private handleAcpJobs(req: express.Request, channelId: string, res: express.Response): void {
+		const session = this.getAuthorizedSession(req, channelId, res);
+		if (!session) return;
+		if (!this.features.agentWorkers) {
+			res.json({ jobs: [] });
+			return;
+		}
+		const workspaceRoot = this.workspaceStore.getWorkspaceRoot(session.workspaceId);
+		res.json({ jobs: listAcpJobs(workspaceRoot, channelId) });
+	}
+
+	private handleCancelAcpJob(req: express.Request, channelId: string, jobId: string, res: express.Response): void {
+		const session = this.getAuthorizedSession(req, channelId, res);
+		if (!session) return;
+		if (!this.features.agentWorkers) {
+			res.status(403).json({ ok: false, error: "Agent workers are disabled" });
+			return;
+		}
+		const workspaceRoot = this.workspaceStore.getWorkspaceRoot(session.workspaceId);
+		const ok = cancelAcpJob(workspaceRoot, jobId);
+		res.json({ ok });
+	}
+
 	private handleArtifactUrl(req: express.Request, filePath: string, res: express.Response): void {
 		const resolved = this.resolveReadableWorkspaceFile(req, filePath, res);
 		if (!resolved) {
@@ -889,6 +1386,9 @@ export class HttpServer {
 				type ToolResult = { toolCallId: string; toolName: string; text: string; isError: boolean };
 				type Turn = { userText: string; attachments: string[]; toolCalls: ToolCall[]; toolResults: ToolResult[]; assistantTexts: string[] };
 				const normalizeAttachedFilePath = (rawPath: string): string => {
+					const dockerWorkspacePrefix = `/workspace/workspaces/${session.workspaceId}/`;
+					if (rawPath === `/workspace/workspaces/${session.workspaceId}`) return workspaceRoot;
+					if (rawPath.startsWith(dockerWorkspacePrefix)) return join(workspaceRoot, rawPath.slice(dockerWorkspacePrefix.length));
 					if (rawPath === "/workspace") return workspaceRoot;
 					if (rawPath.startsWith("/workspace/")) return join(workspaceRoot, rawPath.slice("/workspace/".length));
 					if (isAbsolute(rawPath)) return rawPath;

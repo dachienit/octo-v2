@@ -2,22 +2,32 @@ import { spawn } from "child_process";
 //IYH1HC add: Node fs/path APIs for cross-platform file I/O on the host
 import { mkdir, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs/promises";
 import { dirname, isAbsolute, posix, resolve } from "node:path";
+import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 
-export type SandboxConfig = { type: "host" } | { type: "docker"; container: string };
+export type ContainerRuntime = "docker" | "podman";
+export type SandboxConfig = { type: "host" } | {
+	type: ContainerRuntime;
+	container?: string;
+	workspacePath?: string;
+	usersPath?: string;
+};
 
 export function parseSandboxArg(value: string): SandboxConfig {
 	if (value === "host") {
 		return { type: "host" };
 	}
-	if (value.startsWith("docker:")) {
-		const container = value.slice("docker:".length);
+	for (const runtime of ["docker", "podman"] as const) {
+		if (value === runtime) return { type: runtime };
+		const prefix = `${runtime}:`;
+		if (!value.startsWith(prefix)) continue;
+		const container = value.slice(prefix.length);
 		if (!container) {
-			console.error("Error: docker sandbox requires container name (e.g., docker:mom-sandbox)");
+			console.error(`Error: ${runtime} sandbox requires container name (e.g., ${runtime}:octo-sandbox)`);
 			process.exit(1);
 		}
-		return { type: "docker", container };
+		return { type: runtime, container };
 	}
-	console.error(`Error: Invalid sandbox type '${value}'. Use 'host' or 'docker:<container-name>'`);
+	console.error(`Error: Invalid sandbox type '${value}'. Use 'host', 'docker', 'podman', 'docker:<container-name>', or 'podman:<container-name>'`);
 	process.exit(1);
 }
 
@@ -27,26 +37,31 @@ export async function validateSandbox(config: SandboxConfig): Promise<void> {
 	}
 
 	try {
-		await execSimple("docker", ["--version"]);
+		await execSimple(config.type, ["--version"]);
 	} catch {
-		console.error("Error: Docker is not installed or not in PATH");
+		console.error(`Error: ${runtimeLabel(config.type)} is not installed or not in PATH`);
 		process.exit(1);
 	}
 
+	if (!config.container) {
+		console.log(`  ${runtimeLabel(config.type)} runtime is available; workspace containers will start on demand.`);
+		return;
+	}
+
 	try {
-		const result = await execSimple("docker", ["inspect", "-f", "{{.State.Running}}", config.container]);
+		const result = await execSimple(config.type, ["inspect", "-f", "{{.State.Running}}", config.container]);
 		if (result.trim() !== "true") {
 			console.error(`Error: Container '${config.container}' is not running.`);
-			console.error(`Start it with: docker start ${config.container}`);
+			console.error(`Start it with: ${config.type} start ${config.container}`);
 			process.exit(1);
 		}
 	} catch {
 		console.error(`Error: Container '${config.container}' does not exist.`);
-		console.error("Create it with: ./docker.sh create <data-dir>");
+		console.error(`Create it with: ./${config.type}.sh create <data-dir>`);
 		process.exit(1);
 	}
 
-	console.log(`  Docker container '${config.container}' is running.`);
+	console.log(`  ${runtimeLabel(config.type)} container '${config.container}' is running.`);
 }
 
 function execSimple(cmd: string, args: string[]): Promise<string> {
@@ -71,11 +86,13 @@ export function createExecutor(config: SandboxConfig, cwd?: string): Executor {
 	if (config.type === "host") {
 		return new HostExecutor(cwd);
 	}
-	return new DockerExecutor(config.container, cwd);
+	if (!config.container) throw new Error(`${config.type} executor requires a resolved container name`);
+	return new ContainerExecutor(config.type, config.container, cwd);
 }
 
 export interface Executor {
 	exec(command: string, options?: ExecOptions): Promise<ExecResult>;
+	spawn(command: string, args?: string[], options?: SpawnOptions): ChildProcessWithoutNullStreams;
 	getWorkspacePath(hostPath: string): string;
 	//IYH1HC add: sandbox-aware file I/O so tools never depend on a POSIX shell.
 	// Host: Node fs (cross-platform). Docker: shell commands inside the container.
@@ -85,6 +102,12 @@ export interface Executor {
 
 export interface ExecOptions {
 	timeout?: number;
+	signal?: AbortSignal;
+}
+
+export interface SpawnOptions {
+	cwd?: string;
+	env?: Record<string, string>;
 	signal?: AbortSignal;
 }
 
@@ -186,18 +209,27 @@ class HostExecutor implements Executor {
 		await mkdir(dirname(resolved), { recursive: true });
 		await fsWriteFile(resolved, content, "utf-8");
 	}
+	spawn(command: string, args: string[] = [], options?: SpawnOptions): ChildProcessWithoutNullStreams {
+		const child = spawn(command, args, {
+			cwd: options?.cwd ?? this.cwd,
+			env: { ...process.env, ...(options?.env ?? {}) },
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		options?.signal?.addEventListener("abort", () => child.kill("SIGTERM"), { once: true });
+		return child;
+	}
 }
 
-class DockerExecutor implements Executor {
-	constructor(private container: string, private cwd?: string) {}
+class ContainerExecutor implements Executor {
+	constructor(private runtime: ContainerRuntime, private container: string, private cwd?: string) {}
 
 	async exec(command: string, options?: ExecOptions): Promise<ExecResult> {
 		const wrappedCommand = this.cwd
 			? `mkdir -p ${shellEscape(this.cwd)} && cd ${shellEscape(this.cwd)} && ${command}`
 			: command;
-		const dockerCmd = `docker exec ${this.container} sh -c ${shellEscape(wrappedCommand)}`;
+		const containerCmd = `${this.runtime} exec ${this.container} sh -c ${shellEscape(wrappedCommand)}`;
 		const hostExecutor = new HostExecutor();
-		return hostExecutor.exec(dockerCmd, options);
+		return hostExecutor.exec(containerCmd, options);
 	}
 
 	getWorkspacePath(_hostPath: string): string {
@@ -232,6 +264,27 @@ class DockerExecutor implements Executor {
 			throw new Error(result.stderr || `Failed to write file: ${path}`);
 		}
 	}
+	spawn(command: string, args: string[] = [], options?: SpawnOptions): ChildProcessWithoutNullStreams {
+		const cwd = options?.cwd ?? this.cwd;
+		const commandLine = [command, ...args].map(shellEscape).join(" ");
+		const wrappedCommand = cwd
+			? `mkdir -p ${shellEscape(cwd)} && cd ${shellEscape(cwd)} && exec ${commandLine}`
+			: `exec ${commandLine}`;
+		const containerArgs = ["exec", "-i"];
+		for (const [key, value] of Object.entries(options?.env ?? {})) {
+			containerArgs.push("--env", `${key}=${value}`);
+		}
+		containerArgs.push(this.container, "sh", "-c", wrappedCommand);
+		const child = spawn(this.runtime, containerArgs, {
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		options?.signal?.addEventListener("abort", () => child.kill("SIGTERM"), { once: true });
+		return child;
+	}
+}
+
+function runtimeLabel(runtime: ContainerRuntime): string {
+	return runtime === "docker" ? "Docker" : "Podman";
 }
 
 function killProcessTree(pid: number): void {

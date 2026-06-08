@@ -5,7 +5,7 @@ import {
 	loadSkills,
 	type CoreAgentEventHandlers,
 	type SandboxConfig,
-} from "@octo/core";
+} from "@octo/core-agent";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import * as log from "./log.js";
@@ -30,6 +30,10 @@ export interface AgentRunner {
 
 export interface RunnerOptions {
 	authFilePath?: string;
+	userId?: string;
+	usersRoot?: string;
+	agentWorkersEnabled?: boolean;
+	remindersEnabled?: boolean;
 }
 
 function truncate(text: string, maxLen: number): string {
@@ -93,11 +97,13 @@ function buildSystemPrompt(
 	users: UserInfo[],
 	skills: ReturnType<typeof loadSkills>,
 	workspaceInstructions: string,
+	remindersEnabled: boolean,
 ): string {
 	const workspacePathFwd = workspacePath.replace(/\\/g, "/");
 	const channelPath = `${workspacePathFwd}/sessions/${channelId}`;
 	const workingDirectory = `${workspacePathFwd}/artifacts`;
-	const isDocker = sandboxConfig.type === "docker";
+	const isContainer = sandboxConfig.type === "docker" || sandboxConfig.type === "podman";
+	const containerRuntime = sandboxConfig.type === "podman" ? "Podman" : "Docker";
 
 	const channelMappings =
 		channels.length > 0 ? channels.map((c) => `${c.id}\t#${c.name}`).join("\n") : "(no channels loaded)";
@@ -105,8 +111,8 @@ function buildSystemPrompt(
 	const userMappings =
 		users.length > 0 ? users.map((u) => `${u.id}\t@${u.userName}\t${u.displayName}`).join("\n") : "(no users loaded)";
 
-	const envDescription = isDocker
-		? `You are running inside a Docker container (Alpine Linux).
+	const envDescription = isContainer
+		? `You are running inside a ${containerRuntime} container (Alpine Linux).
 - Bash working directory: ${workingDirectory}
 - Install tools with: apk add <package>
 - Your changes persist across sessions`
@@ -124,6 +130,70 @@ function buildSystemPrompt(
 
 	const workspaceInstructionsSection = workspaceInstructions.trim()
 		? `\n## Workspace Instructions\nThese workspace-specific instructions are loaded from AGENTS.md/agents.md/CLAUDE.md/claude.md in the workspace root and override general behavior when they conflict.\n\n${workspaceInstructions.trim()}\n`
+		: "";
+
+	const eventsSection = remindersEnabled
+		? `
+## Events
+You can schedule events that wake you up at specific times or when external things happen. Events are JSON files in \`${workspacePathFwd}/events/\`.
+
+### Event Types
+
+**Immediate** - Triggers as soon as harness sees the file. Use in scripts/webhooks to signal external events.
+\`\`\`json
+{"type": "immediate", "channelId": "${channelId}", "text": "New GitHub issue opened"}
+\`\`\`
+
+**One-shot** - Triggers once at a specific time. Use for reminders.
+\`\`\`json
+{"type": "one-shot", "channelId": "${channelId}", "text": "Remind Mario about dentist", "at": "2025-12-15T09:00:00+01:00"}
+\`\`\`
+
+**Periodic** - Triggers on a cron schedule. Use for recurring tasks.
+\`\`\`json
+{"type": "periodic", "channelId": "${channelId}", "text": "Check inbox and summarize", "schedule": "0 9 * * 1-5", "timezone": "${Intl.DateTimeFormat().resolvedOptions().timeZone}"}
+\`\`\`
+
+### Cron Format
+\`minute hour day-of-month month day-of-week\`
+- \`0 9 * * *\` = daily at 9:00
+- \`0 9 * * 1-5\` = weekdays at 9:00
+- \`30 14 * * 1\` = Mondays at 14:30
+- \`0 0 1 * *\` = first of each month at midnight
+
+### Timezones
+All \`at\` timestamps must include offset (e.g., \`+01:00\`). Periodic events use IANA timezone names. The harness runs in ${Intl.DateTimeFormat().resolvedOptions().timeZone}. When users mention times without timezone, assume ${Intl.DateTimeFormat().resolvedOptions().timeZone}.
+
+### Creating Events
+Use unique filenames to avoid overwriting existing events. Include a timestamp or random suffix:
+\`\`\`bash
+cat > ${workspacePathFwd}/events/dentist-reminder-$(date +%s).json << 'EOF'
+{"type": "one-shot", "channelId": "${channelId}", "text": "Dentist tomorrow", "at": "2025-12-14T09:00:00+01:00"}
+EOF
+\`\`\`
+Or check if file exists first before creating.
+
+### Managing Events
+- List: \`ls ${workspacePathFwd}/events/\`
+- View: \`cat ${workspacePathFwd}/events/foo.json\`
+- Delete/cancel: \`rm ${workspacePathFwd}/events/foo.json\`
+
+### When Events Trigger
+You receive a message like:
+\`\`\`
+[EVENT:dentist-reminder.json:one-shot:2025-12-14T09:00:00+01:00] Dentist tomorrow
+\`\`\`
+Immediate and one-shot events auto-delete after triggering. Periodic events persist until you delete them.
+
+### Silent Completion
+For periodic events where there's nothing to report, respond with just \`[SILENT]\` (no other text). This deletes the status message and posts nothing to Slack. Use this to avoid spamming the channel when periodic checks find nothing actionable.
+
+### Debouncing
+When writing programs that create immediate events (email watchers, webhooks, etc.), always debounce. If 50 emails arrive in a minute, don't create 50 immediate events. Instead collect events over a window and create ONE immediate event summarizing what happened, or just signal "new activity, check inbox" rather than per-item events. Or simpler: use a periodic event to check for new items every N minutes instead of immediate events.
+
+### Limits
+Maximum 5 events can be queued. Don't create excessive immediate or periodic events.
+`
 		: "";
 
 	return `You are mom, a Slack bot assistant. Be concise. No emojis.
@@ -189,8 +259,8 @@ Then use the write tool to create the file there, then call attach:
 
 Do NOT just tell the user the file path — always call \`attach\` so it renders in the chat.
 
-## Skills (Custom CLI Tools)
-You can create reusable CLI tools for recurring tasks (email, APIs, data processing, etc.).
+## Workspace Skills
+Workspace skills are instruction files that provide specialized domain guidance. They are not callable tools.
 
 ### Creating Skills
 Store in \`${workspacePathFwd}/skills/<name>/\` (global) or \`${channelPath}/skills/<name>/\` (channel-specific).
@@ -213,65 +283,11 @@ Scripts are in: {baseDir}/
 ### Available Skills
 ${skills.length > 0 ? formatSkillsForPrompt(skills) : "(no skills installed yet)"}
 
-## Events
-You can schedule events that wake you up at specific times or when external things happen. Events are JSON files in \`${workspacePathFwd}/events/\`.
+If a skill is listed above, it is available in this workspace. Do not claim a listed skill is unavailable and do not look for it as a tool.
+When the user asks to use a listed skill, or the request strongly matches a listed skill description, read that skill's \`SKILL.md\` from the listed location before answering unless the answer is only a trivial clarification.
+Treat natural names as aliases for listed skill IDs. For example, "abap cds skill", "ABAP CDS", and "CDS skill" refer to \`sap-abap-cds\` when that skill is listed.
 
-### Event Types
-
-**Immediate** - Triggers as soon as harness sees the file. Use in scripts/webhooks to signal external events.
-\`\`\`json
-{"type": "immediate", "channelId": "${channelId}", "text": "New GitHub issue opened"}
-\`\`\`
-
-**One-shot** - Triggers once at a specific time. Use for reminders.
-\`\`\`json
-{"type": "one-shot", "channelId": "${channelId}", "text": "Remind Mario about dentist", "at": "2025-12-15T09:00:00+01:00"}
-\`\`\`
-
-**Periodic** - Triggers on a cron schedule. Use for recurring tasks.
-\`\`\`json
-{"type": "periodic", "channelId": "${channelId}", "text": "Check inbox and summarize", "schedule": "0 9 * * 1-5", "timezone": "${Intl.DateTimeFormat().resolvedOptions().timeZone}"}
-\`\`\`
-
-### Cron Format
-\`minute hour day-of-month month day-of-week\`
-- \`0 9 * * *\` = daily at 9:00
-- \`0 9 * * 1-5\` = weekdays at 9:00
-- \`30 14 * * 1\` = Mondays at 14:30
-- \`0 0 1 * *\` = first of each month at midnight
-
-### Timezones
-All \`at\` timestamps must include offset (e.g., \`+01:00\`). Periodic events use IANA timezone names. The harness runs in ${Intl.DateTimeFormat().resolvedOptions().timeZone}. When users mention times without timezone, assume ${Intl.DateTimeFormat().resolvedOptions().timeZone}.
-
-### Creating Events
-Use unique filenames to avoid overwriting existing events. Include a timestamp or random suffix:
-\`\`\`bash
-cat > ${workspacePathFwd}/events/dentist-reminder-$(date +%s).json << 'EOF'
-{"type": "one-shot", "channelId": "${channelId}", "text": "Dentist tomorrow", "at": "2025-12-14T09:00:00+01:00"}
-EOF
-\`\`\`
-Or check if file exists first before creating.
-
-### Managing Events
-- List: \`ls ${workspacePathFwd}/events/\`
-- View: \`cat ${workspacePathFwd}/events/foo.json\`
-- Delete/cancel: \`rm ${workspacePathFwd}/events/foo.json\`
-
-### When Events Trigger
-You receive a message like:
-\`\`\`
-[EVENT:dentist-reminder.json:one-shot:2025-12-14T09:00:00+01:00] Dentist tomorrow
-\`\`\`
-Immediate and one-shot events auto-delete after triggering. Periodic events persist until you delete them.
-
-### Silent Completion
-For periodic events where there's nothing to report, respond with just \`[SILENT]\` (no other text). This deletes the status message and posts nothing to Slack. Use this to avoid spamming the channel when periodic checks find nothing actionable.
-
-### Debouncing
-When writing programs that create immediate events (email watchers, webhook handlers, etc.), always debounce. If 50 emails arrive in a minute, don't create 50 immediate events. Instead collect events over a window and create ONE immediate event summarizing what happened, or just signal "new activity, check inbox" rather than per-item events. Or simpler: use a periodic event to check for new items every N minutes instead of immediate events.
-
-### Limits
-Maximum 5 events can be queued. Don't create excessive immediate or periodic events.
+${eventsSection}
 
 ## Memory
 Write to MEMORY.md files to persist context across conversations.
@@ -295,7 +311,7 @@ ${workspaceInstructionsSection}
 ## Log Queries (for older history)
 Format: \`{"date":"...","ts":"...","user":"...","userName":"...","text":"...","isBot":false}\`
 The log contains user messages and your final responses (not tool calls/results).
-${isDocker ? "Install jq: apk add jq" : ""}
+${isContainer ? "Install jq: apk add jq" : ""}
 
 \`\`\`bash
 # Recent messages
@@ -329,7 +345,7 @@ function loadWorkspaceInstructions(workspacePath: string): string {
 
 // Cache one CoreAgent per channel/auth file. AgentSession owns a ModelRegistry
 // bound to its AuthStorage, so recreate the agent when a web user auth path changes.
-const channelAgents = new Map<string, { agent: CoreAgent; authFilePath?: string }>();
+const channelAgents = new Map<string, { agent: CoreAgent; authFilePath?: string; agentWorkersEnabled?: boolean; remindersEnabled?: boolean }>();
 
 export function getOrCreateRunner(
 	sandboxConfig: SandboxConfig,
@@ -338,13 +354,25 @@ export function getOrCreateRunner(
 	options: RunnerOptions = {},
 ): AgentRunner {
 	const existing = channelAgents.get(channelId);
-	if (existing && existing.authFilePath === options.authFilePath) {
-		return createRunner(existing.agent, sandboxConfig, channelId, channelDir);
+	if (
+		existing &&
+		existing.authFilePath === options.authFilePath &&
+		existing.agentWorkersEnabled === options.agentWorkersEnabled &&
+		existing.remindersEnabled === options.remindersEnabled
+	) {
+		return createRunner(existing.agent, sandboxConfig, channelId, channelDir, options.remindersEnabled !== false);
 	}
 
-	const agent = new CoreAgent(channelId, { sandboxConfig, channelDir, authFilePath: options.authFilePath });
-	channelAgents.set(channelId, { agent, authFilePath: options.authFilePath });
-	return createRunner(agent, sandboxConfig, channelId, channelDir);
+	const agent = new CoreAgent(channelId, {
+		sandboxConfig,
+		channelDir,
+		authFilePath: options.authFilePath,
+		userId: options.userId,
+		usersRoot: options.usersRoot,
+		agentWorkersEnabled: options.agentWorkersEnabled,
+	});
+	channelAgents.set(channelId, { agent, authFilePath: options.authFilePath, agentWorkersEnabled: options.agentWorkersEnabled, remindersEnabled: options.remindersEnabled });
+	return createRunner(agent, sandboxConfig, channelId, channelDir, options.remindersEnabled !== false);
 }
 
 function createRunner(
@@ -352,6 +380,7 @@ function createRunner(
 	sandboxConfig: SandboxConfig,
 	channelId: string,
 	channelDir: string,
+	remindersEnabled: boolean,
 ): AgentRunner {
 	return {
 		async run(
@@ -420,6 +449,18 @@ function createRunner(
 					}
 				},
 
+				onToolUpdate(toolName, label, args, resultText) {
+					if (!resultText.trim()) return;
+					log.logInfo(`[${channelId}] ${toolName} update: ${truncate(resultText, 200)}`);
+					const argsFormatted = formatToolArgsForSlack(toolName, args);
+					let threadMessage = `*… ${toolName}*`;
+					if (label) threadMessage += `: ${label}`;
+					threadMessage += "\n";
+					if (argsFormatted) threadMessage += `\`\`\`\n${argsFormatted}\n\`\`\`\n`;
+					threadMessage += `*Progress:*\n\`\`\`\n${resultText}\n\`\`\``;
+					enqueueMessage(threadMessage, "thread", "tool progress thread", false);
+				},
+
 				onMessage(text) {
 					log.logResponse(logCtx, text);
 					enqueueMessage(text, "main", "response main");
@@ -457,7 +498,8 @@ function createRunner(
 			// Build system prompt with fresh memory/skills/channels/users
 			const memory = getMemory(channelDir);
 			const skills = loadSkills(channelDir, coreAgent.workspacePath);
-			const workspaceInstructions = loadWorkspaceInstructions(coreAgent.workspacePath);
+			const hostWorkspacePath = join(channelDir, "..", "..");
+			const workspaceInstructions = loadWorkspaceInstructions(hostWorkspacePath);
 			const systemPrompt = buildSystemPrompt(
 				coreAgent.workspacePath,
 				channelId,
@@ -467,6 +509,7 @@ function createRunner(
 				ctx.users,
 				skills,
 				workspaceInstructions,
+				remindersEnabled,
 			);
 
 			log.logInfo(`Context sizes - system: ${systemPrompt.length} chars, memory: ${memory.length} chars`);

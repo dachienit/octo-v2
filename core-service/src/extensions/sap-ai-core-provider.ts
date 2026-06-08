@@ -1,4 +1,4 @@
-import { calculateCost, createAssistantMessageEventStream, type AssistantMessage, type Context, type ExtensionAPI, type Model, type ProviderModelConfig, type SimpleStreamOptions, type TextContent } from "@octo/core";
+import { calculateCost, createAssistantMessageEventStream, type AssistantMessage, type Context, type ExtensionAPI, type Model, type ProviderModelConfig, type SimpleStreamOptions, type TextContent } from "@octo/core-agent";
 import { installSapOrchestrationFetch } from "./sap-orchestration-adapter.js";
 
 type SAPServiceKey = {

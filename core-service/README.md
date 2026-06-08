@@ -11,6 +11,7 @@ A Slack bot powered by an LLM that can execute bash commands, read/write files, 
 - **Docker Sandbox**: Isolate mom in a container (recommended for all use)
 - **Persistent Workspace**: All conversation history, files, and tools stored in one directory you control
 - **Working Memory & Custom Tools**: Mom remembers context across sessions and creates workflow-specific CLI tools ([aka "skills"](https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/)) for your tasks
+- **Agent Delegation**: Mom can delegate work to local worker agents
 - **Thread-Based Details**: Clean main messages with verbose tool details in threads
 
 ## Documentation
@@ -66,17 +67,47 @@ export MOM_SLACK_BOT_TOKEN=xoxb-...
 export ANTHROPIC_API_KEY=sk-ant-...
 # Option 2: use /login command in pi agent, then copy/link auth.json to ~/.pi/mom/
 
-# Create Docker sandbox (recommended)
-docker run -d \
-  --name mom-sandbox \
-  -v $(pwd)/data:/workspace \
-  alpine:latest \
-  tail -f /dev/null
+# Run mom with managed per-workspace Docker sandboxes
+mom --sandbox=docker ./data
 
-# Run mom in Docker mode
-mom --sandbox=docker:mom-sandbox ./data
+# Or use Podman instead
+mom --sandbox=podman ./data
+
+# Fixed shared-container mode is still available for debugging
+./docker.sh build
+./docker.sh create ./data
+mom --sandbox=docker:octo-sandbox ./data
 
 # Mom will install any tools she needs herself (git, jq, etc.)
+```
+
+## Workspace Templates
+
+Workspace creation can copy starter content from the service data root:
+
+```text
+<data-root>/templates/sap-cap/
+<data-root>/templates/sap-abap/
+```
+
+Each template folder is copied into the new workspace when that type is selected. The service seeds default SAP template folders on startup if they are missing. The built-in templates vendor selected skills from [`secondsky/sap-skills`](https://github.com/secondsky/sap-skills):
+
+- `sap-cap`: `sap-cap-capire`
+- `sap-abap`: `sap-abap`, `sap-abap-cds`
+
+Put files such as `AGENTS.md`, `skills/<name>/SKILL.md`, sample artifacts, or other starter content in the matching template folder.
+
+Optional `template.json` controls template metadata:
+
+```json
+{
+  "label": "SAP ABAP",
+  "description": "SAP ABAP and ABAP CDS workspace with vendored ABAP development skills.",
+  "sandboxImage": "octo/sandbox:local",
+  "settings": {
+    "connectors": { "allowed": ["sap-adt"] }
+  }
+}
 ```
 
 ## CLI Options
@@ -86,7 +117,10 @@ mom [options] <working-directory>
 
 Options:
   --sandbox=host              Run tools on host (not recommended)
-  --sandbox=docker:<name>     Run tools in Docker container (recommended)
+  --sandbox=docker            Run tools in managed per-workspace Docker containers
+  --sandbox=podman            Run tools in managed per-workspace Podman containers
+  --sandbox=docker:<name>     Run tools in a fixed Docker container
+  --sandbox=podman:<name>     Run tools in a fixed Podman container
 ```
 
 ## Environment Variables
@@ -96,6 +130,7 @@ Options:
 | `MOM_SLACK_APP_TOKEN` | Slack app-level token (xapp-...) |
 | `MOM_SLACK_BOT_TOKEN` | Slack bot token (xoxb-...) |
 | `ANTHROPIC_API_KEY` | (Optional) Anthropic API key |
+| `ACP_AGENTS_JSON` | (Optional) JSON map of worker agent commands |
 
 ## Authentication
 
@@ -151,6 +186,18 @@ Mom has access to these tools:
 - **write**: Create or overwrite files
 - **edit**: Make surgical edits to existing files
 - **attach**: Share files back to Slack
+- **Agent workers**: List configured local worker agents
+- **Agent delegate**: Delegate single, parallel, or chained tasks to worker agents
+
+Worker agents run as host subprocesses and receive mom's shared `artifacts/` workspace as their session cwd, so files created by mom and delegated agents are visible to each other. Configure real agent CLI commands with `ACP_AGENTS_JSON`:
+
+```bash
+export ACP_AGENTS_JSON='{
+  "codex": { "command": "npx", "args": ["-y", "@agentclientprotocol/codex-acp"] },
+  "gemini": { "command": "gemini", "args": ["--acp"] },
+  "claude": { "command": "npx", "args": ["-y", "@agentclientprotocol/claude-agent-acp"] }
+}'
+```
 
 ### Bash Execution Environment
 
@@ -169,7 +216,7 @@ Mom uses the `bash` tool to do most of her work. It can run in one of two enviro
 
 ### Self-Managing Environment
 
-Inside her execution environment (Docker container or host), mom has full control:
+Inside her execution environment (container or host), mom has full control:
 - **Installs tools**: `apk add git jq curl` (Linux) or `brew install` (macOS)
 - **Configures tool credentials**: Asks you for tokens/keys and stores them inside the container or data directory, depending on the tool's needs
 - **Persistent**: Everything she installs stays between sessions. If you remove the container, anything not in the data directory is lost
@@ -364,7 +411,7 @@ You can write event files directly to `data/events/` on the host machine. This l
 
 ### Updating Mom
 
-Update mom anytime with `npm install -g @mariozechner/pi-mom`. This only updates the Node.js app on your host. Anything mom installed inside the Docker container remains unchanged.
+Update mom anytime with `npm install -g @mariozechner/pi-mom`. This only updates the Node.js app on your host. Anything mom installed inside the sandbox container remains unchanged.
 
 ## Message History
 
@@ -444,10 +491,10 @@ Mom executes the hidden command and sends your SSH key to the attacker.
 Example setup:
 ```bash
 # General team mom (limited access)
-mom --sandbox=docker:mom-general ./data-general
+mom --sandbox=docker:octo-sandbox ./data-general
 
 # Executive team mom (full access)
-mom --sandbox=docker:mom-exec ./data-exec
+mom --sandbox=docker:octo-sandbox ./data-exec
 ```
 
 **Mitigations:**
@@ -482,7 +529,9 @@ npm run dev
 Terminal 2 (mom, with auto-restart):
 ```bash
 cd packages/mom
-npx tsx --watch-path src --watch src/main.ts --sandbox=docker:mom-sandbox ./data
+npx tsx --watch-path src --watch src/main.ts --sandbox=docker ./data
+# or
+npx tsx --watch-path src --watch src/main.ts --sandbox=podman ./data
 ```
 
 ## License

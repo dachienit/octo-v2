@@ -7,6 +7,12 @@ export interface CoreAgentOptions {
 	channelDir: string;
 	/** Auth JSON path used unless a run provides a user-specific path */
 	authFilePath?: string;
+	/** User id owning this agent run and any delegated worker auth */
+	userId?: string;
+	/** Root directory containing per-user service data */
+	usersRoot?: string;
+	/** Enable ACP-compatible delegated worker agents */
+	agentWorkersEnabled?: boolean;
 	/** Additional tools beyond the primitive set */
 	extraTools?: AgentTool<any>[];
 }
@@ -45,6 +51,12 @@ export interface CoreAgentEventHandlers {
 		durationMs: number,
 		resultText: string,
 		isError: boolean,
+	) => void;
+	onToolUpdate?: (
+		toolName: string,
+		label: string | undefined,
+		args: Record<string, unknown>,
+		resultText: string,
 	) => void;
 	onMessage?: (text: string) => void;
 	onThinking?: (text: string) => void;

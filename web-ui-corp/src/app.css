@@ -1,0 +1,135 @@
+/* Import Claude theme from mini-lit */
+@import "@mariozechner/mini-lit/styles/themes/default.css";
+
+/* Tell Tailwind to scan mini-lit components */
+/* biome-ignore lint/suspicious/noUnknownAtRules: Tailwind 4 source directive */
+@source "../../../node_modules/@mariozechner/mini-lit/dist";
+/* Tell Tailwind to scan this source package when consumed from the monorepo app. */
+/* biome-ignore lint/suspicious/noUnknownAtRules: Tailwind 4 source directive */
+@source ".";
+
+/* Import Tailwind */
+/* biome-ignore lint/correctness/noInvalidPositionAtImportRule: fuck you */
+@import "tailwindcss";
+
+body {
+	font-size: 16px;
+	-webkit-font-smoothing: antialiased;
+}
+
+:root {
+	--background: var(--sapBackgroundColor, #f7f7f7);
+	--foreground: var(--sapTextColor, #1d2d3e);
+	--card: var(--sapTile_Background, #ffffff);
+	--card-foreground: var(--sapTextColor, #1d2d3e);
+	--popover: var(--sapGroup_ContentBackground, #ffffff);
+	--popover-foreground: var(--sapTextColor, #1d2d3e);
+	--primary: var(--sapButton_Emphasized_Background, #0070f2);
+	--primary-foreground: var(--sapButton_Emphasized_TextColor, #ffffff);
+	--secondary: var(--sapButton_Background, #ffffff);
+	--secondary-foreground: var(--sapButton_TextColor, #0064d9);
+	--muted: var(--sapList_Background, #ffffff);
+	--muted-foreground: var(--sapContent_LabelColor, #556b82);
+	--accent: var(--sapList_SelectionBackgroundColor, #e5f2ff);
+	--accent-foreground: var(--sapLinkColor, #0064d9);
+	--destructive: var(--sapNegativeColor, #aa0808);
+	--destructive-foreground: var(--sapContent_ContrastTextColor, #ffffff);
+	--border: var(--sapList_BorderColor, #d9d9d9);
+	--input: var(--sapField_BorderColor, #89919a);
+	--ring: var(--sapContent_FocusColor, #0064d9);
+	--sidebar: var(--sapShell_Background, #eff1f2);
+	--sidebar-foreground: var(--sapShell_TextColor, #1d2d3e);
+	--sidebar-primary: var(--sapButton_Emphasized_Background, #0070f2);
+	--sidebar-primary-foreground: var(--sapButton_Emphasized_TextColor, #ffffff);
+	--sidebar-accent: var(--sapShell_InteractiveBackground, #ffffff);
+	--sidebar-accent-foreground: var(--sapShell_InteractiveTextColor, #0064d9);
+	--sidebar-border: var(--sapShell_BorderColor, #d9d9d9);
+	--sidebar-ring: var(--sapContent_FocusColor, #0064d9);
+	--radius: var(--sapElement_BorderCornerRadius, 0.5rem);
+	--font-sans: var(--sapFontFamily, "72", Arial, Helvetica, sans-serif);
+}
+
+.dark {
+	--background: var(--sapBackgroundColor, #1d232a);
+	--foreground: var(--sapTextColor, #f5f6f7);
+	--card: var(--sapTile_Background, #222b35);
+	--card-foreground: var(--sapTextColor, #f5f6f7);
+	--popover: var(--sapGroup_ContentBackground, #222b35);
+	--popover-foreground: var(--sapTextColor, #f5f6f7);
+	--primary: var(--sapButton_Emphasized_Background, #4db1ff);
+	--primary-foreground: var(--sapButton_Emphasized_TextColor, #0b1f33);
+	--secondary: var(--sapButton_Background, #2d3742);
+	--secondary-foreground: var(--sapButton_TextColor, #8cc9ff);
+	--muted: var(--sapList_Background, #1d232a);
+	--muted-foreground: var(--sapContent_LabelColor, #b8c4cf);
+	--accent: var(--sapList_SelectionBackgroundColor, #12314d);
+	--accent-foreground: var(--sapLinkColor, #8cc9ff);
+	--destructive: var(--sapNegativeColor, #ff8888);
+	--destructive-foreground: var(--sapContent_ContrastTextColor, #ffffff);
+	--border: var(--sapList_BorderColor, #3a4552);
+	--input: var(--sapField_BorderColor, #798797);
+	--ring: var(--sapContent_FocusColor, #8cc9ff);
+	--sidebar: var(--sapShell_Background, #161c22);
+	--sidebar-foreground: var(--sapShell_TextColor, #f5f6f7);
+	--sidebar-primary: var(--sapButton_Emphasized_Background, #4db1ff);
+	--sidebar-primary-foreground: var(--sapButton_Emphasized_TextColor, #0b1f33);
+	--sidebar-accent: var(--sapShell_InteractiveBackground, #222b35);
+	--sidebar-accent-foreground: var(--sapShell_InteractiveTextColor, #8cc9ff);
+	--sidebar-border: var(--sapShell_BorderColor, #3a4552);
+	--sidebar-ring: var(--sapContent_FocusColor, #8cc9ff);
+	--radius: var(--sapElement_BorderCornerRadius, 0.5rem);
+	--font-sans: var(--sapFontFamily, "72", Arial, Helvetica, sans-serif);
+}
+
+* {
+	scrollbar-width: thin;
+	scrollbar-color: var(--color-border) rgba(0, 0, 0, 0);
+}
+
+*::-webkit-scrollbar {
+	width: 8px;
+	height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+	background-color: var(--color-border);
+	border-radius: 4px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+	background-color: rgba(0, 0, 0, 0);
+}
+
+/* Fix cursor for dialog close buttons */
+.fixed.inset-0 button[aria-label*="Close"],
+.fixed.inset-0 button[type="button"] {
+	cursor: pointer;
+}
+
+/* Shimmer animation for thinking text */
+@keyframes shimmer {
+	0% {
+		background-position: -200% 0;
+	}
+	100% {
+		background-position: 200% 0;
+	}
+}
+
+.animate-shimmer {
+	animation: shimmer 2s ease-in-out infinite;
+}
+
+/* User message with fancy pill styling */
+.user-message-container {
+	transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+	position: relative;
+	background: linear-gradient(135deg, rgba(217, 79, 0, 0.12), rgba(255, 107, 0, 0.12), rgba(212, 165, 0, 0.12));
+	border: 1px solid rgba(255, 107, 0, 0.25);
+	backdrop-filter: blur(10px);
+	max-width: 100%;
+}

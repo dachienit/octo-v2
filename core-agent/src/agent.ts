@@ -4,17 +4,19 @@ import {
 	AgentSession,
 	AuthStorage,
 	convertToLlm,
+	DefaultResourceLoader,
 	formatSkillsForPrompt,
+	getAgentDir,
 	loadSkillsFromDir,
 	ModelRegistry,
-	type ResourceLoader,
 	SessionManager,
 	type Skill,
 } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
 import { homedir } from "os";
-import { dirname, join } from "path";
+import { dirname, isAbsolute, join, relative } from "path";
+import { createAcpOrchestratorExtension } from "./extensions/acp-orchestrator.js";
 import { createExecutor, type Executor } from "./sandbox.js";
 import { AgentSettingsManager } from "./settings.js";
 import { createPrimitiveTools } from "./tools/index.js";
@@ -253,6 +255,7 @@ function freshUsage() {
 export class CoreAgent {
 	private readonly channelId: string;
 	private readonly channelDir: string;
+	private readonly hostDataRoot: string;
 	private readonly hostWorkspacePath: string;
 	/** Container path (or host path for host-mode sandboxes) */
 	readonly workspacePath: string;
@@ -260,6 +263,7 @@ export class CoreAgent {
 	private readonly agentInstance: Agent;
 	private readonly session: AgentSession;
 	private readonly sessionManager: SessionManager;
+	private resourcesLoaded = false;
 	private authStorage: AuthStorage;
 	private authFilePath: string;
 
@@ -284,14 +288,23 @@ export class CoreAgent {
 		this.channelId = channelId;
 		this.channelDir = options.channelDir;
 		const hostWorkspacePath = dirname(dirname(options.channelDir));
+		const hostDataRoot = options.usersRoot ? dirname(options.usersRoot) : dirname(dirname(hostWorkspacePath));
+		this.hostDataRoot = hostDataRoot;
 		this.hostWorkspacePath = hostWorkspacePath;
 		const hostArtifactsDir = join(hostWorkspacePath, "artifacts");
 		mkdirSync(hostArtifactsDir, { recursive: true });
-		const executorCwd = options.sandboxConfig.type === "docker"
-			? "/workspace/artifacts"
+		const sandboxConfig = options.sandboxConfig;
+		const isContainerSandbox = isContainerSandboxConfig(sandboxConfig);
+		const containerWorkspacePath = isContainerSandbox
+			? sandboxConfig.workspacePath ?? getContainerWorkspacePath(hostDataRoot, hostWorkspacePath)
+			: hostWorkspacePath;
+		const executorCwd = isContainerSandbox
+			? `${containerWorkspacePath}/artifacts`
 			: hostArtifactsDir;
-		this.executor = createExecutor(options.sandboxConfig, executorCwd);
-		this.workspacePath = this.executor.getWorkspacePath(hostWorkspacePath);
+		this.executor = createExecutor(sandboxConfig, executorCwd);
+		this.workspacePath = isContainerSandbox
+			? containerWorkspacePath
+			: this.executor.getWorkspacePath(hostWorkspacePath);
 
 		//IYH1HC add: attach uploads from the HOST fs, so it must use the host artifacts dir
 		//IYH1HC add: (executorCwd is a container path like /workspace/artifacts in Docker mode).
@@ -321,17 +334,27 @@ export class CoreAgent {
 			(this.agentInstance.state as any).messages = loadedSession.messages;
 		}
 
-		const resourceLoader: ResourceLoader = {
-			getExtensions: () => ({ extensions: [], errors: [], runtime: { pendingProviderRegistrations: [] } as any }),
-			getSkills: () => ({ skills: [], diagnostics: [] }),
-			getPrompts: () => ({ prompts: [], diagnostics: [] }),
-			getThemes: () => ({ themes: [], diagnostics: [] }),
-			getAgentsFiles: () => ({ agentsFiles: [] }),
-			getSystemPrompt: () => "",
-			getAppendSystemPrompt: () => [],
-			extendResources: () => {},
-			reload: async () => {},
-		};
+		const runtimeUsersRoot = isContainerSandbox ? sandboxConfig.usersPath ?? "/workspace/users" : options.usersRoot;
+
+		const extensionFactories = options.agentWorkersEnabled === false
+			? []
+			: [createAcpOrchestratorExtension(executorCwd, hostWorkspacePath, channelId, {
+				userId: options.userId ?? "web-user",
+				usersRoot: options.usersRoot,
+				runtimeUsersRoot,
+			}, this.executor)];
+
+		const resourceLoader = new DefaultResourceLoader({
+			cwd: executorCwd,
+			agentDir: getAgentDir(),
+			settingsManager: settingsManager as any,
+			extensionFactories,
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+			noContextFiles: true,
+			systemPrompt: "",
+		});
 
 		const baseToolsOverride = Object.fromEntries(tools.map((t) => [t.name, t]));
 
@@ -369,6 +392,17 @@ export class CoreAgent {
 					durationMs,
 					resultStr,
 					e.isError,
+				);
+			} else if (event.type === "tool_execution_update") {
+				const e = event as AgentEvent & { type: "tool_execution_update" };
+				const resultStr = extractToolResultText((e as any).partialResult);
+				const pending = this.pendingTools.get(e.toolCallId);
+				const label = pending?.args ? (pending.args as { label?: string }).label : undefined;
+				events.onToolUpdate?.(
+					e.toolName,
+					label,
+					(pending?.args as Record<string, unknown>) ?? {},
+					resultStr,
 				);
 			} else if (event.type === "message_end") {
 				const e = event as AgentEvent & { type: "message_end" };
@@ -511,6 +545,10 @@ export class CoreAgent {
 	async run(input: CoreAgentRunInput): Promise<CoreAgentRunResult> {
 		await mkdir(this.channelDir, { recursive: true });
 		if (input.authFilePath) this.useAuthFilePath(input.authFilePath);
+		if (!this.resourcesLoaded) {
+			await this.session.reload();
+			this.resourcesLoaded = true;
+		}
 
 		//IYH1HC add: apply a per-run model override coming from the web UI. When absent,
 		// restore the env-driven default so reused instances (Slack/cron) stay backward-compatible.
@@ -554,8 +592,10 @@ export class CoreAgent {
 			(this.agentInstance.state as any).messages = reloadedSession.messages;
 		}
 
-		// Update system prompt for this run
+		// AgentSession.prompt() resets agent.state.systemPrompt from its private base prompt.
+		// Keep both in sync so service-built workspace prompts survive that reset.
 		(this.session.agent.state as any).systemPrompt = input.systemPrompt;
+		(this.session as any)._baseSystemPrompt = input.systemPrompt;
 
 		// Wire upload function — CoreAgent translates container→host paths before calling it
 		this.currentUploadFn = input.uploadFile
@@ -650,14 +690,28 @@ export class CoreAgent {
 
 	/** Translate a container path back to a host path for file operations (Docker mode only). */
 	private translateToHostPath(containerPath: string): string {
-		if (this.workspacePath === "/workspace") {
-			if (containerPath === "/workspace") {
-				return this.hostWorkspacePath;
-			}
-			if (containerPath.startsWith("/workspace/")) {
-				return join(this.hostWorkspacePath, containerPath.slice("/workspace/".length));
-			}
+		if (containerPath === this.workspacePath) {
+			return this.hostWorkspacePath;
+		}
+		if (containerPath.startsWith(`${this.workspacePath}/`)) {
+			return join(this.hostWorkspacePath, containerPath.slice(this.workspacePath.length + 1));
+		}
+		if (containerPath === "/workspace") {
+			return this.hostDataRoot;
+		}
+		if (containerPath.startsWith("/workspace/")) {
+			return join(this.hostDataRoot, containerPath.slice("/workspace/".length));
 		}
 		return containerPath;
 	}
+}
+
+function getContainerWorkspacePath(hostDataRoot: string, hostWorkspacePath: string): string {
+	const rel = relative(hostDataRoot, hostWorkspacePath);
+	if (!rel || rel.startsWith("..") || isAbsolute(rel)) return "/workspace";
+	return `/workspace/${rel.replace(/\\/g, "/")}`;
+}
+
+function isContainerSandboxConfig(config: CoreAgentOptions["sandboxConfig"]): config is Extract<CoreAgentOptions["sandboxConfig"], { type: "docker" | "podman" }> {
+	return config.type === "docker" || config.type === "podman";
 }
