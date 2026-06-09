@@ -1,4 +1,4 @@
-import { configureFioriTheme, CoreServiceChatPanel, CoreServiceClient, translations, type AcpJob, type AuthUser, type ConnectorStatus, type CoreServiceFeatures, type SessionInfo, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSandboxStatus, type WorkspaceScheduledEvent, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTemplate, type WorkspaceTree } from "@octo/web-ui-corp";
+import { configureFioriTheme, CoreServiceChatPanel, CoreServiceClient, translations, type AcpJob, type AuthUser, type ConnectorStatus, type CoreServiceFeatures, type LlmConfig, type SessionInfo, type SsoConfig, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSandboxStatus, type WorkspaceScheduledEvent, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTemplate, type WorkspaceTree } from "@octo/web-ui-corp";
 import { setTranslations } from "@mariozechner/mini-lit";
 import { html, render } from "lit";
 import { icon } from "@mariozechner/mini-lit";
@@ -22,6 +22,7 @@ let currentUser: AuthUser | null = null;
 let userName = urlParams.get("userName") || "user";
 let authMode: "login" | "register" = "login";
 let authError = "";
+let ssoConfig: SsoConfig = { enabled: false }; //IYH1HC add
 let authDisplayName = "";
 let authEmail = "";
 let authPassword = "";
@@ -39,6 +40,15 @@ let codexLoginCode = "";
 let codexAuthError = "";
 let codexAuthBusy = false;
 let serviceFeatures: CoreServiceFeatures = { agentWorkers: true, reminders: true };
+//IYH1HC add: per-user LLM key + model selection state for the provider dialog.
+let llmConfig: LlmConfig = { providers: [] };
+let llmConfigLoading = false;
+let providerKeyInput = "";
+let providerKeySaving = false;
+let providerKeyError = "";
+let providerSavedNotice = ""; //IYH1HC add: transient "Saved" confirmation
+let modelFilter = ""; //IYH1HC add: model list search box
+let apiKeysExpanded = false; //IYH1HC add: collapsible "API Keys" section state
 
 // App state
 let sidebarOpen = true;
@@ -348,6 +358,29 @@ function toggleSidebar() {
 	renderApp();
 }
 
+//IYH1HC add: pick up the session token handed back by the SSO callback via the
+// URL hash fragment (kept out of server logs), then strip it from the address bar.
+function consumeSsoHash() {
+	if (!window.location.hash) return;
+	const params = new URLSearchParams(window.location.hash.slice(1));
+	const token = params.get("sso_token");
+	const error = params.get("sso_error");
+	if (token) {
+		authToken = token;
+		localStorage.setItem(authTokenKey, token);
+	}
+	if (error) authError = error;
+	if (token || error) {
+		window.history.replaceState(null, "", window.location.pathname + window.location.search);
+	}
+}
+
+//IYH1HC add: discover whether SSO is enabled so the login button can be shown.
+async function refreshSsoConfig() {
+	ssoConfig = await client.getSsoConfig();
+	if (!currentUser) renderApp();
+}
+
 async function initializeAuth() {
 	const user = await client.me();
 	if (!user) {
@@ -620,7 +653,12 @@ function openProviderDialog() {
 	providerDialogOpen = true;
 	codexAuthError = "";
 	codexLoginCode = "";
+	providerKeyInput = ""; //IYH1HC add
+	providerKeyError = ""; //IYH1HC add
+	providerSavedNotice = ""; //IYH1HC add
+	modelFilter = ""; //IYH1HC add
 	void refreshCodexStatus();
+	void loadLlmConfig(); //IYH1HC add
 	renderApp();
 }
 
@@ -722,6 +760,11 @@ function setProvider(provider: string) {
 	selectedProvider = provider;
 	localStorage.setItem(providerKey, provider);
 	codexAuthError = "";
+	providerKeyInput = ""; //IYH1HC add
+	providerKeyError = ""; //IYH1HC add
+	providerSavedNotice = ""; //IYH1HC add
+	modelFilter = ""; //IYH1HC add
+	apiKeysExpanded = !llmConfig.providers.find((p) => p.id === provider)?.hasKey; //IYH1HC add
 	if (provider === "openai-codex") void refreshCodexStatus();
 	renderApp();
 }
@@ -730,6 +773,103 @@ async function refreshCodexStatus() {
 	const status = await client.getCodexAuthStatus();
 	codexConfigured = status?.configured === true;
 	renderApp();
+}
+
+//IYH1HC add: providers that use the key + model-selection flow (mirrors the backend allowlist).
+const LLM_KEY_PROVIDERS = new Set(["openai", "anthropic", "google"]);
+
+//IYH1HC add: load per-provider key/model config for the dialog.
+async function loadLlmConfig() {
+	llmConfigLoading = true;
+	providerKeyError = "";
+	renderApp();
+	llmConfig = await client.getLlmConfig();
+	llmConfigLoading = false;
+	//IYH1HC add: expand the API Keys section automatically when no key is stored yet.
+	apiKeysExpanded = !currentProviderConfig()?.hasKey;
+	renderApp();
+}
+
+function currentProviderConfig() {
+	return llmConfig.providers.find((p) => p.id === selectedProvider);
+}
+
+//IYH1HC add: forget the stored API key for the selected provider.
+async function deleteProviderKey() {
+	if (!LLM_KEY_PROVIDERS.has(selectedProvider)) return;
+	providerKeySaving = true;
+	providerKeyError = "";
+	providerSavedNotice = "";
+	renderApp();
+	try {
+		await client.deleteProviderKey(selectedProvider);
+		await loadLlmConfig();
+	} catch (err) {
+		providerKeyError = err instanceof Error ? err.message : String(err);
+	} finally {
+		providerKeySaving = false;
+		renderApp();
+	}
+}
+
+//IYH1HC add: models for the current provider matching the search box.
+function filteredModels() {
+	const provider = currentProviderConfig();
+	if (!provider) return [];
+	const q = modelFilter.trim().toLowerCase();
+	if (!q) return provider.models;
+	return provider.models.filter((m) => m.name.toLowerCase().includes(q) || m.id.toLowerCase().includes(q));
+}
+
+//IYH1HC add: toggle a model and auto-save immediately (no Save button). Optimistic
+// local update, then persist the full active set and refresh the chatbox listbox.
+async function toggleModelActive(modelId: string, active: boolean) {
+	const provider = currentProviderConfig();
+	if (!provider) return;
+	const model = provider.models.find((m) => m.id === modelId);
+	if (!model) return;
+	model.active = active;
+	providerKeyError = "";
+	providerSavedNotice = "";
+	renderApp();
+	try {
+		const activeIds = provider.models.filter((m) => m.active).map((m) => m.id);
+		await client.setActiveModels(selectedProvider, activeIds);
+		void chatPanel.refreshActiveModels();
+	} catch (err) {
+		model.active = !active; // revert on failure
+		providerKeyError = err instanceof Error ? err.message : String(err);
+		renderApp();
+	}
+}
+
+//IYH1HC add: persist the typed API key on Enter/blur (no Save button). No-op when empty.
+async function commitProviderKey() {
+	if (!LLM_KEY_PROVIDERS.has(selectedProvider) || !providerKeyInput.trim()) return;
+	providerKeySaving = true;
+	providerKeyError = "";
+	providerSavedNotice = "";
+	renderApp();
+	try {
+		await client.saveProviderKey(selectedProvider, providerKeyInput.trim());
+		providerKeyInput = "";
+		await loadLlmConfig();
+		providerSavedNotice = "Saved";
+	} catch (err) {
+		providerKeyError = err instanceof Error ? err.message : String(err);
+	} finally {
+		providerKeySaving = false;
+		renderApp();
+	}
+}
+
+//IYH1HC add: API-key toggle handler. On → save typed key (no-op if empty); off → forget key.
+async function toggleProviderKey(enabled: boolean) {
+	if (enabled) {
+		await commitProviderKey();
+	} else {
+		await deleteProviderKey();
+	}
 }
 
 async function startCodexLogin() {
@@ -1377,6 +1517,7 @@ function renderProviderDialog() {
 	const providers = [
 		{ id: "openai-codex", label: "Codex" },
 		{ id: "openai", label: "OpenAI" },
+		{ id: "google", label: "Google Gemini" }, //IYH1HC add
 		{ id: "anthropic", label: "Anthropic" },
 		{ id: "sap-openai", label: "SAP OpenAI" },
 		{ id: "sap-claude", label: "SAP Claude" },
@@ -1441,8 +1582,133 @@ function renderProviderDialog() {
 							</div>
 						`
 						: ""}
+
+					${LLM_KEY_PROVIDERS.has(selectedProvider) ? renderLlmKeyAndModels() : ""}
 				</div>
 			</div>
+		</div>
+	`;
+}
+
+//IYH1HC add: provider setup — toggle-switch model list (search) + collapsible
+// API Keys section. Everything auto-saves: flipping a model toggle persists the
+// active set; typing a key + Enter/blur (or flipping the key toggle on) stores it.
+function renderLlmKeyAndModels() {
+	const provider = currentProviderConfig();
+	const hasKey = provider?.hasKey === true;
+	const label = provider?.label ?? selectedProvider;
+	const allModels = provider?.models ?? [];
+	const visible = filteredModels();
+	const enabledCount = allModels.filter((m) => m.active).length;
+
+	const keyDocsUrl = selectedProvider === "google"
+		? "https://aistudio.google.com/apikey"
+		: selectedProvider === "openai"
+			? "https://platform.openai.com/api-keys"
+			: "https://console.anthropic.com/settings/keys";
+
+	return html`
+		<div class="flex flex-col gap-3">
+			<!-- Models -->
+			<div class="rounded-lg border border-border bg-card">
+				<div class="flex items-center gap-2 px-3 py-2">
+					<span class="text-sm font-semibold">Models</span>
+					<span class="text-xs text-muted-foreground">${enabledCount} enabled</span>
+					<span class="ml-auto"></span>
+					${Ui5Button({
+						className: "corp-tight-icon-button",
+						ui5Icon: "refresh",
+						onClick: () => void loadLlmConfig(),
+						disabled: llmConfigLoading,
+						title: "Refresh models",
+					})}
+				</div>
+				<div class="px-3 pb-2">
+					<ui5-input
+						class="corp-ui5-input"
+						placeholder="Add or search model"
+						show-clear-icon
+						value=${modelFilter}
+						@input=${(e: Event) => { modelFilter = getUi5Value(e); renderApp(); }}
+					></ui5-input>
+				</div>
+				${llmConfigLoading
+					? html`<div class="px-3 py-4 text-center text-xs italic text-muted-foreground">Loading models...</div>`
+					: allModels.length === 0
+						? html`<div class="px-3 py-4 text-center text-xs italic text-muted-foreground">No models available for this provider.</div>`
+						: html`
+							<div class="max-h-64 overflow-y-auto">
+								${visible.length === 0
+									? html`<div class="px-3 py-3 text-center text-xs italic text-muted-foreground">No match.</div>`
+									: visible.map((model) => html`
+										<div class="flex items-center gap-3 border-t border-border px-3 py-2">
+											<div class="min-w-0 flex-1">
+												<div class="truncate text-sm">${model.name}</div>
+												<div class="corp-mono truncate text-xs text-muted-foreground">${model.id}</div>
+											</div>
+											<ui5-switch
+												class="corp-ui5-switch"
+												?checked=${model.active}
+												?disabled=${providerKeySaving}
+												@change=${(e: Event) => void toggleModelActive(model.id, (e.target as HTMLInputElement & { checked: boolean }).checked)}
+											></ui5-switch>
+										</div>
+									`)}
+							</div>
+						`}
+			</div>
+
+			<!-- API Keys (collapsible) -->
+			<div class="rounded-lg border border-border bg-card">
+				<button
+					type="button"
+					class="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-accent"
+					@click=${() => { apiKeysExpanded = !apiKeysExpanded; renderApp(); }}
+				>
+					${icon(apiKeysExpanded ? ChevronDown : ChevronRight, "xs")}
+					<span class="text-sm font-semibold">API Keys</span>
+					${hasKey
+						? html`<span class="ml-auto inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" style="color: var(--sapPositiveColor, #256f3a); background: var(--sapSuccessBackgroundColor, rgba(37,111,58,0.1));">Stored</span>`
+						: html`<span class="ml-auto text-xs text-muted-foreground">Required</span>`}
+				</button>
+				${apiKeysExpanded
+					? html`
+						<div class="flex flex-col gap-2 border-t border-border px-3 py-3">
+							<div class="flex items-center gap-2">
+								<div class="min-w-0 flex-1">
+									<div class="text-sm font-medium">${label} API Key</div>
+									<div class="text-xs text-muted-foreground">
+										${hasKey ? "A key is stored (encrypted)." : "You can put in your own key to use these models at cost."}
+									</div>
+								</div>
+								<ui5-switch
+									class="corp-ui5-switch"
+									?checked=${hasKey}
+									?disabled=${providerKeySaving}
+									@change=${(e: Event) => void toggleProviderKey((e.target as HTMLInputElement & { checked: boolean }).checked)}
+								></ui5-switch>
+							</div>
+							<ui5-input
+								class="corp-ui5-input"
+								type="Password"
+								placeholder=${hasKey ? `Replace your ${label} API Key` : `Enter your ${label} API Key`}
+								value=${providerKeyInput}
+								?disabled=${providerKeySaving}
+								@input=${(e: Event) => { providerKeyInput = getUi5Value(e); providerSavedNotice = ""; }}
+								@change=${() => void commitProviderKey()}
+							></ui5-input>
+							<div class="flex items-center gap-2">
+								<span class="text-xs text-muted-foreground">
+									Get a key at <a class="text-primary underline" href=${keyDocsUrl} target="_blank" rel="noopener noreferrer">${new URL(keyDocsUrl).host}</a>.
+								</span>
+								${providerSavedNotice ? html`<span class="ml-auto text-xs font-medium" style="color: var(--sapPositiveColor, #256f3a);">${providerSavedNotice}</span>` : ""}
+							</div>
+						</div>
+					`
+					: ""}
+			</div>
+
+			${providerKeyError ? html`<div class="text-xs text-destructive">${providerKeyError}</div>` : ""}
 		</div>
 	`;
 }
@@ -1593,6 +1859,22 @@ function renderApp() {
 						>
 							${authMode === "login" ? "Create an account" : "Use an existing account"}
 						</ui5-button>
+						${ssoConfig.enabled
+							? html`
+								<div class="flex items-center gap-2 my-1">
+									<div class="h-px flex-1 bg-border"></div>
+									<span class="text-xs text-muted-foreground">or</span>
+									<div class="h-px flex-1 bg-border"></div>
+								</div>
+								${Ui5Button({
+									className: "corp-wide-button",
+									design: "Transparent",
+									children: html`${icon(KeyRound, "xs")}<span>${`Sign in with ${ssoConfig.label ?? "SSO"}`}</span>`,
+									onClick: () => { window.location.href = client.ssoLoginHref(); },
+									title: "Sign in with SSO",
+								})}
+							`
+							: ""}
 					</form>
 				</div>
 			`,
@@ -1761,5 +2043,7 @@ function renderApp() {
 }
 
 // Initial render then load workspaces/sessions
+consumeSsoHash();        //IYH1HC add
+void refreshSsoConfig(); //IYH1HC add
 renderApp();
 void initializeAuth();

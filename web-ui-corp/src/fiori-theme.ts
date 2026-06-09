@@ -4,6 +4,7 @@ import "@ui5/webcomponents/dist/CheckBox.js";
 import "@ui5/webcomponents/dist/Input.js";
 import "@ui5/webcomponents/dist/Option.js";
 import "@ui5/webcomponents/dist/Select.js";
+import "@ui5/webcomponents/dist/Switch.js";
 import "@ui5/webcomponents/dist/TextArea.js";
 import "@ui5/webcomponents-fiori/dist/Assets.js";
 import "@ui5/webcomponents-icons/dist/add.js";

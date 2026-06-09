@@ -1,8 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import { Dirent, appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { basename, extname, isAbsolute, join, resolve } from "path";
-import { getModel, getModels, getProviderAuthStatus, loginProvider } from "@octo/core"; //IYH1HC comment: added getModel/getModels
 import {
+	getModel,
+	getModels,
 	cancelAcpJob,
 	connectorHomeHasFiles,
 	ensureConnectorHome,

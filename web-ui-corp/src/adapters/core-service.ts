@@ -68,6 +68,8 @@ export type ActiveModel = {
 	provider: string;
 	modelId: string;
 	label: string;
+};
+
 export type AcpJob = {
 	id: string;
 	sessionId: string;

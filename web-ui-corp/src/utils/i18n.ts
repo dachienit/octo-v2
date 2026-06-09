@@ -206,6 +206,11 @@ declare module "@mariozechner/mini-lit" {
 		"Anthropic Messages Compatible": string;
 		"Checking...": string;
 		Disconnected: string;
+		// IYH1HC add: inline composer quick selector labels
+		Reasoning: string;
+		Model: string;
+		Default: string;
+		Send: string;
 	}
 }
 
@@ -430,6 +435,10 @@ export const translations = {
 		"Anthropic Messages Compatible": "Anthropic Messages Compatible",
 		"Checking...": "Checking...",
 		Disconnected: "Disconnected",
+		Reasoning: "Reasoning", // IYH1HC add
+		Model: "Model", // IYH1HC add
+		Default: "Default", // IYH1HC add
+		Send: "Send", // IYH1HC add
 	},
 	de: {
 		...defaultGerman,
@@ -651,6 +660,10 @@ export const translations = {
 		"Anthropic Messages Compatible": "Anthropic Messages Kompatibel",
 		"Checking...": "Überprüfe...",
 		Disconnected: "Getrennt",
+		Reasoning: "Reasoning", // IYH1HC add
+		Model: "Modell", // IYH1HC add
+		Default: "Standard", // IYH1HC add
+		Send: "Senden", // IYH1HC add
 	},
 };
 
