@@ -35,5 +35,11 @@ tmp/
 .tmp/
 .factory
 
+# MTA build / deploy
+mta_archives/
+secrets.mtaext
+approuter/resources/
+core-service/deploy/
+
 CLAUDE*.md
 CLAUDE.md

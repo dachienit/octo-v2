@@ -5,6 +5,7 @@ import { pbkdf2Sync, randomBytes, timingSafeEqual, createHash } from "crypto";
 import passport from "passport";
 import { Strategy as LocalStrategy } from "passport-local";
 import type express from "express";
+import { isXsuaaEnabled, verifyXsuaaToken } from "./xsuaa.js"; //IYH1HC add: XSUAA edge auth on BTP
 
 export interface AuthUser {
 	id: string;
@@ -133,6 +134,20 @@ export class AuthStore {
 				provider TEXT NOT NULL,
 				model_id TEXT NOT NULL,
 				PRIMARY KEY (user_id, provider, model_id),
+				FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+			);
+			-- IYH1HC add: user-defined custom models (Bosch GenAI / LLM Farm). Each row is a
+			-- block pointing at a custom gateway endpoint; the API key is AES-256-GCM encrypted
+			-- exactly like provider_keys. base_provider selects the request header/body format.
+			CREATE TABLE IF NOT EXISTS custom_models (
+				id TEXT NOT NULL,
+				user_id TEXT NOT NULL,
+				name TEXT NOT NULL,
+				base_provider TEXT NOT NULL,
+				endpoint TEXT NOT NULL,
+				encrypted_key TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				PRIMARY KEY (user_id, id),
 				FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 			);
 		`);
@@ -345,6 +360,67 @@ export class AuthStore {
 			ORDER BY provider, model_id
 		`).map((row) => ({ provider: row.provider, modelId: row.model_id }));
 	}
+
+	//IYH1HC add: list a user's custom models (Bosch GenAI). Never returns the key.
+	listCustomModels(userId: string): Array<{ id: string; name: string; baseProvider: string; endpoint: string }> {
+		return this.all<{ id: string; name: string; base_provider: string; endpoint: string }>(`
+			SELECT id, name, base_provider, endpoint FROM custom_models
+			WHERE user_id = ${sqlString(userId)}
+			ORDER BY created_at
+		`).map((row) => ({ id: row.id, name: row.name, baseProvider: row.base_provider, endpoint: row.endpoint }));
+	}
+
+	//IYH1HC add: fetch one custom model incl. the encrypted key (caller decrypts at chat time).
+	getCustomModel(
+		userId: string,
+		id: string,
+	): { id: string; name: string; baseProvider: string; endpoint: string; encryptedKey: string } | undefined {
+		const row = this.all<{ id: string; name: string; base_provider: string; endpoint: string; encrypted_key: string }>(`
+			SELECT id, name, base_provider, endpoint, encrypted_key FROM custom_models
+			WHERE user_id = ${sqlString(userId)} AND id = ${sqlString(id)}
+			LIMIT 1
+		`)[0];
+		if (!row) return undefined;
+		return { id: row.id, name: row.name, baseProvider: row.base_provider, endpoint: row.endpoint, encryptedKey: row.encrypted_key };
+	}
+
+	//IYH1HC add: create a custom model; returns the generated id.
+	addCustomModel(
+		userId: string,
+		opts: { name: string; baseProvider: string; endpoint: string; encryptedKey: string },
+	): string {
+		const id = createId("cm");
+		const createdAt = new Date().toISOString();
+		this.run(`
+			INSERT INTO custom_models (id, user_id, name, base_provider, endpoint, encrypted_key, created_at)
+			VALUES (${sqlString(id)}, ${sqlString(userId)}, ${sqlString(opts.name)}, ${sqlString(opts.baseProvider)}, ${sqlString(opts.endpoint)}, ${sqlString(opts.encryptedKey)}, ${sqlString(createdAt)})
+		`);
+		return id;
+	}
+
+	//IYH1HC add: update a custom model. encryptedKey is optional (keep the stored key when omitted).
+	updateCustomModel(
+		userId: string,
+		id: string,
+		opts: { name: string; baseProvider: string; endpoint: string; encryptedKey?: string },
+	): void {
+		const keyClause = opts.encryptedKey ? `, encrypted_key = ${sqlString(opts.encryptedKey)}` : "";
+		this.run(`
+			UPDATE custom_models SET
+				name = ${sqlString(opts.name)},
+				base_provider = ${sqlString(opts.baseProvider)},
+				endpoint = ${sqlString(opts.endpoint)}${keyClause}
+			WHERE user_id = ${sqlString(userId)} AND id = ${sqlString(id)}
+		`);
+	}
+
+	//IYH1HC add: delete a custom model.
+	deleteCustomModel(userId: string, id: string): void {
+		this.run(`
+			DELETE FROM custom_models
+			WHERE user_id = ${sqlString(userId)} AND id = ${sqlString(id)}
+		`);
+	}
 }
 
 export class CoreServiceAuth {
@@ -426,11 +502,42 @@ export class CoreServiceAuth {
 		res.json({ user: req.user });
 	}
 
-	requireAuth(req: express.Request, res: express.Response, next: express.NextFunction): void {
+	//IYH1HC add: cache (subject -> {user, expiry}) so a forwarded XSUAA JWT does not
+	// re-validate + re-touch the DB on every single request.
+	private xsuaaUserCache = new Map<string, { user: AuthUser; exp: number }>();
+
+	//IYH1HC add: resolve (and cache) the local Octo user for a forwarded XSUAA JWT,
+	// reusing the existing federated-identity upsert (provider = "xsuaa").
+	private async resolveXsuaaUser(token: string): Promise<AuthUser | undefined> {
+		const identity = await verifyXsuaaToken(token);
+		if (!identity) return undefined;
+		const cached = this.xsuaaUserCache.get(identity.subject);
+		if (cached && cached.exp > Date.now()) return cached.user;
+		const user = this.store.upsertFederatedUser(identity);
+		this.xsuaaUserCache.set(identity.subject, { user, exp: Date.now() + 5 * 60_000 });
+		return user;
+	}
+
+	//IYH1HC comment: requireAuth was synchronous (opaque token only); it is now async to
+	//IYH1HC comment: validate a forwarded XSUAA JWT first when OCTO_EDGE_AUTH=xsuaa.
+	async requireAuth(req: express.Request, res: express.Response, next: express.NextFunction): Promise<void> {
 		const token = this.extractBearerToken(req);
 		if (!token) {
 			res.status(401).json({ error: "Authentication required" });
 			return;
+		}
+		//IYH1HC add: XSUAA edge auth — on BTP the bearer is the JWT forwarded by the approuter.
+		if (isXsuaaEnabled()) {
+			try {
+				const xsuaaUser = await this.resolveXsuaaUser(token);
+				if (xsuaaUser) {
+					req.user = xsuaaUser;
+					next();
+					return;
+				}
+			} catch {
+				// Not a valid XSUAA token — fall through to the opaque-token path below.
+			}
 		}
 		const user = this.store.getUserByToken(token);
 		if (!user) {

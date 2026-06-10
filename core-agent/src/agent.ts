@@ -79,6 +79,7 @@ const model: ReturnType<typeof getModel> = _rawModel ?? ({
 	input: ["text", "image"],
 	contextWindow: 200000,
 	maxTokens: 8192,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, //IYH1HC add: avoid calculateCost crash
 } as any);
 if (process.env.LLM_BASE_URL) {
 	model.baseUrl = process.env.LLM_BASE_URL;
@@ -566,6 +567,9 @@ export class CoreAgent {
 				input: ["text", "image"],
 				contextWindow: 200000,
 				maxTokens: 8192,
+				//IYH1HC add: calculateCost() reads model.cost.input — a stub without it crashes
+				// ("Cannot read properties of undefined (reading 'input')") for custom models.
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			};
 			if (input.model.baseUrl) runModel.baseUrl = input.model.baseUrl;
 			if (input.model.apiType) runModel.api = input.model.apiType;

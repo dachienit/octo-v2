@@ -1,0 +1,18 @@
+{
+  "xsappname": "octo",
+  "tenant-mode": "dedicated",
+  "description": "Octo AI Agent Core Service security descriptor (XSUAA / IAS). Authentication only — no role/scope authorization yet.",
+  "scopes": [
+    {
+      "name": "uaa.user",
+      "description": "Default identity scope required for principal propagation."
+    }
+  ],
+  "oauth2-configuration": {
+    "token-validity": 3600,
+    "refresh-token-validity": 2592000,
+    "redirect-uris": [
+      "https://*.cfapps.*.hana.ondemand.com/**"
+    ]
+  }
+}

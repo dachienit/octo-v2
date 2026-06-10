@@ -19,6 +19,7 @@ import {
 import express from "express";
 import { CoreServiceAuth } from "./auth.js";
 import { decryptSecret, encryptSecret } from "./crypto.js"; //IYH1HC add
+import { prepareBoschOpenAIEndpoint } from "./extensions/bosch-genai-adapter.js"; //IYH1HC add
 import { GithubSsoProvider, loadSsoConfig } from "./sso.js"; //IYH1HC add
 import * as log from "./log.js";
 import { getWorkspaceSandboxStatus } from "./sandbox-manager.js";
@@ -258,6 +259,11 @@ export class HttpServer {
 		app.put("/llm/providers/:provider/key", (req, res) => this.handleSetProviderKey(req, res));
 		app.delete("/llm/providers/:provider/key", (req, res) => this.handleDeleteProviderKey(req, res));
 		app.put("/llm/providers/:provider/models", (req, res) => this.handleSetActiveModels(req, res));
+		//IYH1HC add: user-defined custom models (Bosch GenAI / LLM Farm).
+		app.get("/llm/custom-models", (req, res) => this.handleListCustomModels(req, res));
+		app.post("/llm/custom-models", (req, res) => this.handleCreateCustomModel(req, res));
+		app.put("/llm/custom-models/:id", (req, res) => this.handleUpdateCustomModel(req, res));
+		app.delete("/llm/custom-models/:id", (req, res) => this.handleDeleteCustomModel(req, res));
 		app.get("/auth/connectors", (req, res) => this.handleConnectors(req, res));
 		app.get("/auth/connectors/:connector/status", (req, res) => this.handleConnectorStatus(req, res));
 		app.post("/auth/connectors/:connector/login", (req, res) => this.handleConnectorLogin(req, res));
@@ -533,11 +539,17 @@ export class HttpServer {
 	// GET /llm/active-models → flat [{ provider, modelId, label }] for the chatbox listbox.
 	private handleLlmActiveModels(req: express.Request, res: express.Response): void {
 		const userId = this.getUserId(req);
-		const models = this.auth.getStore().getActiveModels(userId).map((m) => ({
+		const store = this.auth.getStore();
+		const models = store.getActiveModels(userId).map((m) => ({
 			provider: m.provider,
 			modelId: m.modelId,
 			label: this.modelLabel(m.provider, m.modelId),
 		}));
+		//IYH1HC add: surface custom models (Bosch GenAI) into the same listbox. They are
+		// always active once configured, addressed by provider "custom" + modelId = custom-model id.
+		for (const cm of store.listCustomModels(userId)) {
+			models.push({ provider: "custom", modelId: cm.id, label: cm.name });
+		}
 		res.json({ models });
 	}
 
@@ -586,6 +598,91 @@ export class HttpServer {
 			return;
 		}
 		this.auth.getStore().setActiveModels(this.getUserId(req), provider, modelIds as string[]);
+		res.json({ ok: true });
+	}
+
+	//IYH1HC add: whether a base provider is valid for a custom model (reuse the key-provider allowlist).
+	private isAllowedBaseProvider(provider: string): boolean {
+		return LLM_KEY_PROVIDERS.some((p) => p.id === provider);
+	}
+
+	//IYH1HC add: parse + validate a custom-model payload. apiKey is required only on create.
+	private parseCustomModelBody(
+		req: express.Request,
+		requireKey: boolean,
+	): { name: string; baseProvider: string; endpoint: string; apiKey?: string } | { error: string } {
+		const { name, baseProvider, endpoint, apiKey } = req.body as {
+			name?: string; baseProvider?: string; endpoint?: string; apiKey?: string;
+		};
+		if (!name || !name.trim()) return { error: "Missing name" };
+		if (!baseProvider || !this.isAllowedBaseProvider(baseProvider)) return { error: "Unsupported baseProvider" };
+		if (!endpoint || !endpoint.trim()) return { error: "Missing endpoint" };
+		if (requireKey && (!apiKey || !apiKey.trim())) return { error: "Missing apiKey" };
+		return {
+			name: name.trim(),
+			baseProvider,
+			endpoint: endpoint.trim(),
+			apiKey: apiKey && apiKey.trim() ? apiKey.trim() : undefined,
+		};
+	}
+
+	// GET /llm/custom-models → { customModels: [{ id, name, baseProvider, endpoint }] }. Never returns keys.
+	private handleListCustomModels(req: express.Request, res: express.Response): void {
+		const customModels = this.auth.getStore().listCustomModels(this.getUserId(req));
+		res.json({ customModels });
+	}
+
+	// POST /llm/custom-models  body { name, baseProvider, endpoint, apiKey } → encrypt + store.
+	private handleCreateCustomModel(req: express.Request, res: express.Response): void {
+		const parsed = this.parseCustomModelBody(req, true);
+		if ("error" in parsed) {
+			res.status(400).json({ error: parsed.error });
+			return;
+		}
+		try {
+			const encryptedKey = encryptSecret(parsed.apiKey as string);
+			const id = this.auth.getStore().addCustomModel(this.getUserId(req), {
+				name: parsed.name,
+				baseProvider: parsed.baseProvider,
+				endpoint: parsed.endpoint,
+				encryptedKey,
+			});
+			res.json({ ok: true, id });
+		} catch (err) {
+			res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+
+	// PUT /llm/custom-models/:id  body { name, baseProvider, endpoint, apiKey? } → update (key optional).
+	private handleUpdateCustomModel(req: express.Request, res: express.Response): void {
+		const id = String(req.params.id);
+		const userId = this.getUserId(req);
+		if (!this.auth.getStore().getCustomModel(userId, id)) {
+			res.status(404).json({ error: "Custom model not found" });
+			return;
+		}
+		const parsed = this.parseCustomModelBody(req, false);
+		if ("error" in parsed) {
+			res.status(400).json({ error: parsed.error });
+			return;
+		}
+		try {
+			const encryptedKey = parsed.apiKey ? encryptSecret(parsed.apiKey) : undefined;
+			this.auth.getStore().updateCustomModel(userId, id, {
+				name: parsed.name,
+				baseProvider: parsed.baseProvider,
+				endpoint: parsed.endpoint,
+				encryptedKey,
+			});
+			res.json({ ok: true });
+		} catch (err) {
+			res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+
+	// DELETE /llm/custom-models/:id → forget the custom model.
+	private handleDeleteCustomModel(req: express.Request, res: express.Response): void {
+		this.auth.getStore().deleteCustomModel(this.getUserId(req), String(req.params.id));
 		res.json({ ok: true });
 	}
 
@@ -1101,6 +1198,33 @@ export class HttpServer {
 				}
 			}
 			resolvedModel = { provider: modelSel.provider, modelId: modelSel.modelId, apiKey };
+		} else if (modelSel?.provider === "custom" && modelSel?.modelId) {
+			//IYH1HC add: custom model (Bosch GenAI) — resolve to its base provider's request
+			// format but fetch through the user-configured gateway endpoint (baseUrl override).
+			const cm = this.auth.getStore().getCustomModel(userId, modelSel.modelId);
+			if (cm) {
+				let apiKey: string | undefined;
+				try {
+					apiKey = decryptSecret(cm.encryptedKey);
+				} catch (err) {
+					log.logWarning("[llm] failed to decrypt custom model key", err instanceof Error ? err.message : String(err));
+				}
+				// For an OpenAI base provider, use the classic Chat Completions API and normalise
+				// the endpoint. The OpenAI client appends /chat/completions and drops any query, so
+				// the user's full Azure URL (…/deployments/<dep>/chat/completions?api-version=…) is
+				// reduced to its deployment base here; the bosch-genai fetch adapter re-attaches the
+				// api-version query + api-key header at request time. The Responses API default
+				// ({endpoint}/responses) is not exposed by these gateways → 404. google/anthropic keep
+				// their defaults (generateContent / v1/messages).
+				const isOpenAiBase = cm.baseProvider === "openai";
+				resolvedModel = {
+					provider: cm.baseProvider,   // openai|google|anthropic → drives header/body format
+					modelId: cm.name,            // placeholder; the gateway routes by endpoint
+					apiKey,
+					baseUrl: isOpenAiBase ? prepareBoschOpenAIEndpoint(cm.endpoint) : cm.endpoint,
+					apiType: isOpenAiBase ? "openai-completions" : undefined,
+				};
+			}
 		}
 
 		if (!sessionId || !text) {

@@ -26,6 +26,8 @@
 	"dependencies": {
 		"@aws-sdk/client-bedrock-runtime": "^3.1050.0",
 		"@octo/core-agent": "*",
+		"@sap/xsenv": "^5.6.0",
+		"@sap/xssec": "^4.8.0",
 		"@slack/socket-mode": "^2.0.0",
 		"@slack/web-api": "^7.0.0",
 		"chalk": "^5.6.2",

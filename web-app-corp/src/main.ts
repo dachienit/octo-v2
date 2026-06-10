@@ -1,4 +1,4 @@
-import { configureFioriTheme, CoreServiceChatPanel, CoreServiceClient, translations, type AcpJob, type AuthUser, type ConnectorStatus, type CoreServiceFeatures, type LlmConfig, type SessionInfo, type SsoConfig, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSandboxStatus, type WorkspaceScheduledEvent, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTemplate, type WorkspaceTree } from "@octo/web-ui-corp";
+import { configureFioriTheme, CoreServiceChatPanel, CoreServiceClient, translations, type AcpJob, type AuthUser, type ConnectorStatus, type CoreServiceFeatures, type CustomModelConfig, type LlmConfig, type SessionInfo, type SsoConfig, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSandboxStatus, type WorkspaceScheduledEvent, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTemplate, type WorkspaceTree } from "@octo/web-ui-corp";
 import { setTranslations } from "@mariozechner/mini-lit";
 import { html, render } from "lit";
 import { icon } from "@mariozechner/mini-lit";
@@ -27,6 +27,7 @@ let authDisplayName = "";
 let authEmail = "";
 let authPassword = "";
 let userMenuOpen = false;
+let themeMenuOpen = false; //IYH1HC add: theme selector dropdown open state
 let providerDialogOpen = false;
 let createWorkspaceDialogOpen = false;
 let workspaceSettingsDialogOpen = false;
@@ -49,6 +50,18 @@ let providerKeyError = "";
 let providerSavedNotice = ""; //IYH1HC add: transient "Saved" confirmation
 let modelFilter = ""; //IYH1HC add: model list search box
 let apiKeysExpanded = false; //IYH1HC add: collapsible "API Keys" section state
+//IYH1HC add: Bosch GenAI (custom models) state for the provider dialog.
+let boschModels: CustomModelConfig[] = [];
+let boschLoading = false;
+let boschSaving = false;
+let boschError = "";
+// Draft for the "Add model" form (cleared after a successful create).
+let boschDraft: { name: string; baseProvider: string; endpoint: string; apiKey: string } = {
+	name: "",
+	baseProvider: "openai",
+	endpoint: "",
+	apiKey: "",
+};
 
 // App state
 let sidebarOpen = true;
@@ -102,19 +115,50 @@ if (!app) throw new Error("App container not found");
 
 type Ui5ButtonDesign = "Default" | "Emphasized" | "Transparent" | "Positive" | "Negative" | "Attention";
 
-function getEffectiveAppTheme() {
-	const theme = localStorage.getItem("theme") || "system";
-	if (theme === "system") return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-	return theme === "dark" ? "dark" : "light";
+//IYH1HC comment: legacy 2-state light/dark helpers replaced by 4-theme model below.
+//IYH1HC comment: function getEffectiveAppTheme() {
+//IYH1HC comment: 	const theme = localStorage.getItem("theme") || "system";
+//IYH1HC comment: 	if (theme === "system") return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+//IYH1HC comment: 	return theme === "dark" ? "dark" : "light";
+//IYH1HC comment: }
+//IYH1HC comment:
+//IYH1HC comment: function applyAppTheme() {
+//IYH1HC comment: 	document.documentElement.classList.toggle("dark", getEffectiveAppTheme() === "dark");
+//IYH1HC comment: }
+//IYH1HC comment:
+//IYH1HC comment: function cycleAppTheme() {
+//IYH1HC comment: 	const nextTheme = getEffectiveAppTheme() === "dark" ? "light" : "dark";
+//IYH1HC comment: 	localStorage.setItem("theme", nextTheme);
+//IYH1HC comment: 	applyAppTheme();
+//IYH1HC comment: }
+
+//IYH1HC add: 4-theme model — Fiori light/dark + SAP Joule "AI" light/dark.
+type AppTheme = "light" | "dark" | "joule-light" | "joule-dark";
+
+const THEME_OPTIONS: { value: AppTheme; label: string }[] = [
+	{ value: "light", label: "Fiori Light" },
+	{ value: "dark", label: "Fiori Dark" },
+	{ value: "joule-light", label: "AI Light" },
+	{ value: "joule-dark", label: "AI Dark" },
+];
+
+function getStoredTheme(): AppTheme {
+	const theme = localStorage.getItem("theme");
+	if (theme === "dark" || theme === "light" || theme === "joule-light" || theme === "joule-dark") return theme;
+	// legacy "system"/null → follow prefers-color-scheme
+	return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
 function applyAppTheme() {
-	document.documentElement.classList.toggle("dark", getEffectiveAppTheme() === "dark");
+	const theme = getStoredTheme();
+	const isDark = theme === "dark" || theme === "joule-dark";
+	const isJoule = theme === "joule-light" || theme === "joule-dark";
+	document.documentElement.classList.toggle("dark", isDark);
+	document.documentElement.classList.toggle("joule", isJoule);
 }
 
-function cycleAppTheme() {
-	const nextTheme = getEffectiveAppTheme() === "dark" ? "light" : "dark";
-	localStorage.setItem("theme", nextTheme);
+function setAppTheme(theme: AppTheme) {
+	localStorage.setItem("theme", theme);
 	applyAppTheme();
 }
 
@@ -149,17 +193,33 @@ function Ui5Button(config: {
 	`;
 }
 
-function renderThemeButton() {
-	const isDark = getEffectiveAppTheme() === "dark";
-	return Ui5Button({
-		className: "corp-icon-button",
-		ui5Icon: isDark ? "light-mode" : "dark-mode",
-		onClick: () => {
-			cycleAppTheme();
-			renderApp();
-		},
-		title: isDark ? "Switch to light mode" : "Switch to dark mode",
-	});
+//IYH1HC add: theme dropdown (Fiori Light/Dark + AI Light/Dark), mirrors renderUserMenu.
+function renderThemeMenu() {
+	const current = getStoredTheme();
+	return html`
+		<div class="relative">
+			${Ui5Button({
+				className: "corp-icon-button",
+				ui5Icon: "palette",
+				onClick: () => { themeMenuOpen = !themeMenuOpen; userMenuOpen = false; renderApp(); },
+				title: "Theme",
+			})}
+			${themeMenuOpen
+				? html`
+					<div class="absolute right-0 top-10 z-50 w-48 rounded border border-border bg-background shadow-lg">
+						${THEME_OPTIONS.map((opt) => html`
+							<ui5-button
+								class="corp-ui5-button corp-menu-button ${opt.value === current ? "corp-menu-button-active" : ""}"
+								design="Transparent"
+								@click=${() => { setAppTheme(opt.value); themeMenuOpen = false; renderApp(); }}
+							>
+								<span>${opt.label}</span>
+							</ui5-button>
+						`)}
+					</div>`
+				: ""}
+		</div>
+	`;
 }
 
 function getUi5Value(event: Event) {
@@ -428,6 +488,7 @@ async function logout() {
 	authPassword = "";
 	currentUser = null;
 	userMenuOpen = false;
+	themeMenuOpen = false; //IYH1HC add
 	providerDialogOpen = false;
 	workspaces = [];
 	sessions = [];
@@ -650,6 +711,7 @@ async function disconnectBusinessConnector(connectorId: string) {
 
 function openProviderDialog() {
 	userMenuOpen = false;
+	themeMenuOpen = false; //IYH1HC add
 	providerDialogOpen = true;
 	codexAuthError = "";
 	codexLoginCode = "";
@@ -659,6 +721,7 @@ function openProviderDialog() {
 	modelFilter = ""; //IYH1HC add
 	void refreshCodexStatus();
 	void loadLlmConfig(); //IYH1HC add
+	void loadBoschModels(); //IYH1HC add
 	renderApp();
 }
 
@@ -792,6 +855,86 @@ async function loadLlmConfig() {
 
 function currentProviderConfig() {
 	return llmConfig.providers.find((p) => p.id === selectedProvider);
+}
+
+//IYH1HC add: load the user's custom models (Bosch GenAI) for the dialog.
+async function loadBoschModels() {
+	boschLoading = true;
+	boschError = "";
+	renderApp();
+	try {
+		boschModels = await client.getCustomModels();
+	} catch (err) {
+		boschError = err instanceof Error ? err.message : String(err);
+	} finally {
+		boschLoading = false;
+		renderApp();
+	}
+}
+
+//IYH1HC add: create a custom model from the draft form, then refresh the chatbox listbox.
+async function addBoschModel() {
+	const name = boschDraft.name.trim();
+	const endpoint = boschDraft.endpoint.trim();
+	const apiKey = boschDraft.apiKey.trim();
+	if (!name || !endpoint || !apiKey) {
+		boschError = "Name, endpoint and API key are required.";
+		renderApp();
+		return;
+	}
+	boschSaving = true;
+	boschError = "";
+	renderApp();
+	try {
+		await client.addCustomModel({ name, baseProvider: boschDraft.baseProvider, endpoint, apiKey });
+		boschDraft = { name: "", baseProvider: "openai", endpoint: "", apiKey: "" };
+		await loadBoschModels();
+		void chatPanel.refreshActiveModels();
+	} catch (err) {
+		boschError = err instanceof Error ? err.message : String(err);
+	} finally {
+		boschSaving = false;
+		renderApp();
+	}
+}
+
+//IYH1HC add: update one field of an existing custom model and persist (apiKey omitted = keep stored key).
+async function updateBoschModel(model: CustomModelConfig, patch: Partial<Pick<CustomModelConfig, "name" | "baseProvider" | "endpoint">> & { apiKey?: string }) {
+	boschSaving = true;
+	boschError = "";
+	renderApp();
+	try {
+		await client.updateCustomModel(model.id, {
+			name: patch.name ?? model.name,
+			baseProvider: patch.baseProvider ?? model.baseProvider,
+			endpoint: patch.endpoint ?? model.endpoint,
+			apiKey: patch.apiKey,
+		});
+		await loadBoschModels();
+		void chatPanel.refreshActiveModels();
+	} catch (err) {
+		boschError = err instanceof Error ? err.message : String(err);
+	} finally {
+		boschSaving = false;
+		renderApp();
+	}
+}
+
+//IYH1HC add: delete a custom model and refresh the listbox.
+async function deleteBoschModel(id: string) {
+	boschSaving = true;
+	boschError = "";
+	renderApp();
+	try {
+		await client.deleteCustomModel(id);
+		await loadBoschModels();
+		void chatPanel.refreshActiveModels();
+	} catch (err) {
+		boschError = err instanceof Error ? err.message : String(err);
+	} finally {
+		boschSaving = false;
+		renderApp();
+	}
 }
 
 //IYH1HC add: forget the stored API key for the selected provider.
@@ -1411,7 +1554,7 @@ function renderUserMenu() {
 			${Ui5Button({
 				className: "corp-icon-button",
 				ui5Icon: "employee",
-				onClick: () => { userMenuOpen = !userMenuOpen; renderApp(); },
+				onClick: () => { userMenuOpen = !userMenuOpen; themeMenuOpen = false; renderApp(); },
 				title: "User menu",
 			})}
 			${userMenuOpen
@@ -1515,6 +1658,7 @@ function renderCreateWorkspaceDialog() {
 function renderProviderDialog() {
 	if (!providerDialogOpen) return "";
 	const providers = [
+		{ id: "bosch-genai", label: "Bosch GenAI" }, //IYH1HC add: custom LLM Farm models (first option)
 		{ id: "openai-codex", label: "Codex" },
 		{ id: "openai", label: "OpenAI" },
 		{ id: "google", label: "Google Gemini" }, //IYH1HC add
@@ -1583,8 +1727,138 @@ function renderProviderDialog() {
 						`
 						: ""}
 
+					${selectedProvider === "bosch-genai" ? renderBoschGenAIConfig() : ""}
+
 					${LLM_KEY_PROVIDERS.has(selectedProvider) ? renderLlmKeyAndModels() : ""}
 				</div>
+			</div>
+		</div>
+	`;
+}
+
+//IYH1HC add: Bosch GenAI setup — manage multiple custom model blocks (LLM Farm).
+// Each block { name, provider, endpoint, API key } points at a custom gateway endpoint;
+// the API key is encrypted server-side (same mechanism as the cloud providers). Saved
+// blocks appear by name in the chatbox model listbox.
+const BOSCH_BASE_PROVIDERS = [
+	{ id: "openai", label: "OpenAI" },
+	{ id: "google", label: "Google Gemini" },
+	{ id: "anthropic", label: "Anthropic" },
+];
+
+function renderBoschGenAIConfig() {
+	return html`
+		<div class="flex flex-col gap-3">
+			<p class="text-xs text-muted-foreground">
+				Configure models served through your Bosch GenAI / LLM Farm gateway. Each entry calls the chosen
+				provider's API format but is routed to your endpoint. Saved entries appear in the model picker.
+			</p>
+
+			<!-- Configured blocks -->
+			<div class="flex flex-col gap-3">
+				${boschLoading
+					? html`<div class="px-3 py-4 text-center text-xs italic text-muted-foreground">Loading models...</div>`
+					: boschModels.length === 0
+						? html`<div class="rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs italic text-muted-foreground">No models configured yet.</div>`
+						: boschModels.map((model) => renderBoschModelBlock(model))}
+			</div>
+
+			<!-- Add new block -->
+			<div class="rounded-lg border border-border bg-card">
+				<div class="flex items-center gap-2 px-3 py-2">
+					<span class="text-sm font-semibold">Add model</span>
+				</div>
+				<div class="flex flex-col gap-2 border-t border-border px-3 py-3">
+					<ui5-input
+						class="corp-ui5-input"
+						placeholder="Name (e.g. LLM Farm GPT-5-nano)"
+						value=${boschDraft.name}
+						?disabled=${boschSaving}
+						@input=${(e: Event) => { boschDraft.name = getUi5Value(e); }}
+					></ui5-input>
+					<ui5-select
+						class="corp-ui5-select"
+						?disabled=${boschSaving}
+						@change=${(e: Event) => { boschDraft.baseProvider = getUi5SelectValue(e, boschDraft.baseProvider); }}
+					>
+						${BOSCH_BASE_PROVIDERS.map((p) => html`<ui5-option value=${p.id} ?selected=${p.id === boschDraft.baseProvider}>${p.label}</ui5-option>`)}
+					</ui5-select>
+					<ui5-input
+						class="corp-ui5-input"
+						placeholder="Endpoint (https://...)"
+						value=${boschDraft.endpoint}
+						?disabled=${boschSaving}
+						@input=${(e: Event) => { boschDraft.endpoint = getUi5Value(e); }}
+					></ui5-input>
+					<ui5-input
+						class="corp-ui5-input"
+						type="Password"
+						placeholder="API Key"
+						value=${boschDraft.apiKey}
+						?disabled=${boschSaving}
+						@input=${(e: Event) => { boschDraft.apiKey = getUi5Value(e); }}
+					></ui5-input>
+					<ui5-button
+						class="corp-ui5-button corp-wide-button"
+						design="Emphasized"
+						?disabled=${boschSaving}
+						@click=${() => void addBoschModel()}
+					>
+						${boschSaving ? "Saving..." : "Add model"}
+					</ui5-button>
+				</div>
+			</div>
+
+			${boschError ? html`<div class="text-xs text-destructive">${boschError}</div>` : ""}
+		</div>
+	`;
+}
+
+//IYH1HC add: one editable custom-model block. Fields auto-save on change; the API key
+// field is blank (placeholder only) and only sent when the user types a replacement.
+function renderBoschModelBlock(model: CustomModelConfig) {
+	return html`
+		<div class="rounded-lg border border-border bg-card">
+			<div class="flex items-center gap-2 px-3 py-2">
+				<span class="min-w-0 flex-1 truncate text-sm font-medium">${model.name}</span>
+				<ui5-button
+					class="corp-tight-icon-button"
+					design="Transparent"
+					icon="delete"
+					?disabled=${boschSaving}
+					title="Delete"
+					@click=${() => void deleteBoschModel(model.id)}
+				></ui5-button>
+			</div>
+			<div class="flex flex-col gap-2 border-t border-border px-3 py-3">
+				<ui5-input
+					class="corp-ui5-input"
+					placeholder="Name"
+					value=${model.name}
+					?disabled=${boschSaving}
+					@change=${(e: Event) => { const v = getUi5Value(e); if (v.trim() && v.trim() !== model.name) void updateBoschModel(model, { name: v.trim() }); }}
+				></ui5-input>
+				<ui5-select
+					class="corp-ui5-select"
+					?disabled=${boschSaving}
+					@change=${(e: Event) => { const v = getUi5SelectValue(e, model.baseProvider); if (v !== model.baseProvider) void updateBoschModel(model, { baseProvider: v }); }}
+				>
+					${BOSCH_BASE_PROVIDERS.map((p) => html`<ui5-option value=${p.id} ?selected=${p.id === model.baseProvider}>${p.label}</ui5-option>`)}
+				</ui5-select>
+				<ui5-input
+					class="corp-ui5-input"
+					placeholder="Endpoint (https://...)"
+					value=${model.endpoint}
+					?disabled=${boschSaving}
+					@change=${(e: Event) => { const v = getUi5Value(e); if (v.trim() && v.trim() !== model.endpoint) void updateBoschModel(model, { endpoint: v.trim() }); }}
+				></ui5-input>
+				<ui5-input
+					class="corp-ui5-input"
+					type="Password"
+					placeholder="Replace API Key (leave blank to keep)"
+					?disabled=${boschSaving}
+					@change=${(e: Event) => { const v = getUi5Value(e); if (v.trim()) void updateBoschModel(model, { apiKey: v.trim() }); }}
+				></ui5-input>
 			</div>
 		</div>
 	`;
@@ -1895,7 +2169,7 @@ function renderApp() {
 							onClick: toggleSidebar,
 							title: sidebarOpen ? "Collapse sessions" : "Expand sessions",
 						})}
-						<span class="text-base font-semibold text-foreground">Bot Chat</span>
+						<span class="corp-app-title text-base font-semibold text-foreground">Bot Chat</span>
 					</div>
 					<div class="flex items-center gap-2">
 						${Ui5Button({
@@ -1913,7 +2187,7 @@ function renderApp() {
 								title: "Expand workspace",
 							})
 							: ""}
-						${renderThemeButton()}
+						${renderThemeMenu()}
 						${renderUserMenu()}
 					</div>
 				</div>

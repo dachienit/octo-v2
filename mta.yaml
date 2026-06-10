@@ -1,0 +1,126 @@
+_schema-version: "3.3.0"
+ID: octo
+version: 1.0.0
+description: Octo AI Agent Core Service + Approuter on SAP BTP Cloud Foundry
+
+parameters:
+  enable-parallel-deployments: true
+  deploy_mode: html5-repo
+
+# Compile the npm-workspace monorepo once, in dependency order, before any module
+# is packaged. core-agent -> web-ui-corp -> core-service, and web-ui-corp -> web-app-corp.
+build-parameters:
+  before-all:
+    - builder: custom
+      commands:
+        - npm ci
+        - npm run build --workspace=core-agent
+        - npm run build --workspace=core-service
+        - npm run build --workspace=web-ui-corp
+        - npm run build --workspace=web-app-corp
+
+modules:
+  # ----------------------------------------------------------------------------
+  # Backend: core-service (HTTP/SSE). Tools run with --sandbox=host inside this
+  # container. $PORT is injected by Cloud Foundry.
+  # ----------------------------------------------------------------------------
+  - name: octo-srv
+    type: nodejs
+    path: core-service
+    parameters:
+      buildpack: nodejs_buildpack
+      command: node dist/main.js --http $PORT workspace
+      memory: 16384M
+      disk-quota: 10239M
+    properties:
+      OCTO_EDGE_AUTH: xsuaa
+      CORE_SERVICE_ALLOW_SIGNUP: "false"
+      NODE_ENV: production
+    provides:
+      - name: octo-srv-api
+        properties:
+          srv-url: ${default-url}
+    requires:
+      - name: octo-xsuaa
+      # octo-postgresql + octo-objectstore are added back when A3 persistence lands.
+      - name: octo-destination
+      - name: octo-connectivity
+      - name: octo-secrets
+    # Assemble a self-contained deploy/ folder: vendors @octo/core-agent as an
+    # npm-pack tarball (file: dep) so the CF buildpack's node_modules relocation
+    # does not break workspace resolution. before-all has already built all dist.
+    build-parameters:
+      builder: custom
+      commands:
+        - node scripts/assemble-deploy.mjs
+      build-result: deploy
+      ignore:
+        - "node_modules/"
+
+  # ----------------------------------------------------------------------------
+  # Approuter: XSUAA login gate, static SPA host, reverse proxy to octo-srv.
+  # The SPA build is copied into approuter/resources at build time.
+  # ----------------------------------------------------------------------------
+  - name: octo-agent
+    type: approuter.nodejs
+    path: approuter
+    parameters:
+      memory: 2048M
+      disk-quota: 8192M
+    requires:
+      - name: octo-xsuaa
+      - name: octo-srv-api
+        group: destinations
+        properties:
+          name: octo-srv
+          url: ~{srv-url}
+          forwardAuthToken: true
+    build-parameters:
+      builder: custom
+      # Cross-platform copy of the built SPA into approuter/resources. Node is used
+      # instead of rm/cp/mkdir so the build works on Windows (mbt) and Linux CI alike.
+      commands:
+        - node -e "const fs=require('fs');fs.rmSync('resources',{recursive:true,force:true});fs.cpSync('../web-app-corp/dist','resources',{recursive:true})"
+      ignore:
+        - "node_modules/"
+
+resources:
+  - name: octo-xsuaa
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: xsuaa
+      service-plan: application
+      path: ./xs-security.json
+
+  # Persistence services are deferred to the A3 phase. When implemented, re-add:
+  #   - octo-postgresql (service: postgresql-db, plan: per `cf marketplace -e postgresql-db`)
+  #   - octo-objectstore (service: objectstore, plan: per `cf marketplace -e objectstore`,
+  #     usually s3-standard on AWS landscapes — NOT "standard")
+  # and restore their `requires:` entries under octo-srv.
+
+  # Destination + connectivity for on-prem SAP reach via principal propagation.
+  - name: octo-destination
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: destination
+      service-plan: lite
+
+  - name: octo-connectivity
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: connectivity
+      service-plan: lite
+
+  # Secrets. DO NOT commit real values: override via an mtaext at deploy time
+  # (cf deploy octo_*.mtar -e secrets.mtaext) or set after deploy with
+  # `cf update-user-provided-service`.
+  - name: octo-secrets
+    type: org.cloudfoundry.user-provided-service
+    parameters:
+      config:
+        CORE_SERVICE_ENCRYPTION_KEY: "123456789!@#987654321"
+        SSO_GITHUB_CLIENT_SECRET: ""
+        AICORE_SERVICE_KEY: ""
+        CORE_SERVICE_AGENT_WORKERS_ENABLED: false
+        CORE_SERVICE_REMINDERS_ENABLED: false
+        CORE_SERVICE_ALLOW_SIGNUP: false

@@ -70,6 +70,14 @@ export type ActiveModel = {
 	label: string;
 };
 
+// IYH1HC add: a user-defined custom model (Bosch GenAI). Never carries the API key.
+export type CustomModelConfig = {
+	id: string;
+	name: string;
+	baseProvider: string;
+	endpoint: string;
+};
+
 export type AcpJob = {
 	id: string;
 	sessionId: string;
@@ -421,6 +429,51 @@ export class CoreServiceClient {
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ modelIds }),
 		});
+		if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+		return true;
+	}
+
+	// IYH1HC add: list the user's custom models (Bosch GenAI). Keys are never returned.
+	async getCustomModels(): Promise<CustomModelConfig[]> {
+		try {
+			const response = await this.fetch("/llm/custom-models");
+			if (!response.ok) return [];
+			const data = await response.json() as { customModels?: CustomModelConfig[] };
+			return data.customModels ?? [];
+		} catch {
+			return [];
+		}
+	}
+
+	// IYH1HC add: create a custom model (key encrypted server-side); returns the new id.
+	async addCustomModel(body: { name: string; baseProvider: string; endpoint: string; apiKey: string }): Promise<string> {
+		const response = await this.fetch("/llm/custom-models", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+		const data = await response.json() as { id?: string };
+		return data.id ?? "";
+	}
+
+	// IYH1HC add: update a custom model. Omit apiKey to keep the stored key unchanged.
+	async updateCustomModel(
+		id: string,
+		body: { name: string; baseProvider: string; endpoint: string; apiKey?: string },
+	): Promise<boolean> {
+		const response = await this.fetch(`/llm/custom-models/${encodeURIComponent(id)}`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+		return true;
+	}
+
+	// IYH1HC add: delete a custom model.
+	async deleteCustomModel(id: string): Promise<boolean> {
+		const response = await this.fetch(`/llm/custom-models/${encodeURIComponent(id)}`, { method: "DELETE" });
 		if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
 		return true;
 	}

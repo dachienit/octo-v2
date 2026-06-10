@@ -16,6 +16,7 @@ import "@ui5/webcomponents-icons/dist/folder-blank.js";
 import "@ui5/webcomponents-icons/dist/Assets.js";
 import "@ui5/webcomponents-icons/dist/light-mode.js";
 import "@ui5/webcomponents-icons/dist/navigation-left-arrow.js";
+import "@ui5/webcomponents-icons/dist/palette.js"; //IYH1HC add: theme selector icon
 import "@ui5/webcomponents-icons/dist/navigation-right-arrow.js";
 import "@ui5/webcomponents-icons/dist/navigation-down-arrow.js";
 import "@ui5/webcomponents-icons/dist/refresh.js";

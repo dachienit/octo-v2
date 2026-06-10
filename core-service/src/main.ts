@@ -2,6 +2,31 @@
 
 import "dotenv/config";
 
+//IYH1HC add: On Cloud Foundry the credentials of a user-provided service (e.g.
+//IYH1HC add: `octo-secrets`) are injected into VCAP_SERVICES, NOT as plain env vars,
+//IYH1HC add: while the code reads process.env directly. Hydrate process.env from every
+//IYH1HC add: bound user-provided service's credentials (real env vars keep priority).
+//IYH1HC add: No-op locally where VCAP_SERVICES is absent.
+function loadUserProvidedCredentials(): void {
+	const raw = process.env.VCAP_SERVICES;
+	if (!raw) return;
+	try {
+		const services = JSON.parse(raw) as Record<string, Array<{ credentials?: Record<string, unknown> }>>;
+		const userProvided = services["user-provided"] ?? [];
+		for (const instance of userProvided) {
+			const credentials = instance?.credentials ?? {};
+			for (const [key, value] of Object.entries(credentials)) {
+				if (process.env[key] === undefined && value !== null && value !== undefined) {
+					process.env[key] = typeof value === "string" ? value : String(value);
+				}
+			}
+		}
+	} catch (err) {
+		console.error("[vcap] failed to parse VCAP_SERVICES:", err instanceof Error ? err.message : err);
+	}
+}
+loadUserProvidedCredentials();
+
 // Wire proxy before any fetch calls (earendil, OAuth2, etc.).
 // Node.js built-in fetch (undici) does not respect HTTP_PROXY/HTTPS_PROXY automatically.
 const _proxyUrl =
@@ -68,8 +93,11 @@ function parseArgs(): ParsedArgs {
 			if (next && !next.startsWith("-") && /^\d+$/.test(next)) {
 				httpPort = parseInt(next, 10);
 				i++;
+			//IYH1HC add: on Cloud Foundry the start command is `--http $PORT`; if $PORT is
+			//IYH1HC add: unset/empty the flag arrives bare, so fall back to env PORT then 3030.
 			} else {
-				httpPort = 3030;
+				const envPort = parseInt(process.env.PORT ?? "", 10);
+				httpPort = Number.isFinite(envPort) ? envPort : 3030;
 			}
 		} else if (!arg.startsWith("-")) {
 			workingDir = arg;
