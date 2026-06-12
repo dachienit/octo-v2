@@ -324,9 +324,9 @@ const handler: BotHandler = {
 				//IYH1HC add: snapshot this run's sessions/artifacts to the Object Store.
 				//IYH1HC add: Fire-and-forget so the session queue isn't blocked; the mirror
 				//IYH1HC add: serializes overlapping snapshots internally.
-				void objectStore
-					?.snapshot({ workspaceId: state.workspaceId, sessionId: channelId })
-					.catch((err) => log.logWarning("[object-store] run-end snapshot error", err instanceof Error ? err.message : String(err)));
+				// void objectStore ?.snapshot({ workspaceId: state.workspaceId, sessionId: channelId })
+				//	.catch((err) => log.logWarning("[object-store] run-end snapshot error", err instanceof Error ? err.message : String(err)));
+				
 			}
 		});
 		state.queue = run.catch(() => {});
@@ -456,17 +456,16 @@ if (hasSlack) {
 //IYH1HC add: periodic full snapshot so changes between run-end snapshots (and any
 //IYH1HC add: file written outside a run) reach the bucket. <=0 disables. The mirror
 //IYH1HC add: serializes against run-end snapshots, so overlaps are safe.
-const snapshotIntervalMs = parsePositiveIntEnv("CORE_SERVICE_OBJECTSTORE_SNAPSHOT_INTERVAL_MS", 300_000);
+//const snapshotIntervalMs = parsePositiveIntEnv("CORE_SERVICE_OBJECTSTORE_SNAPSHOT_INTERVAL_MS", 300_000);
 let snapshotTimer: NodeJS.Timeout | undefined;
-if (objectStore && snapshotIntervalMs > 0) {
+/* if (objectStore && snapshotIntervalMs > 0) {
 	snapshotTimer = setInterval(() => {
-		void objectStore
-			?.snapshot()
+		void objectStore ?.snapshot()
 			.catch((err) => log.logWarning("[object-store] interval snapshot error", err instanceof Error ? err.message : String(err)));
 	}, snapshotIntervalMs);
 	snapshotTimer.unref?.();
 	log.logInfo(`Object store snapshot interval enabled (${snapshotIntervalMs}ms)`);
-}
+} */
 
 // Handle shutdown
 //IYH1HC add: shared async shutdown so SIGINT/SIGTERM both flush a final snapshot
