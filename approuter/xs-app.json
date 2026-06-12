@@ -23,7 +23,13 @@
       "authenticationType": "xsuaa"
     },
     {
+      "source": "^/(.+\\.[^/.]+)$",
+      "localDir": "resources",
+      "authenticationType": "xsuaa"
+    },
+    {
       "source": "^(.*)$",
+      "target": "/index.html",
       "localDir": "resources",
       "replace": {
         "pathSuffixes": ["index.html"]

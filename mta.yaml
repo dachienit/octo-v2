@@ -7,11 +7,11 @@ parameters:
   enable-parallel-deployments: true
   deploy_mode: html5-repo
 
-# Compile the npm-workspace monorepo once, in dependency order, before any module
-# is packaged. core-agent -> web-ui-corp -> core-service, and web-ui-corp -> web-app-corp.
+# Build project
 build-parameters:
   before-all:
     - builder: custom
+      timeout: 30m
       commands:
         - npm ci
         - npm run build --workspace=core-agent
@@ -33,16 +33,25 @@ modules:
       memory: 16384M
       disk-quota: 10239M
     properties:
+      # Skip login logout UI      
       OCTO_EDGE_AUTH: xsuaa
+      CORE_SERVICE_HIDE_AUTH_UI: "true"
       CORE_SERVICE_ALLOW_SIGNUP: "false"
       NODE_ENV: production
+      # To disable postgresql-db if not available in BTP subaccount
+      CORE_SERVICE_AUTH_ALLOW_EPHEMERAL: "true"
+      # To disable objectstore if not available in BTP subaccount
+      CORE_SERVICE_OBJECTSTORE_ALLOW_EPHEMERAL: "true"
+      CORE_SERVICE_AGENT_WORKERS_ENABLED: "false"
+      CORE_SERVICE_REMINDERS_ENABLED: "false"
     provides:
       - name: octo-srv-api
         properties:
           srv-url: ${default-url}
     requires:
       - name: octo-xsuaa
-      # octo-postgresql + octo-objectstore are added back when A3 persistence lands.
+      - name: octo-objectstore
+      #- name: octo-postgresql
       - name: octo-destination
       - name: octo-connectivity
       - name: octo-secrets
@@ -92,11 +101,32 @@ resources:
       service-plan: application
       path: ./xs-security.json
 
-  # Persistence services are deferred to the A3 phase. When implemented, re-add:
-  #   - octo-postgresql (service: postgresql-db, plan: per `cf marketplace -e postgresql-db`)
-  #   - octo-objectstore (service: objectstore, plan: per `cf marketplace -e objectstore`,
-  #     usually s3-standard on AWS landscapes — NOT "standard")
-  # and restore their `requires:` entries under octo-srv.
+  # Durable user DB. The CF container filesystem is ephemeral, so the
+  # auth store (users/tokens/federated identities/provider keys) must live in a
+  # bound PostgreSQL service. core-service auto-selects PostgreSQL when this
+  # binding is present (see auth-storage.ts detectPostgres); falls back to SQLite
+  # locally. Plan confirmed via `cf marketplace -e postgresql-db` (this landscape
+  # only offers "standard").
+  #- name: octo-postgresql
+  #  type: org.cloudfoundry.managed-service
+  #  parameters:
+  #    service: postgresql-db
+  #    service-plan: standard
+
+  # Whole-tree data-root durability via object store (snapshot/restore
+  # mirror). Scope is the ENTIRE data root — auth.sqlite, users/, templates/,
+  # workspaces/** — so users/memberships and sessions/artifacts all survive a
+  # restart (the CF filesystem is ephemeral). Binds the existing 'taf-objectstore'
+  # instance the user created by hand (avoids MTA creating a duplicate).
+  # core-service auto-selects it from VCAP_SERVICES (see object-store.ts
+  # detectObjectStore); falls back to ephemeral locally.
+  # SINGLE-WRITER: do NOT scale octo-srv instances > 1 while the mirror is active —
+  # concurrent snapshots would overwrite each other and delete-sync from one
+  # instance could wipe another instance's fresh writes.
+  - name: octo-objectstore
+    type: org.cloudfoundry.existing-service
+    parameters:
+      service-name: taf-objectstore
 
   # Destination + connectivity for on-prem SAP reach via principal propagation.
   - name: octo-destination
@@ -118,9 +148,6 @@ resources:
     type: org.cloudfoundry.user-provided-service
     parameters:
       config:
-        CORE_SERVICE_ENCRYPTION_KEY: "123456789!@#987654321"
+        CORE_SERVICE_ENCRYPTION_KEY: ""
         SSO_GITHUB_CLIENT_SECRET: ""
         AICORE_SERVICE_KEY: ""
-        CORE_SERVICE_AGENT_WORKERS_ENABLED: false
-        CORE_SERVICE_REMINDERS_ENABLED: false
-        CORE_SERVICE_ALLOW_SIGNUP: false

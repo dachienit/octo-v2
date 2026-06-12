@@ -21,6 +21,7 @@ export type SsoConfig = {
 	provider?: string;
 	label?: string;
 	loginUrl?: string;
+	hideAuthUi?: boolean; //IYH1HC add: when true, hide the in-app login screen + logout (XSUAA edge auth)
 };
 
 export type ProviderAuthStatus = {

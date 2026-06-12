@@ -23,6 +23,7 @@ let userName = urlParams.get("userName") || "user";
 let authMode: "login" | "register" = "login";
 let authError = "";
 let ssoConfig: SsoConfig = { enabled: false }; //IYH1HC add
+let authResolved = false; //IYH1HC add: true once /auth/me has been checked — gates the login screen so it never flashes before auth resolves
 let authDisplayName = "";
 let authEmail = "";
 let authPassword = "";
@@ -445,9 +446,11 @@ async function initializeAuth() {
 	const user = await client.me();
 	if (!user) {
 		currentUser = null;
+		authResolved = true; //IYH1HC add: auth checked, no session — allow the login screen to render
 		renderApp();
 		return;
 	}
+	authResolved = true; //IYH1HC add
 	currentUser = user;
 	userName = user.displayName;
 	chatPanel.userName = userName;
@@ -1568,10 +1571,11 @@ function renderUserMenu() {
 							${icon(KeyRound, "xs")}
 							<span>LLM provider</span>
 						</ui5-button>
+						${ssoConfig.hideAuthUi ? "" : html`
 						<ui5-button class="corp-ui5-button corp-menu-button" design="Transparent" @click=${() => void logout()}>
 							${icon(LogOut, "xs")}
 							<span>Logout</span>
-						</ui5-button>
+						</ui5-button>`}<!--IYH1HC add: hide Logout under XSUAA edge auth-->
 					</div>
 				`
 				: ""}
@@ -2088,6 +2092,19 @@ function renderWorkspaceSettingsDialog() {
 
 function renderApp() {
 	if (!currentUser) {
+		//IYH1HC add: never flash the login form before auth resolves; when hideAuthUi
+		// is set (XSUAA edge auth on BTP) the login screen is suppressed entirely.
+		if (ssoConfig.hideAuthUi || !authResolved) {
+			render(
+				html`
+					<div class="w-full h-screen flex items-center justify-center bg-background text-foreground">
+						<div class="text-sm text-muted-foreground">Signing in…</div>
+					</div>
+				`,
+				app,
+			);
+			return;
+		}
 		render(
 			html`
 				<div class="w-full h-screen flex items-center justify-center bg-background text-foreground">
