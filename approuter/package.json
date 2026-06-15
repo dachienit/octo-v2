@@ -1,0 +1,15 @@
+{
+  "name": "octo-approuter",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SAP BTP application router for Octo: XSUAA login gate, static SPA host, and reverse proxy to core-service.",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@sap/approuter": "^16.7.2"
+  },
+  "scripts": {
+    "start": "node node_modules/@sap/approuter/approuter.js"
+  }
+}

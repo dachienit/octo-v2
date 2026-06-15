@@ -5,6 +5,7 @@ import { html, LitElement } from "lit";
 import { state } from "lit/decorators.js";
 import { Download, X } from "lucide";
 import * as pdfjsLib from "pdfjs-dist";
+import "../tools/artifacts/TextArtifact.js";
 import type { Attachment } from "../utils/attachment-utils.js";
 import { i18n } from "../utils/i18n.js";
 
@@ -244,14 +245,20 @@ export class AttachmentOverlay extends LitElement {
 			case "pptx":
 				return this.renderDownloadOnlyContent();
 
-			default:
+			default: {
+				const content = this.attachment.extractedText || this.attachment.content || "";
+				// If content is base64 encoded text, we'd need to decode it, but extractedText is plain text.
+				// However, TextArtifact handles plain text directly.
 				return html`
-					<div class="bg-card border border-border text-foreground p-6 w-full h-full max-w-4xl overflow-auto">
-						<pre class="whitespace-pre-wrap font-mono text-sm">${
-							this.attachment.extractedText || i18n("No content available")
-						}</pre>
+					<div class="w-full h-full max-w-5xl overflow-hidden bg-card border border-border shadow-lg">
+						<text-artifact
+							class="block h-full w-full"
+							.filename=${this.attachment.fileName}
+							.content=${content}
+						></text-artifact>
 					</div>
 				`;
+			}
 		}
 	}
 

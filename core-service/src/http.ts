@@ -1,8 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import { Dirent, appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { basename, extname, isAbsolute, join, resolve } from "path";
-import { getModel, getModels, getProviderAuthStatus, loginProvider } from "@octo/core"; //IYH1HC comment: added getModel/getModels
 import {
+	getModel,
+	getModels,
 	cancelAcpJob,
 	connectorHomeHasFiles,
 	ensureConnectorHome,
@@ -18,6 +19,7 @@ import {
 import express from "express";
 import { CoreServiceAuth } from "./auth.js";
 import { decryptSecret, encryptSecret } from "./crypto.js"; //IYH1HC add
+import { prepareBoschOpenAIEndpoint } from "./extensions/bosch-genai-adapter.js"; //IYH1HC add
 import { GithubSsoProvider, loadSsoConfig } from "./sso.js"; //IYH1HC add
 import * as log from "./log.js";
 import { getWorkspaceSandboxStatus } from "./sandbox-manager.js";
@@ -52,6 +54,9 @@ const LLM_KEY_PROVIDERS: ReadonlyArray<{ id: string; label: string }> = [
 	{ id: "google", label: "Google Gemini" },
 	{ id: "anthropic", label: "Anthropic" },
 ];
+type ConnectorLoginMode = NonNullable<ConnectorRuntime["loginModes"]>[number];
+type JsonObject = Record<string, unknown>;
+
 interface PendingAgentWorkerLogin {
 	userId: string;
 	connectorId: string;
@@ -61,6 +66,7 @@ interface PendingAgentWorkerLogin {
 	url?: string;
 	error?: string;
 	child?: ChildProcessWithoutNullStreams;
+	autoConfirmed?: boolean;
 }
 
 const BINARY_MIME_TYPES: Record<string, string> = {
@@ -185,13 +191,16 @@ export class HttpServer {
 	private pendingAuthLogins = new Map<string, PendingAuthLogin>();
 	private sso: GithubSsoProvider | null; //IYH1HC add
 	private pendingAgentWorkerLogins = new Map<string, PendingAgentWorkerLogin>();
+	//IYH1HC add: returns the object-store mirror state, or undefined when ephemeral.
+	private getObjectStoreStatus?: () => unknown;
 
-	constructor(config: { port: number; workingDir: string; handler: BotHandler; workspaceStore: WorkspaceStore; sandboxConfig: SandboxConfig; features?: { agentWorkers?: boolean; reminders?: boolean } }) {
+	constructor(config: { port: number; workingDir: string; handler: BotHandler; workspaceStore: WorkspaceStore; sandboxConfig: SandboxConfig; features?: { agentWorkers?: boolean; reminders?: boolean }; getObjectStoreStatus?: () => unknown }) {
 		this.port = config.port;
 		this.workingDir = config.workingDir;
 		this.handler = config.handler;
 		this.workspaceStore = config.workspaceStore;
 		this.sandboxConfig = config.sandboxConfig;
+		this.getObjectStoreStatus = config.getObjectStoreStatus; //IYH1HC add
 		this.features = {
 			agentWorkers: config.features?.agentWorkers !== false,
 			reminders: config.features?.reminders !== false,
@@ -203,7 +212,10 @@ export class HttpServer {
 		if (this.sso) log.logInfo(`SSO enabled: ${ssoConfig?.provider} (${ssoConfig?.label})`);
 	}
 
-	start(): void {
+	//IYH1HC comment: start() is now async — the auth store (PostgreSQL/SQLite) must finish
+	//IYH1HC comment: its async init (connect + schema bootstrap) before any request is served.
+	async start(): Promise<void> {
+		await this.auth.init(); //IYH1HC add: bootstrap the selected auth storage backend
 		const app = express();
 		app.use(express.json({ limit: "50mb" }));
 
@@ -232,6 +244,14 @@ export class HttpServer {
 		app.get("/auth/sso/login", (req, res) => this.handleSsoLogin(req, res));
 		app.get("/auth/sso/callback", (req, res) => { void this.handleSsoCallback(req, res); });
 
+		//IYH1HC add: object-store mirror diagnostics — public (no secrets, only bucket
+		// name + counters) so it stays reachable right after a restart when the
+		// freshly-restored auth DB may not yet recognize the caller.
+		app.get("/objectstore/status", (_req, res) => {
+			const status = this.getObjectStoreStatus?.();
+			res.json(status ? { mode: "mirror", ...status } : { mode: "ephemeral" });
+		});
+
 		app.use((req, res, next) => this.auth.requireAuth(req, res, next));
 		app.use("/artifacts", express.static(artifactsDir, { fallthrough: false }));
 
@@ -257,6 +277,11 @@ export class HttpServer {
 		app.put("/llm/providers/:provider/key", (req, res) => this.handleSetProviderKey(req, res));
 		app.delete("/llm/providers/:provider/key", (req, res) => this.handleDeleteProviderKey(req, res));
 		app.put("/llm/providers/:provider/models", (req, res) => this.handleSetActiveModels(req, res));
+		//IYH1HC add: user-defined custom models (Bosch GenAI / LLM Farm).
+		app.get("/llm/custom-models", (req, res) => this.handleListCustomModels(req, res));
+		app.post("/llm/custom-models", (req, res) => this.handleCreateCustomModel(req, res));
+		app.put("/llm/custom-models/:id", (req, res) => this.handleUpdateCustomModel(req, res));
+		app.delete("/llm/custom-models/:id", (req, res) => this.handleDeleteCustomModel(req, res));
 		app.get("/auth/connectors", (req, res) => this.handleConnectors(req, res));
 		app.get("/auth/connectors/:connector/status", (req, res) => this.handleConnectorStatus(req, res));
 		app.post("/auth/connectors/:connector/login", (req, res) => this.handleConnectorLogin(req, res));
@@ -348,11 +373,12 @@ export class HttpServer {
 
 	//IYH1HC add: public SSO config so the web app knows whether to show the button.
 	private handleSsoConfig(_req: express.Request, res: express.Response): void {
+		const hideAuthUi = process.env.CORE_SERVICE_HIDE_AUTH_UI === "true"; //IYH1HC add: hide login screen + logout (XSUAA edge auth)
 		if (!this.sso) {
-			res.json({ enabled: false });
+			res.json({ enabled: false, hideAuthUi }); //IYH1HC add: hideAuthUi
 			return;
 		}
-		res.json({ enabled: true, provider: this.sso.config.provider, label: this.sso.config.label, loginUrl: "/auth/sso/login" });
+		res.json({ enabled: true, provider: this.sso.config.provider, label: this.sso.config.label, loginUrl: "/auth/sso/login", hideAuthUi }); //IYH1HC add: hideAuthUi
 	}
 
 	//IYH1HC add: start the SSO flow — redirect the browser to the GHES authorize URL.
@@ -381,7 +407,7 @@ export class HttpServer {
 			if (!this.sso.consumeState(state)) throw new Error("Invalid or expired state");
 
 			const identity = await this.sso.resolveIdentity(code);
-			const session = this.auth.completeFederatedLogin(res, identity);
+			const session = await this.auth.completeFederatedLogin(res, identity); //IYH1HC comment: await — completeFederatedLogin is now async
 			res.redirect(`${redirectBase}/#sso_token=${encodeURIComponent(session.token)}`);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -510,11 +536,11 @@ export class HttpServer {
 	}
 
 	// GET /llm/config → per-provider { id, label, hasKey, models:[{id,name,active}] }. Never returns keys.
-	private handleLlmConfig(req: express.Request, res: express.Response): void {
+	private async handleLlmConfig(req: express.Request, res: express.Response): Promise<void> { //IYH1HC comment: async — store reads are now async
 		const userId = this.getUserId(req);
 		const store = this.auth.getStore();
-		const active = new Set(store.getActiveModels(userId).map((m) => `${m.provider}:${m.modelId}`));
-		const providers = LLM_KEY_PROVIDERS.map((p) => {
+		const active = new Set((await store.getActiveModels(userId)).map((m) => `${m.provider}:${m.modelId}`)); //IYH1HC comment: await
+		const providers = await Promise.all(LLM_KEY_PROVIDERS.map(async (p) => { //IYH1HC comment: await hasProviderKey per provider
 			let models: Array<{ id: string; name: string; active: boolean }> = [];
 			try {
 				// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -524,24 +550,30 @@ export class HttpServer {
 					active: active.has(`${p.id}:${m.id}`),
 				}));
 			} catch { models = []; }
-			return { id: p.id, label: p.label, hasKey: store.hasProviderKey(userId, p.id), models };
-		});
+			return { id: p.id, label: p.label, hasKey: await store.hasProviderKey(userId, p.id), models }; //IYH1HC comment: await
+		}));
 		res.json({ providers });
 	}
 
 	// GET /llm/active-models → flat [{ provider, modelId, label }] for the chatbox listbox.
-	private handleLlmActiveModels(req: express.Request, res: express.Response): void {
+	private async handleLlmActiveModels(req: express.Request, res: express.Response): Promise<void> { //IYH1HC comment: async
 		const userId = this.getUserId(req);
-		const models = this.auth.getStore().getActiveModels(userId).map((m) => ({
+		const store = this.auth.getStore();
+		const models = (await store.getActiveModels(userId)).map((m) => ({ //IYH1HC comment: await
 			provider: m.provider,
 			modelId: m.modelId,
 			label: this.modelLabel(m.provider, m.modelId),
 		}));
+		//IYH1HC add: surface custom models (Bosch GenAI) into the same listbox. They are
+		// always active once configured, addressed by provider "custom" + modelId = custom-model id.
+		for (const cm of await store.listCustomModels(userId)) { //IYH1HC comment: await
+			models.push({ provider: "custom", modelId: cm.id, label: cm.name });
+		}
 		res.json({ models });
 	}
 
 	// PUT /llm/providers/:provider/key  body { apiKey } → encrypt + store.
-	private handleSetProviderKey(req: express.Request, res: express.Response): void {
+	private async handleSetProviderKey(req: express.Request, res: express.Response): Promise<void> { //IYH1HC comment: async
 		const provider = String(req.params.provider);
 		if (!this.isAllowedLlmProvider(provider)) {
 			res.status(400).json({ error: "Unsupported provider" });
@@ -554,7 +586,7 @@ export class HttpServer {
 		}
 		try {
 			const encrypted = encryptSecret(apiKey.trim());
-			this.auth.getStore().setProviderKey(this.getUserId(req), provider, encrypted);
+			await this.auth.getStore().setProviderKey(this.getUserId(req), provider, encrypted); //IYH1HC comment: await
 			res.json({ ok: true, hasKey: true });
 		} catch (err) {
 			res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -562,18 +594,18 @@ export class HttpServer {
 	}
 
 	// DELETE /llm/providers/:provider/key → forget the stored key.
-	private handleDeleteProviderKey(req: express.Request, res: express.Response): void {
+	private async handleDeleteProviderKey(req: express.Request, res: express.Response): Promise<void> { //IYH1HC comment: async
 		const provider = String(req.params.provider);
 		if (!this.isAllowedLlmProvider(provider)) {
 			res.status(400).json({ error: "Unsupported provider" });
 			return;
 		}
-		this.auth.getStore().deleteProviderKey(this.getUserId(req), provider);
+		await this.auth.getStore().deleteProviderKey(this.getUserId(req), provider); //IYH1HC comment: await
 		res.json({ ok: true, hasKey: false });
 	}
 
 	// PUT /llm/providers/:provider/models  body { modelIds: string[] } → replace active set.
-	private handleSetActiveModels(req: express.Request, res: express.Response): void {
+	private async handleSetActiveModels(req: express.Request, res: express.Response): Promise<void> { //IYH1HC comment: async
 		const provider = String(req.params.provider);
 		if (!this.isAllowedLlmProvider(provider)) {
 			res.status(400).json({ error: "Unsupported provider" });
@@ -584,7 +616,92 @@ export class HttpServer {
 			res.status(400).json({ error: "modelIds must be a string array" });
 			return;
 		}
-		this.auth.getStore().setActiveModels(this.getUserId(req), provider, modelIds as string[]);
+		await this.auth.getStore().setActiveModels(this.getUserId(req), provider, modelIds as string[]); //IYH1HC comment: await
+		res.json({ ok: true });
+	}
+
+	//IYH1HC add: whether a base provider is valid for a custom model (reuse the key-provider allowlist).
+	private isAllowedBaseProvider(provider: string): boolean {
+		return LLM_KEY_PROVIDERS.some((p) => p.id === provider);
+	}
+
+	//IYH1HC add: parse + validate a custom-model payload. apiKey is required only on create.
+	private parseCustomModelBody(
+		req: express.Request,
+		requireKey: boolean,
+	): { name: string; baseProvider: string; endpoint: string; apiKey?: string } | { error: string } {
+		const { name, baseProvider, endpoint, apiKey } = req.body as {
+			name?: string; baseProvider?: string; endpoint?: string; apiKey?: string;
+		};
+		if (!name || !name.trim()) return { error: "Missing name" };
+		if (!baseProvider || !this.isAllowedBaseProvider(baseProvider)) return { error: "Unsupported baseProvider" };
+		if (!endpoint || !endpoint.trim()) return { error: "Missing endpoint" };
+		if (requireKey && (!apiKey || !apiKey.trim())) return { error: "Missing apiKey" };
+		return {
+			name: name.trim(),
+			baseProvider,
+			endpoint: endpoint.trim(),
+			apiKey: apiKey && apiKey.trim() ? apiKey.trim() : undefined,
+		};
+	}
+
+	// GET /llm/custom-models → { customModels: [{ id, name, baseProvider, endpoint }] }. Never returns keys.
+	private async handleListCustomModels(req: express.Request, res: express.Response): Promise<void> { //IYH1HC comment: async
+		const customModels = await this.auth.getStore().listCustomModels(this.getUserId(req)); //IYH1HC comment: await
+		res.json({ customModels });
+	}
+
+	// POST /llm/custom-models  body { name, baseProvider, endpoint, apiKey } → encrypt + store.
+	private async handleCreateCustomModel(req: express.Request, res: express.Response): Promise<void> { //IYH1HC comment: async
+		const parsed = this.parseCustomModelBody(req, true);
+		if ("error" in parsed) {
+			res.status(400).json({ error: parsed.error });
+			return;
+		}
+		try {
+			const encryptedKey = encryptSecret(parsed.apiKey as string);
+			const id = await this.auth.getStore().addCustomModel(this.getUserId(req), { //IYH1HC comment: await
+				name: parsed.name,
+				baseProvider: parsed.baseProvider,
+				endpoint: parsed.endpoint,
+				encryptedKey,
+			});
+			res.json({ ok: true, id });
+		} catch (err) {
+			res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+
+	// PUT /llm/custom-models/:id  body { name, baseProvider, endpoint, apiKey? } → update (key optional).
+	private async handleUpdateCustomModel(req: express.Request, res: express.Response): Promise<void> { //IYH1HC comment: async
+		const id = String(req.params.id);
+		const userId = this.getUserId(req);
+		if (!(await this.auth.getStore().getCustomModel(userId, id))) { //IYH1HC comment: await
+			res.status(404).json({ error: "Custom model not found" });
+			return;
+		}
+		const parsed = this.parseCustomModelBody(req, false);
+		if ("error" in parsed) {
+			res.status(400).json({ error: parsed.error });
+			return;
+		}
+		try {
+			const encryptedKey = parsed.apiKey ? encryptSecret(parsed.apiKey) : undefined;
+			await this.auth.getStore().updateCustomModel(userId, id, { //IYH1HC comment: await
+				name: parsed.name,
+				baseProvider: parsed.baseProvider,
+				endpoint: parsed.endpoint,
+				encryptedKey,
+			});
+			res.json({ ok: true });
+		} catch (err) {
+			res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+		}
+	}
+
+	// DELETE /llm/custom-models/:id → forget the custom model.
+	private async handleDeleteCustomModel(req: express.Request, res: express.Response): Promise<void> { //IYH1HC comment: async
+		await this.auth.getStore().deleteCustomModel(this.getUserId(req), String(req.params.id)); //IYH1HC comment: await
 		res.json({ ok: true });
 	}
 
@@ -625,6 +742,7 @@ export class HttpServer {
 			label: connector.label,
 			kind: connector.kind,
 			authMode: connector.authMode,
+			loginModes: connector.loginModes,
 			connected: connectorHomeHasFiles(usersRoot, userId, connector.id),
 			usedByAgents: connector.usedByAgents ?? [],
 			accessPolicy: connector.accessPolicy,
@@ -658,7 +776,7 @@ export class HttpServer {
 
 	private handleConnectorLogin(req: express.Request, res: express.Response): void {
 		const connector = this.resolveConnector(String(req.params.connector));
-		if (!connector?.command || !connector.loginCommand) {
+		if (!connector || (!connector.loginModes?.length && (!connector.command || !connector.loginCommand))) {
 			res.status(404).json({ error: "Connector login is not configured" });
 			return;
 		}
@@ -675,8 +793,8 @@ export class HttpServer {
 
 	private handleConnectorLogout(req: express.Request, res: express.Response): void {
 		const connector = this.resolveConnector(String(req.params.connector));
-		if (!connector?.command || !connector.logoutCommand) {
-			res.status(404).json({ error: "Connector logout is not configured" });
+		if (!connector) {
+			res.status(404).json({ error: "Unknown connector" });
 			return;
 		}
 		this.logoutConnector(req, res, connector);
@@ -751,21 +869,106 @@ export class HttpServer {
 			res.status(404).json({ error: "Unknown agent worker" });
 			return;
 		}
-		const userId = this.getUserId(req);
-		const usersRoot = this.getUsersRoot();
-		res.json({
-			id: agent,
-			label: connector.label,
-			connected: connectorHomeHasFiles(usersRoot, userId, agent),
-			authMode: connector.authMode,
-			kind: connector.kind,
-			usedByAgents: connector.usedByAgents ?? [],
-		});
+		res.json(this.serializeConnector(req, connector));
+	}
+
+	private isJsonObject(value: unknown): value is JsonObject {
+		return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+	}
+
+	private writeGeminiAuthSettings(home: string, authType: "oauth-personal" | "vertex-ai"): void {
+		const settingsDir = join(home, ".gemini");
+		const settingsPath = join(settingsDir, "settings.json");
+		mkdirSync(settingsDir, { recursive: true });
+
+		let settings: JsonObject = {};
+		if (existsSync(settingsPath)) {
+			try {
+				const parsed = JSON.parse(readFileSync(settingsPath, "utf-8"));
+				if (this.isJsonObject(parsed)) settings = parsed;
+			} catch {
+				settings = {};
+			}
+		}
+
+		const security = this.isJsonObject(settings.security) ? settings.security : {};
+		const auth = this.isJsonObject(security.auth) ? security.auth : {};
+
+		settings.selectedAuthType = authType;
+		settings.security = {
+			...security,
+			auth: {
+				...auth,
+				selectedType: authType,
+			},
+		};
+
+		writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+	}
+
+	private prepareConnectorLogin(
+		userId: string,
+		connector: ConnectorRuntime,
+		selectedMode: ConnectorLoginMode | undefined,
+		home: string,
+	): NodeJS.ProcessEnv {
+		const env = this.getConnectorEnv(userId, connector);
+		if (connector.id !== "gemini") return env;
+
+		const authType = selectedMode?.id === "gcloud-adc" ? "vertex-ai" : "oauth-personal";
+		this.writeGeminiAuthSettings(home, authType);
+
+		if (authType === "vertex-ai") {
+			delete env.GEMINI_API_KEY;
+			delete env.GOOGLE_API_KEY;
+			env.GOOGLE_GENAI_USE_VERTEXAI = "true";
+			return env;
+		}
+
+		delete env.GEMINI_API_KEY;
+		delete env.GOOGLE_API_KEY;
+		delete env.GOOGLE_GENAI_USE_VERTEXAI;
+		delete env.GOOGLE_GENAI_USE_GCA;
+		return env;
+	}
+
+	private maybeAutoConfirmConnectorLogin(
+		entry: PendingAgentWorkerLogin,
+		connector: ConnectorRuntime,
+		selectedMode: ConnectorLoginMode | undefined,
+	): void {
+		if (
+			entry.autoConfirmed ||
+			!entry.child ||
+			connector.id !== "gemini" ||
+			selectedMode?.id !== "gemini-cli"
+		) return;
+
+		if (!/Opening authentication page in your browser\.\s*Do you want to continue\?\s*\[Y\/n\]:/i.test(entry.output)) {
+			return;
+		}
+
+		entry.autoConfirmed = true;
+		entry.child.stdin.write("Y\n");
 	}
 
 	private startConnectorLogin(req: express.Request, res: express.Response, connector: ConnectorRuntime): void {
 		const userId = this.getUserId(req);
 		const loginId = this.createLoginId();
+
+		const { loginMode } = req.body as { loginMode?: string };
+		const selectedMode =
+			connector.loginModes?.find((mode) => mode.id === loginMode) ??
+			connector.loginModes?.[0];
+
+		const command = selectedMode?.command ?? connector.command;
+		const args = selectedMode?.args ?? connector.loginCommand;
+
+		if (!command || !args) {
+			res.status(404).json({ error: "Connector login is not configured" });
+			return;
+		}
+
 		const entry: PendingAgentWorkerLogin = {
 			userId,
 			connectorId: connector.id,
@@ -774,10 +977,12 @@ export class HttpServer {
 			output: "",
 		};
 		this.pendingAgentWorkerLogins.set(loginId, entry);
-		const home = ensureConnectorHome(this.getUsersRoot(), userId, connector.id);
 
-		const child = spawn(connector.command!, connector.loginCommand!, {
-			env: this.getConnectorEnv(userId, connector),
+		const home = ensureConnectorHome(this.getUsersRoot(), userId, connector.id);
+		const env = this.prepareConnectorLogin(userId, connector, selectedMode, home);
+
+		const child = spawn(command, args, {
+			env,
 			cwd: home,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
@@ -786,6 +991,7 @@ export class HttpServer {
 			entry.output += chunk.toString("utf-8");
 			if (entry.output.length > 20000) entry.output = entry.output.slice(-20000);
 			entry.url = entry.url ?? this.extractUrl(entry.output);
+			this.maybeAutoConfirmConnectorLogin(entry, connector, selectedMode);
 		};
 		child.stdout.on("data", onData);
 		child.stderr.on("data", onData);
@@ -801,6 +1007,7 @@ export class HttpServer {
 
 		res.status(201).json({
 			loginId,
+			loginMode: selectedMode?.id,
 			agent: connector.id,
 			connector: connector.id,
 			label: connector.label,
@@ -819,7 +1026,7 @@ export class HttpServer {
 		}
 		const agent = String(req.params.agent);
 		const connector = this.resolveConnector(agent, "agent-runtime");
-		if (!connector?.command || !connector.loginCommand) {
+		if (!connector || (!connector.loginModes?.length && (!connector.command || !connector.loginCommand))) {
 			res.status(404).json({ error: "Unknown agent worker" });
 			return;
 		}
@@ -835,6 +1042,7 @@ export class HttpServer {
 		res.json({
 			status: entry.status,
 			[fieldName]: entry.connectorId,
+			loginMode: (entry as any).loginMode,
 			url: entry.url,
 			output: entry.output,
 			error: entry.error,
@@ -876,15 +1084,24 @@ export class HttpServer {
 	private logoutConnector(req: express.Request, res: express.Response, connector: ConnectorRuntime): void {
 		const userId = this.getUserId(req);
 		const home = getConnectorHome(this.getUsersRoot(), userId, connector.id);
-		const child = spawn(connector.command!, connector.logoutCommand!, {
-			env: this.getConnectorEnv(userId, connector),
-			cwd: home,
-			stdio: ["ignore", "ignore", "ignore"],
-		});
-		child.once("exit", () => {
+
+		const removeHome = () => {
 			try { rmSync(home, { recursive: true, force: true }); } catch { /* ignore */ }
-		});
-		res.json({ ok: true });
+		};
+
+		if (connector.command && connector.logoutCommand) {
+			const child = spawn(connector.command, connector.logoutCommand, {
+				env: this.getConnectorEnv(userId, connector),
+				cwd: home,
+				stdio: ["ignore", "ignore", "ignore"],
+			});
+			child.once("exit", removeHome);
+			child.once("error", removeHome);
+			res.json({ ok: true });
+		} else {
+			removeHome();
+			res.json({ ok: true });
+		}
 	}
 
 	private handleAgentWorkerLogout(req: express.Request, res: express.Response): void {
@@ -894,7 +1111,7 @@ export class HttpServer {
 		}
 		const agent = String(req.params.agent);
 		const connector = this.resolveConnector(agent, "agent-runtime");
-		if (!connector?.command || !connector.logoutCommand) {
+		if (!connector) {
 			res.status(404).json({ error: "Unknown agent worker" });
 			return;
 		}
@@ -1090,7 +1307,7 @@ export class HttpServer {
 		//IYH1HC add: resolve the per-run model override (decrypt the user's key here).
 		let resolvedModel: BotContext["model"];
 		if (modelSel?.provider && modelSel?.modelId && this.isAllowedLlmProvider(modelSel.provider)) {
-			const encrypted = this.auth.getStore().getProviderKey(userId, modelSel.provider);
+			const encrypted = await this.auth.getStore().getProviderKey(userId, modelSel.provider); //IYH1HC comment: await
 			let apiKey: string | undefined;
 			if (encrypted) {
 				try {
@@ -1100,6 +1317,33 @@ export class HttpServer {
 				}
 			}
 			resolvedModel = { provider: modelSel.provider, modelId: modelSel.modelId, apiKey };
+		} else if (modelSel?.provider === "custom" && modelSel?.modelId) {
+			//IYH1HC add: custom model (Bosch GenAI) — resolve to its base provider's request
+			// format but fetch through the user-configured gateway endpoint (baseUrl override).
+			const cm = await this.auth.getStore().getCustomModel(userId, modelSel.modelId); //IYH1HC comment: await
+			if (cm) {
+				let apiKey: string | undefined;
+				try {
+					apiKey = decryptSecret(cm.encryptedKey);
+				} catch (err) {
+					log.logWarning("[llm] failed to decrypt custom model key", err instanceof Error ? err.message : String(err));
+				}
+				// For an OpenAI base provider, use the classic Chat Completions API and normalise
+				// the endpoint. The OpenAI client appends /chat/completions and drops any query, so
+				// the user's full Azure URL (…/deployments/<dep>/chat/completions?api-version=…) is
+				// reduced to its deployment base here; the bosch-genai fetch adapter re-attaches the
+				// api-version query + api-key header at request time. The Responses API default
+				// ({endpoint}/responses) is not exposed by these gateways → 404. google/anthropic keep
+				// their defaults (generateContent / v1/messages).
+				const isOpenAiBase = cm.baseProvider === "openai";
+				resolvedModel = {
+					provider: cm.baseProvider,   // openai|google|anthropic → drives header/body format
+					modelId: cm.name,            // placeholder; the gateway routes by endpoint
+					apiKey,
+					baseUrl: isOpenAiBase ? prepareBoschOpenAIEndpoint(cm.endpoint) : cm.endpoint,
+					apiType: isOpenAiBase ? "openai-completions" : undefined,
+				};
+			}
 		}
 
 		if (!sessionId || !text) {
@@ -1258,7 +1502,11 @@ export class HttpServer {
 		if (!resolved) {
 			return;
 		}
-		let url = `http://localhost:${this.port}/file?path=${encodeURIComponent(resolved)}`;
+		//IYH1HC comment: let url = `http://localhost:${this.port}/file?path=${encodeURIComponent(resolved)}`;
+		// IYH1HC add: default to null so the web app builds a same-origin URL via its own
+		// baseUrl (/api/file). The hardcoded localhost URL was unreachable from the browser
+		// on BTP; only a real public tunnel URL (below) should override this.
+		let url: string | null = null;
 
 		const tunnelUrlFile = "/tmp/artifacts-url.txt";
 		if (existsSync(tunnelUrlFile)) {
@@ -1333,6 +1581,8 @@ export class HttpServer {
 		const mimeType = BINARY_MIME_TYPES[ext];
 		if (mimeType) {
 			res.type(mimeType);
+		} else if (["abap", "cds", "csn"].includes(ext)) {
+			res.type("text/plain");
 		}
 		if (req.query.download === "1") {
 			res.attachment(basename(resolved));

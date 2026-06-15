@@ -1,4 +1,4 @@
-import { configureFioriTheme, CoreServiceChatPanel, CoreServiceClient, translations, type AcpJob, type AuthUser, type ConnectorStatus, type CoreServiceFeatures, type SessionInfo, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSandboxStatus, type WorkspaceScheduledEvent, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTemplate, type WorkspaceTree } from "@octo/web-ui-corp";
+import { configureFioriTheme, CoreServiceChatPanel, CoreServiceClient, translations, type AcpJob, type AuthUser, type ConnectorStatus, type CoreServiceFeatures, type CustomModelConfig, type LlmConfig, type SessionInfo, type SsoConfig, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSandboxStatus, type WorkspaceScheduledEvent, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTemplate, type WorkspaceTree } from "@octo/web-ui-corp";
 import { setTranslations } from "@mariozechner/mini-lit";
 import { html, render } from "lit";
 import { icon } from "@mariozechner/mini-lit";
@@ -22,10 +22,13 @@ let currentUser: AuthUser | null = null;
 let userName = urlParams.get("userName") || "user";
 let authMode: "login" | "register" = "login";
 let authError = "";
+let ssoConfig: SsoConfig = { enabled: false }; //IYH1HC add
+let authResolved = false; //IYH1HC add: true once /auth/me has been checked — gates the login screen so it never flashes before auth resolves
 let authDisplayName = "";
 let authEmail = "";
 let authPassword = "";
 let userMenuOpen = false;
+let themeMenuOpen = false; //IYH1HC add: theme selector dropdown open state
 let providerDialogOpen = false;
 let createWorkspaceDialogOpen = false;
 let workspaceSettingsDialogOpen = false;
@@ -39,6 +42,27 @@ let codexLoginCode = "";
 let codexAuthError = "";
 let codexAuthBusy = false;
 let serviceFeatures: CoreServiceFeatures = { agentWorkers: true, reminders: true };
+//IYH1HC add: per-user LLM key + model selection state for the provider dialog.
+let llmConfig: LlmConfig = { providers: [] };
+let llmConfigLoading = false;
+let providerKeyInput = "";
+let providerKeySaving = false;
+let providerKeyError = "";
+let providerSavedNotice = ""; //IYH1HC add: transient "Saved" confirmation
+let modelFilter = ""; //IYH1HC add: model list search box
+let apiKeysExpanded = false; //IYH1HC add: collapsible "API Keys" section state
+//IYH1HC add: Bosch GenAI (custom models) state for the provider dialog.
+let boschModels: CustomModelConfig[] = [];
+let boschLoading = false;
+let boschSaving = false;
+let boschError = "";
+// Draft for the "Add model" form (cleared after a successful create).
+let boschDraft: { name: string; baseProvider: string; endpoint: string; apiKey: string } = {
+	name: "",
+	baseProvider: "openai",
+	endpoint: "",
+	apiKey: "",
+};
 
 // App state
 let sidebarOpen = true;
@@ -66,6 +90,10 @@ let agentWorkerBusy = "";
 let agentWorkerLoginOutput = "";
 let businessConnectorBusy = "";
 let businessConnectorLoginOutput = "";
+
+const connectorLoginModes = new Map<string, string>();
+const LOGIN_INPUT_PROMPT_LIMIT = 3;
+const LOGIN_INPUT_PROMPT_PATTERN = /paste|enter|code|verification|continue|\[Y\/n\]/i;
 let agentWorkersCollapsed = localStorage.getItem("agentWorkersCollapsed") === "true";
 let newWorkspaceName = "New workspace";
 let newWorkspaceTemplateId = "sap-cap";
@@ -92,19 +120,50 @@ if (!app) throw new Error("App container not found");
 
 type Ui5ButtonDesign = "Default" | "Emphasized" | "Transparent" | "Positive" | "Negative" | "Attention";
 
-function getEffectiveAppTheme() {
-	const theme = localStorage.getItem("theme") || "system";
-	if (theme === "system") return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-	return theme === "dark" ? "dark" : "light";
+//IYH1HC comment: legacy 2-state light/dark helpers replaced by 4-theme model below.
+//IYH1HC comment: function getEffectiveAppTheme() {
+//IYH1HC comment: 	const theme = localStorage.getItem("theme") || "system";
+//IYH1HC comment: 	if (theme === "system") return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+//IYH1HC comment: 	return theme === "dark" ? "dark" : "light";
+//IYH1HC comment: }
+//IYH1HC comment:
+//IYH1HC comment: function applyAppTheme() {
+//IYH1HC comment: 	document.documentElement.classList.toggle("dark", getEffectiveAppTheme() === "dark");
+//IYH1HC comment: }
+//IYH1HC comment:
+//IYH1HC comment: function cycleAppTheme() {
+//IYH1HC comment: 	const nextTheme = getEffectiveAppTheme() === "dark" ? "light" : "dark";
+//IYH1HC comment: 	localStorage.setItem("theme", nextTheme);
+//IYH1HC comment: 	applyAppTheme();
+//IYH1HC comment: }
+
+//IYH1HC add: 4-theme model — Fiori light/dark + SAP Joule "AI" light/dark.
+type AppTheme = "light" | "dark" | "joule-light" | "joule-dark";
+
+const THEME_OPTIONS: { value: AppTheme; label: string }[] = [
+	{ value: "light", label: "Fiori Light" },
+	{ value: "dark", label: "Fiori Dark" },
+	{ value: "joule-light", label: "AI Light" },
+	{ value: "joule-dark", label: "AI Dark" },
+];
+
+function getStoredTheme(): AppTheme {
+	const theme = localStorage.getItem("theme");
+	if (theme === "dark" || theme === "light" || theme === "joule-light" || theme === "joule-dark") return theme;
+	// legacy "system"/null → follow prefers-color-scheme
+	return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
 function applyAppTheme() {
-	document.documentElement.classList.toggle("dark", getEffectiveAppTheme() === "dark");
+	const theme = getStoredTheme();
+	const isDark = theme === "dark" || theme === "joule-dark";
+	const isJoule = theme === "joule-light" || theme === "joule-dark";
+	document.documentElement.classList.toggle("dark", isDark);
+	document.documentElement.classList.toggle("joule", isJoule);
 }
 
-function cycleAppTheme() {
-	const nextTheme = getEffectiveAppTheme() === "dark" ? "light" : "dark";
-	localStorage.setItem("theme", nextTheme);
+function setAppTheme(theme: AppTheme) {
+	localStorage.setItem("theme", theme);
 	applyAppTheme();
 }
 
@@ -139,17 +198,33 @@ function Ui5Button(config: {
 	`;
 }
 
-function renderThemeButton() {
-	const isDark = getEffectiveAppTheme() === "dark";
-	return Ui5Button({
-		className: "corp-icon-button",
-		ui5Icon: isDark ? "light-mode" : "dark-mode",
-		onClick: () => {
-			cycleAppTheme();
-			renderApp();
-		},
-		title: isDark ? "Switch to light mode" : "Switch to dark mode",
-	});
+//IYH1HC add: theme dropdown (Fiori Light/Dark + AI Light/Dark), mirrors renderUserMenu.
+function renderThemeMenu() {
+	const current = getStoredTheme();
+	return html`
+		<div class="relative">
+			${Ui5Button({
+				className: "corp-icon-button",
+				ui5Icon: "palette",
+				onClick: () => { themeMenuOpen = !themeMenuOpen; userMenuOpen = false; renderApp(); },
+				title: "Theme",
+			})}
+			${themeMenuOpen
+				? html`
+					<div class="absolute right-0 top-10 z-50 w-48 rounded border border-border bg-background shadow-lg">
+						${THEME_OPTIONS.map((opt) => html`
+							<ui5-button
+								class="corp-ui5-button corp-menu-button ${opt.value === current ? "corp-menu-button-active" : ""}"
+								design="Transparent"
+								@click=${() => { setAppTheme(opt.value); themeMenuOpen = false; renderApp(); }}
+							>
+								<span>${opt.label}</span>
+							</ui5-button>
+						`)}
+					</div>`
+				: ""}
+		</div>
+	`;
 }
 
 function getUi5Value(event: Event) {
@@ -348,13 +423,38 @@ function toggleSidebar() {
 	renderApp();
 }
 
+//IYH1HC add: pick up the session token handed back by the SSO callback via the
+// URL hash fragment (kept out of server logs), then strip it from the address bar.
+function consumeSsoHash() {
+	if (!window.location.hash) return;
+	const params = new URLSearchParams(window.location.hash.slice(1));
+	const token = params.get("sso_token");
+	const error = params.get("sso_error");
+	if (token) {
+		authToken = token;
+		localStorage.setItem(authTokenKey, token);
+	}
+	if (error) authError = error;
+	if (token || error) {
+		window.history.replaceState(null, "", window.location.pathname + window.location.search);
+	}
+}
+
+//IYH1HC add: discover whether SSO is enabled so the login button can be shown.
+async function refreshSsoConfig() {
+	ssoConfig = await client.getSsoConfig();
+	if (!currentUser) renderApp();
+}
+
 async function initializeAuth() {
 	const user = await client.me();
 	if (!user) {
 		currentUser = null;
+		authResolved = true; //IYH1HC add: auth checked, no session — allow the login screen to render
 		renderApp();
 		return;
 	}
+	authResolved = true; //IYH1HC add
 	currentUser = user;
 	userName = user.displayName;
 	chatPanel.userName = userName;
@@ -395,6 +495,7 @@ async function logout() {
 	authPassword = "";
 	currentUser = null;
 	userMenuOpen = false;
+	themeMenuOpen = false; //IYH1HC add
 	providerDialogOpen = false;
 	workspaces = [];
 	sessions = [];
@@ -525,24 +626,44 @@ async function connectAgentWorker(agent: string) {
 	agentWorkerLoginOutput = "";
 	renderApp();
 	try {
-		const login = await client.startConnectorLogin(agent);
+		const login = await client.startConnectorLogin(agent, {
+			loginMode: connectorLoginModes.get(agent),
+		});
 		if (!login) throw new Error("Could not start worker login");
-		if (login.url) window.open(login.url, "_blank", "noopener,noreferrer");
+		
+		const openedUrls = new Set<string>();
+		if (login.url) {
+			openedUrls.add(login.url);
+			window.open(login.url, "_blank", "noopener,noreferrer");
+		}
+		
 		const deadline = Date.now() + 180000;
 		let lastOutput = login.output ?? "";
+		let inputPromptCount = 0;
+		
 		while (Date.now() < deadline) {
 			const status = await client.getConnectorLoginStatus(agent, login.loginId);
 			if (!status) break;
 			lastOutput = status.output ?? lastOutput;
 			agentWorkerLoginOutput = lastOutput;
 			const url = status.url;
-			if (url) window.open(url, "_blank", "noopener,noreferrer");
+			if (url && !openedUrls.has(url)) {
+				openedUrls.add(url);
+				window.open(url, "_blank", "noopener,noreferrer");
+			}
 			renderApp();
 			if (status.status === "complete") break;
 			if (status.status === "error") throw new Error(status.error || "Worker login failed");
-			if (/paste|enter|code|verification/i.test(lastOutput)) {
+			if (LOGIN_INPUT_PROMPT_PATTERN.test(lastOutput)) {
+				inputPromptCount += 1;
+				if (inputPromptCount > LOGIN_INPUT_PROMPT_LIMIT) {
+					throw new Error("Worker login failed after 3 input attempts");
+				}
+
 				const input = prompt(`${login.label} login input:`);
-				if (input) await client.sendConnectorLoginInput(agent, login.loginId, input);
+				if (!input) throw new Error("Worker login cancelled");
+
+				await client.sendConnectorLoginInput(agent, login.loginId, input);
 			}
 			await new Promise((resolve) => setTimeout(resolve, 1500));
 		}
@@ -573,24 +694,44 @@ async function connectBusinessConnector(connectorId: string) {
 	businessConnectorLoginOutput = "";
 	renderApp();
 	try {
-		const login = await client.startConnectorLogin(connectorId);
+		const login = await client.startConnectorLogin(connectorId, {
+			loginMode: connectorLoginModes.get(connectorId),
+		});
 		if (!login) throw new Error("Could not start connector login");
-		if (login.url) window.open(login.url, "_blank", "noopener,noreferrer");
+		
+		const openedUrls = new Set<string>();
+		if (login.url) {
+			openedUrls.add(login.url);
+			window.open(login.url, "_blank", "noopener,noreferrer");
+		}
+		
 		const deadline = Date.now() + 180000;
 		let lastOutput = login.output ?? "";
+		let inputPromptCount = 0;
+		
 		while (Date.now() < deadline) {
 			const status = await client.getConnectorLoginStatus(connectorId, login.loginId);
 			if (!status) break;
 			lastOutput = status.output ?? lastOutput;
 			businessConnectorLoginOutput = lastOutput;
 			const url = status.url;
-			if (url) window.open(url, "_blank", "noopener,noreferrer");
+			if (url && !openedUrls.has(url)) {
+				openedUrls.add(url);
+				window.open(url, "_blank", "noopener,noreferrer");
+			}
 			renderApp();
 			if (status.status === "complete") break;
 			if (status.status === "error") throw new Error(status.error || "Connector login failed");
-			if (/paste|enter|code|verification/i.test(lastOutput)) {
+			if (LOGIN_INPUT_PROMPT_PATTERN.test(lastOutput)) {
+				inputPromptCount += 1;
+				if (inputPromptCount > LOGIN_INPUT_PROMPT_LIMIT) {
+					throw new Error("Connector login failed after 3 input attempts");
+				}
+
 				const input = prompt(`${login.label} login input:`);
-				if (input) await client.sendConnectorLoginInput(connectorId, login.loginId, input);
+				if (!input) throw new Error("Connector login cancelled");
+
+				await client.sendConnectorLoginInput(connectorId, login.loginId, input);
 			}
 			await new Promise((resolve) => setTimeout(resolve, 1500));
 		}
@@ -617,10 +758,17 @@ async function disconnectBusinessConnector(connectorId: string) {
 
 function openProviderDialog() {
 	userMenuOpen = false;
+	themeMenuOpen = false; //IYH1HC add
 	providerDialogOpen = true;
 	codexAuthError = "";
 	codexLoginCode = "";
+	providerKeyInput = ""; //IYH1HC add
+	providerKeyError = ""; //IYH1HC add
+	providerSavedNotice = ""; //IYH1HC add
+	modelFilter = ""; //IYH1HC add
 	void refreshCodexStatus();
+	void loadLlmConfig(); //IYH1HC add
+	void loadBoschModels(); //IYH1HC add
 	renderApp();
 }
 
@@ -722,6 +870,11 @@ function setProvider(provider: string) {
 	selectedProvider = provider;
 	localStorage.setItem(providerKey, provider);
 	codexAuthError = "";
+	providerKeyInput = ""; //IYH1HC add
+	providerKeyError = ""; //IYH1HC add
+	providerSavedNotice = ""; //IYH1HC add
+	modelFilter = ""; //IYH1HC add
+	apiKeysExpanded = !llmConfig.providers.find((p) => p.id === provider)?.hasKey; //IYH1HC add
 	if (provider === "openai-codex") void refreshCodexStatus();
 	renderApp();
 }
@@ -730,6 +883,183 @@ async function refreshCodexStatus() {
 	const status = await client.getCodexAuthStatus();
 	codexConfigured = status?.configured === true;
 	renderApp();
+}
+
+//IYH1HC add: providers that use the key + model-selection flow (mirrors the backend allowlist).
+const LLM_KEY_PROVIDERS = new Set(["openai", "anthropic", "google"]);
+
+//IYH1HC add: load per-provider key/model config for the dialog.
+async function loadLlmConfig() {
+	llmConfigLoading = true;
+	providerKeyError = "";
+	renderApp();
+	llmConfig = await client.getLlmConfig();
+	llmConfigLoading = false;
+	//IYH1HC add: expand the API Keys section automatically when no key is stored yet.
+	apiKeysExpanded = !currentProviderConfig()?.hasKey;
+	renderApp();
+}
+
+function currentProviderConfig() {
+	return llmConfig.providers.find((p) => p.id === selectedProvider);
+}
+
+//IYH1HC add: load the user's custom models (Bosch GenAI) for the dialog.
+async function loadBoschModels() {
+	boschLoading = true;
+	boschError = "";
+	renderApp();
+	try {
+		boschModels = await client.getCustomModels();
+	} catch (err) {
+		boschError = err instanceof Error ? err.message : String(err);
+	} finally {
+		boschLoading = false;
+		renderApp();
+	}
+}
+
+//IYH1HC add: create a custom model from the draft form, then refresh the chatbox listbox.
+async function addBoschModel() {
+	const name = boschDraft.name.trim();
+	const endpoint = boschDraft.endpoint.trim();
+	const apiKey = boschDraft.apiKey.trim();
+	if (!name || !endpoint || !apiKey) {
+		boschError = "Name, endpoint and API key are required.";
+		renderApp();
+		return;
+	}
+	boschSaving = true;
+	boschError = "";
+	renderApp();
+	try {
+		await client.addCustomModel({ name, baseProvider: boschDraft.baseProvider, endpoint, apiKey });
+		boschDraft = { name: "", baseProvider: "openai", endpoint: "", apiKey: "" };
+		await loadBoschModels();
+		void chatPanel.refreshActiveModels();
+	} catch (err) {
+		boschError = err instanceof Error ? err.message : String(err);
+	} finally {
+		boschSaving = false;
+		renderApp();
+	}
+}
+
+//IYH1HC add: update one field of an existing custom model and persist (apiKey omitted = keep stored key).
+async function updateBoschModel(model: CustomModelConfig, patch: Partial<Pick<CustomModelConfig, "name" | "baseProvider" | "endpoint">> & { apiKey?: string }) {
+	boschSaving = true;
+	boschError = "";
+	renderApp();
+	try {
+		await client.updateCustomModel(model.id, {
+			name: patch.name ?? model.name,
+			baseProvider: patch.baseProvider ?? model.baseProvider,
+			endpoint: patch.endpoint ?? model.endpoint,
+			apiKey: patch.apiKey,
+		});
+		await loadBoschModels();
+		void chatPanel.refreshActiveModels();
+	} catch (err) {
+		boschError = err instanceof Error ? err.message : String(err);
+	} finally {
+		boschSaving = false;
+		renderApp();
+	}
+}
+
+//IYH1HC add: delete a custom model and refresh the listbox.
+async function deleteBoschModel(id: string) {
+	boschSaving = true;
+	boschError = "";
+	renderApp();
+	try {
+		await client.deleteCustomModel(id);
+		await loadBoschModels();
+		void chatPanel.refreshActiveModels();
+	} catch (err) {
+		boschError = err instanceof Error ? err.message : String(err);
+	} finally {
+		boschSaving = false;
+		renderApp();
+	}
+}
+
+//IYH1HC add: forget the stored API key for the selected provider.
+async function deleteProviderKey() {
+	if (!LLM_KEY_PROVIDERS.has(selectedProvider)) return;
+	providerKeySaving = true;
+	providerKeyError = "";
+	providerSavedNotice = "";
+	renderApp();
+	try {
+		await client.deleteProviderKey(selectedProvider);
+		await loadLlmConfig();
+	} catch (err) {
+		providerKeyError = err instanceof Error ? err.message : String(err);
+	} finally {
+		providerKeySaving = false;
+		renderApp();
+	}
+}
+
+//IYH1HC add: models for the current provider matching the search box.
+function filteredModels() {
+	const provider = currentProviderConfig();
+	if (!provider) return [];
+	const q = modelFilter.trim().toLowerCase();
+	if (!q) return provider.models;
+	return provider.models.filter((m) => m.name.toLowerCase().includes(q) || m.id.toLowerCase().includes(q));
+}
+
+//IYH1HC add: toggle a model and auto-save immediately (no Save button). Optimistic
+// local update, then persist the full active set and refresh the chatbox listbox.
+async function toggleModelActive(modelId: string, active: boolean) {
+	const provider = currentProviderConfig();
+	if (!provider) return;
+	const model = provider.models.find((m) => m.id === modelId);
+	if (!model) return;
+	model.active = active;
+	providerKeyError = "";
+	providerSavedNotice = "";
+	renderApp();
+	try {
+		const activeIds = provider.models.filter((m) => m.active).map((m) => m.id);
+		await client.setActiveModels(selectedProvider, activeIds);
+		void chatPanel.refreshActiveModels();
+	} catch (err) {
+		model.active = !active; // revert on failure
+		providerKeyError = err instanceof Error ? err.message : String(err);
+		renderApp();
+	}
+}
+
+//IYH1HC add: persist the typed API key on Enter/blur (no Save button). No-op when empty.
+async function commitProviderKey() {
+	if (!LLM_KEY_PROVIDERS.has(selectedProvider) || !providerKeyInput.trim()) return;
+	providerKeySaving = true;
+	providerKeyError = "";
+	providerSavedNotice = "";
+	renderApp();
+	try {
+		await client.saveProviderKey(selectedProvider, providerKeyInput.trim());
+		providerKeyInput = "";
+		await loadLlmConfig();
+		providerSavedNotice = "Saved";
+	} catch (err) {
+		providerKeyError = err instanceof Error ? err.message : String(err);
+	} finally {
+		providerKeySaving = false;
+		renderApp();
+	}
+}
+
+//IYH1HC add: API-key toggle handler. On → save typed key (no-op if empty); off → forget key.
+async function toggleProviderKey(enabled: boolean) {
+	if (enabled) {
+		await commitProviderKey();
+	} else {
+		await deleteProviderKey();
+	}
 }
 
 async function startCodexLogin() {
@@ -951,6 +1281,36 @@ function renderAgentWorkerSettings() {
 									${worker.authMode ? html`<span> · ${worker.authMode}</span>` : ""}
 									${worker.accessPolicy?.allowedInDocker ? html`<span> · sandbox enabled</span>` : ""}
 								</div>
+								${!worker.connected && worker.loginModes && worker.loginModes.length > 1
+									? html`
+										<div class="mt-2 max-w-xs">
+											<ui5-select
+												class="corp-ui5-select"
+												?disabled=${agentWorkerBusy === worker.id}
+												@change=${(e: Event) => {
+													connectorLoginModes.set(
+														worker.id,
+														getUi5SelectValue(e, connectorLoginModes.get(worker.id) ?? worker.loginModes![0]!.id),
+													);
+												}}
+											>
+												${worker.loginModes.map((mode) => html`
+													<ui5-option
+														value=${mode.id}
+														?selected=${(connectorLoginModes.get(worker.id) ?? worker.loginModes![0]!.id) === mode.id}
+													>
+														${mode.label}
+													</ui5-option>
+												`)}
+											</ui5-select>
+											<div class="mt-1 text-[11px] text-muted-foreground">
+												${worker.loginModes.find(
+													(mode) => mode.id === (connectorLoginModes.get(worker.id) ?? worker.loginModes![0]!.id),
+												)?.description ?? ""}
+											</div>
+										</div>
+									`
+									: ""}
 							</div>
 							<ui5-button
 								class="corp-ui5-button"
@@ -1082,6 +1442,36 @@ function renderBusinessConnectorSettings(sap: WorkspaceSettings["sapConnection"]
 										<span> · host proxy</span>
 										${connector.accessPolicy?.network ? html`<span> · network ${connector.accessPolicy.network}</span>` : ""}
 									</div>
+									${!connector.connected && connector.loginModes && connector.loginModes.length > 1
+										? html`
+											<div class="mt-2 max-w-xs">
+												<ui5-select
+													class="corp-ui5-select"
+													?disabled=${businessConnectorBusy === connector.id}
+													@change=${(e: Event) => {
+														connectorLoginModes.set(
+															connector.id,
+															getUi5SelectValue(e, connectorLoginModes.get(connector.id) ?? connector.loginModes![0]!.id),
+														);
+													}}
+												>
+													${connector.loginModes.map((mode) => html`
+														<ui5-option
+															value=${mode.id}
+															?selected=${(connectorLoginModes.get(connector.id) ?? connector.loginModes![0]!.id) === mode.id}
+														>
+															${mode.label}
+														</ui5-option>
+													`)}
+												</ui5-select>
+												<div class="mt-1 text-[11px] text-muted-foreground">
+													${connector.loginModes.find(
+														(mode) => mode.id === (connectorLoginModes.get(connector.id) ?? connector.loginModes![0]!.id),
+													)?.description ?? ""}
+												</div>
+											</div>
+										`
+										: ""}
 									</div>
 									<ui5-checkbox
 										class="corp-ui5-checkbox"
@@ -1271,7 +1661,7 @@ function renderUserMenu() {
 			${Ui5Button({
 				className: "corp-icon-button",
 				ui5Icon: "employee",
-				onClick: () => { userMenuOpen = !userMenuOpen; renderApp(); },
+				onClick: () => { userMenuOpen = !userMenuOpen; themeMenuOpen = false; renderApp(); },
 				title: "User menu",
 			})}
 			${userMenuOpen
@@ -1285,10 +1675,11 @@ function renderUserMenu() {
 							${icon(KeyRound, "xs")}
 							<span>LLM provider</span>
 						</ui5-button>
+						${ssoConfig.hideAuthUi ? "" : html`
 						<ui5-button class="corp-ui5-button corp-menu-button" design="Transparent" @click=${() => void logout()}>
 							${icon(LogOut, "xs")}
 							<span>Logout</span>
-						</ui5-button>
+						</ui5-button>`}<!--IYH1HC add: hide Logout under XSUAA edge auth-->
 					</div>
 				`
 				: ""}
@@ -1375,8 +1766,10 @@ function renderCreateWorkspaceDialog() {
 function renderProviderDialog() {
 	if (!providerDialogOpen) return "";
 	const providers = [
+		{ id: "bosch-genai", label: "Bosch GenAI" }, //IYH1HC add: custom LLM Farm models (first option)
 		{ id: "openai-codex", label: "Codex" },
 		{ id: "openai", label: "OpenAI" },
+		{ id: "google", label: "Google Gemini" }, //IYH1HC add
 		{ id: "anthropic", label: "Anthropic" },
 		{ id: "sap-openai", label: "SAP OpenAI" },
 		{ id: "sap-claude", label: "SAP Claude" },
@@ -1441,8 +1834,263 @@ function renderProviderDialog() {
 							</div>
 						`
 						: ""}
+
+					${selectedProvider === "bosch-genai" ? renderBoschGenAIConfig() : ""}
+
+					${LLM_KEY_PROVIDERS.has(selectedProvider) ? renderLlmKeyAndModels() : ""}
 				</div>
 			</div>
+		</div>
+	`;
+}
+
+//IYH1HC add: Bosch GenAI setup — manage multiple custom model blocks (LLM Farm).
+// Each block { name, provider, endpoint, API key } points at a custom gateway endpoint;
+// the API key is encrypted server-side (same mechanism as the cloud providers). Saved
+// blocks appear by name in the chatbox model listbox.
+const BOSCH_BASE_PROVIDERS = [
+	{ id: "openai", label: "OpenAI" },
+	{ id: "google", label: "Google Gemini" },
+	{ id: "anthropic", label: "Anthropic" },
+];
+
+function renderBoschGenAIConfig() {
+	return html`
+		<div class="flex flex-col gap-3">
+			<p class="text-xs text-muted-foreground">
+				Configure models served through your Bosch GenAI / LLM Farm gateway. Each entry calls the chosen
+				provider's API format but is routed to your endpoint. Saved entries appear in the model picker.
+			</p>
+
+			<!-- Configured blocks -->
+			<div class="flex flex-col gap-3">
+				${boschLoading
+					? html`<div class="px-3 py-4 text-center text-xs italic text-muted-foreground">Loading models...</div>`
+					: boschModels.length === 0
+						? html`<div class="rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs italic text-muted-foreground">No models configured yet.</div>`
+						: boschModels.map((model) => renderBoschModelBlock(model))}
+			</div>
+
+			<!-- Add new block -->
+			<div class="rounded-lg border border-border bg-card">
+				<div class="flex items-center gap-2 px-3 py-2">
+					<span class="text-sm font-semibold">Add model</span>
+				</div>
+				<div class="flex flex-col gap-2 border-t border-border px-3 py-3">
+					<ui5-input
+						class="corp-ui5-input"
+						placeholder="Name (e.g. LLM Farm GPT-5-nano)"
+						value=${boschDraft.name}
+						?disabled=${boschSaving}
+						@input=${(e: Event) => { boschDraft.name = getUi5Value(e); }}
+					></ui5-input>
+					<ui5-select
+						class="corp-ui5-select"
+						?disabled=${boschSaving}
+						@change=${(e: Event) => { boschDraft.baseProvider = getUi5SelectValue(e, boschDraft.baseProvider); }}
+					>
+						${BOSCH_BASE_PROVIDERS.map((p) => html`<ui5-option value=${p.id} ?selected=${p.id === boschDraft.baseProvider}>${p.label}</ui5-option>`)}
+					</ui5-select>
+					<ui5-input
+						class="corp-ui5-input"
+						placeholder="Endpoint (https://...)"
+						value=${boschDraft.endpoint}
+						?disabled=${boschSaving}
+						@input=${(e: Event) => { boschDraft.endpoint = getUi5Value(e); }}
+					></ui5-input>
+					<ui5-input
+						class="corp-ui5-input"
+						type="Password"
+						placeholder="API Key"
+						value=${boschDraft.apiKey}
+						?disabled=${boschSaving}
+						@input=${(e: Event) => { boschDraft.apiKey = getUi5Value(e); }}
+					></ui5-input>
+					<ui5-button
+						class="corp-ui5-button corp-wide-button"
+						design="Emphasized"
+						?disabled=${boschSaving}
+						@click=${() => void addBoschModel()}
+					>
+						${boschSaving ? "Saving..." : "Add model"}
+					</ui5-button>
+				</div>
+			</div>
+
+			${boschError ? html`<div class="text-xs text-destructive">${boschError}</div>` : ""}
+		</div>
+	`;
+}
+
+//IYH1HC add: one editable custom-model block. Fields auto-save on change; the API key
+// field is blank (placeholder only) and only sent when the user types a replacement.
+function renderBoschModelBlock(model: CustomModelConfig) {
+	return html`
+		<div class="rounded-lg border border-border bg-card">
+			<div class="flex items-center gap-2 px-3 py-2">
+				<span class="min-w-0 flex-1 truncate text-sm font-medium">${model.name}</span>
+				<ui5-button
+					class="corp-tight-icon-button"
+					design="Transparent"
+					icon="delete"
+					?disabled=${boschSaving}
+					title="Delete"
+					@click=${() => void deleteBoschModel(model.id)}
+				></ui5-button>
+			</div>
+			<div class="flex flex-col gap-2 border-t border-border px-3 py-3">
+				<ui5-input
+					class="corp-ui5-input"
+					placeholder="Name"
+					value=${model.name}
+					?disabled=${boschSaving}
+					@change=${(e: Event) => { const v = getUi5Value(e); if (v.trim() && v.trim() !== model.name) void updateBoschModel(model, { name: v.trim() }); }}
+				></ui5-input>
+				<ui5-select
+					class="corp-ui5-select"
+					?disabled=${boschSaving}
+					@change=${(e: Event) => { const v = getUi5SelectValue(e, model.baseProvider); if (v !== model.baseProvider) void updateBoschModel(model, { baseProvider: v }); }}
+				>
+					${BOSCH_BASE_PROVIDERS.map((p) => html`<ui5-option value=${p.id} ?selected=${p.id === model.baseProvider}>${p.label}</ui5-option>`)}
+				</ui5-select>
+				<ui5-input
+					class="corp-ui5-input"
+					placeholder="Endpoint (https://...)"
+					value=${model.endpoint}
+					?disabled=${boschSaving}
+					@change=${(e: Event) => { const v = getUi5Value(e); if (v.trim() && v.trim() !== model.endpoint) void updateBoschModel(model, { endpoint: v.trim() }); }}
+				></ui5-input>
+				<ui5-input
+					class="corp-ui5-input"
+					type="Password"
+					placeholder="Replace API Key (leave blank to keep)"
+					?disabled=${boschSaving}
+					@change=${(e: Event) => { const v = getUi5Value(e); if (v.trim()) void updateBoschModel(model, { apiKey: v.trim() }); }}
+				></ui5-input>
+			</div>
+		</div>
+	`;
+}
+
+//IYH1HC add: provider setup — toggle-switch model list (search) + collapsible
+// API Keys section. Everything auto-saves: flipping a model toggle persists the
+// active set; typing a key + Enter/blur (or flipping the key toggle on) stores it.
+function renderLlmKeyAndModels() {
+	const provider = currentProviderConfig();
+	const hasKey = provider?.hasKey === true;
+	const label = provider?.label ?? selectedProvider;
+	const allModels = provider?.models ?? [];
+	const visible = filteredModels();
+	const enabledCount = allModels.filter((m) => m.active).length;
+
+	const keyDocsUrl = selectedProvider === "google"
+		? "https://aistudio.google.com/apikey"
+		: selectedProvider === "openai"
+			? "https://platform.openai.com/api-keys"
+			: "https://console.anthropic.com/settings/keys";
+
+	return html`
+		<div class="flex flex-col gap-3">
+			<!-- Models -->
+			<div class="rounded-lg border border-border bg-card">
+				<div class="flex items-center gap-2 px-3 py-2">
+					<span class="text-sm font-semibold">Models</span>
+					<span class="text-xs text-muted-foreground">${enabledCount} enabled</span>
+					<span class="ml-auto"></span>
+					${Ui5Button({
+						className: "corp-tight-icon-button",
+						ui5Icon: "refresh",
+						onClick: () => void loadLlmConfig(),
+						disabled: llmConfigLoading,
+						title: "Refresh models",
+					})}
+				</div>
+				<div class="px-3 pb-2">
+					<ui5-input
+						class="corp-ui5-input"
+						placeholder="Add or search model"
+						show-clear-icon
+						value=${modelFilter}
+						@input=${(e: Event) => { modelFilter = getUi5Value(e); renderApp(); }}
+					></ui5-input>
+				</div>
+				${llmConfigLoading
+					? html`<div class="px-3 py-4 text-center text-xs italic text-muted-foreground">Loading models...</div>`
+					: allModels.length === 0
+						? html`<div class="px-3 py-4 text-center text-xs italic text-muted-foreground">No models available for this provider.</div>`
+						: html`
+							<div class="max-h-64 overflow-y-auto">
+								${visible.length === 0
+									? html`<div class="px-3 py-3 text-center text-xs italic text-muted-foreground">No match.</div>`
+									: visible.map((model) => html`
+										<div class="flex items-center gap-3 border-t border-border px-3 py-2">
+											<div class="min-w-0 flex-1">
+												<div class="truncate text-sm">${model.name}</div>
+												<div class="corp-mono truncate text-xs text-muted-foreground">${model.id}</div>
+											</div>
+											<ui5-switch
+												class="corp-ui5-switch"
+												?checked=${model.active}
+												?disabled=${providerKeySaving}
+												@change=${(e: Event) => void toggleModelActive(model.id, (e.target as HTMLInputElement & { checked: boolean }).checked)}
+											></ui5-switch>
+										</div>
+									`)}
+							</div>
+						`}
+			</div>
+
+			<!-- API Keys (collapsible) -->
+			<div class="rounded-lg border border-border bg-card">
+				<button
+					type="button"
+					class="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-accent"
+					@click=${() => { apiKeysExpanded = !apiKeysExpanded; renderApp(); }}
+				>
+					${icon(apiKeysExpanded ? ChevronDown : ChevronRight, "xs")}
+					<span class="text-sm font-semibold">API Keys</span>
+					${hasKey
+						? html`<span class="ml-auto inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" style="color: var(--sapPositiveColor, #256f3a); background: var(--sapSuccessBackgroundColor, rgba(37,111,58,0.1));">Stored</span>`
+						: html`<span class="ml-auto text-xs text-muted-foreground">Required</span>`}
+				</button>
+				${apiKeysExpanded
+					? html`
+						<div class="flex flex-col gap-2 border-t border-border px-3 py-3">
+							<div class="flex items-center gap-2">
+								<div class="min-w-0 flex-1">
+									<div class="text-sm font-medium">${label} API Key</div>
+									<div class="text-xs text-muted-foreground">
+										${hasKey ? "A key is stored (encrypted)." : "You can put in your own key to use these models at cost."}
+									</div>
+								</div>
+								<ui5-switch
+									class="corp-ui5-switch"
+									?checked=${hasKey}
+									?disabled=${providerKeySaving}
+									@change=${(e: Event) => void toggleProviderKey((e.target as HTMLInputElement & { checked: boolean }).checked)}
+								></ui5-switch>
+							</div>
+							<ui5-input
+								class="corp-ui5-input"
+								type="Password"
+								placeholder=${hasKey ? `Replace your ${label} API Key` : `Enter your ${label} API Key`}
+								value=${providerKeyInput}
+								?disabled=${providerKeySaving}
+								@input=${(e: Event) => { providerKeyInput = getUi5Value(e); providerSavedNotice = ""; }}
+								@change=${() => void commitProviderKey()}
+							></ui5-input>
+							<div class="flex items-center gap-2">
+								<span class="text-xs text-muted-foreground">
+									Get a key at <a class="text-primary underline" href=${keyDocsUrl} target="_blank" rel="noopener noreferrer">${new URL(keyDocsUrl).host}</a>.
+								</span>
+								${providerSavedNotice ? html`<span class="ml-auto text-xs font-medium" style="color: var(--sapPositiveColor, #256f3a);">${providerSavedNotice}</span>` : ""}
+							</div>
+						</div>
+					`
+					: ""}
+			</div>
+
+			${providerKeyError ? html`<div class="text-xs text-destructive">${providerKeyError}</div>` : ""}
 		</div>
 	`;
 }
@@ -1548,6 +2196,19 @@ function renderWorkspaceSettingsDialog() {
 
 function renderApp() {
 	if (!currentUser) {
+		//IYH1HC add: never flash the login form before auth resolves; when hideAuthUi
+		// is set (XSUAA edge auth on BTP) the login screen is suppressed entirely.
+		if (ssoConfig.hideAuthUi || !authResolved) {
+			render(
+				html`
+					<div class="w-full h-screen flex items-center justify-center bg-background text-foreground">
+						<div class="text-sm text-muted-foreground">Signing in…</div>
+					</div>
+				`,
+				app,
+			);
+			return;
+		}
 		render(
 			html`
 				<div class="w-full h-screen flex items-center justify-center bg-background text-foreground">
@@ -1593,6 +2254,22 @@ function renderApp() {
 						>
 							${authMode === "login" ? "Create an account" : "Use an existing account"}
 						</ui5-button>
+						${ssoConfig.enabled
+							? html`
+								<div class="flex items-center gap-2 my-1">
+									<div class="h-px flex-1 bg-border"></div>
+									<span class="text-xs text-muted-foreground">or</span>
+									<div class="h-px flex-1 bg-border"></div>
+								</div>
+								${Ui5Button({
+									className: "corp-wide-button",
+									design: "Transparent",
+									children: html`${icon(KeyRound, "xs")}<span>${`Sign in with ${ssoConfig.label ?? "SSO"}`}</span>`,
+									onClick: () => { window.location.href = client.ssoLoginHref(); },
+									title: "Sign in with SSO",
+								})}
+							`
+							: ""}
 					</form>
 				</div>
 			`,
@@ -1613,7 +2290,7 @@ function renderApp() {
 							onClick: toggleSidebar,
 							title: sidebarOpen ? "Collapse sessions" : "Expand sessions",
 						})}
-						<span class="text-base font-semibold text-foreground">Bot Chat</span>
+						<span class="corp-app-title text-base font-semibold text-foreground">Bot Chat</span>
 					</div>
 					<div class="flex items-center gap-2">
 						${Ui5Button({
@@ -1631,7 +2308,7 @@ function renderApp() {
 								title: "Expand workspace",
 							})
 							: ""}
-						${renderThemeButton()}
+						${renderThemeMenu()}
 						${renderUserMenu()}
 					</div>
 				</div>
@@ -1761,5 +2438,7 @@ function renderApp() {
 }
 
 // Initial render then load workspaces/sessions
+consumeSsoHash();        //IYH1HC add
+void refreshSsoConfig(); //IYH1HC add
 renderApp();
 void initializeAuth();

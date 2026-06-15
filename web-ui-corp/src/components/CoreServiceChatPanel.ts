@@ -1,7 +1,7 @@
 import { html, LitElement } from "lit";
 import { customElement, property, query, state } from "lit/decorators.js";
 import { createRef, ref } from "lit/directives/ref.js";
-import type { MessageEditor } from "./MessageEditor.js";
+import type { MessageEditor, QuickModelOption } from "./MessageEditor.js"; //IYH1HC add: QuickModelOption
 import { CoreServiceClient, type ActiveModel, type AttachmentPayload, type SseEvent, type WorkspaceTableRows } from "../adapters/core-service.js";
 import type { Attachment } from "../utils/attachment-utils.js";
 import "./MessageEditor.js";
@@ -23,6 +23,7 @@ const TEXT_PREVIEW_EXTENSIONS = new Set([
 	"json", "jsonl", "xml", "yaml", "yml", "toml", "ini", "env",
 	"sql", "r", "lua", "pl", "pm", "jl",
 	"txt", "csv", "tsv", "log",
+	"abap", "cds", "csn"
 ]);
 
 const BINARY_PREVIEW_UNSUPPORTED_EXTENSIONS = new Set([
@@ -165,17 +166,18 @@ class CoreServiceFileViewer extends LitElement {
 			const src = `${this.baseUrl}/file?path=${encodeURIComponent(this.path)}`;
 			return html`<img src=${src} class="max-w-full" alt=${name} />`;
 		}
+		const actualFilename = this.path.split("/").pop() || this.path;
 		if (this.isPdf) {
-			return html`<pdf-artifact class="block h-full" .filename=${name} .content=${this.content}></pdf-artifact>`;
+			return html`<pdf-artifact class="block h-full" .filename=${actualFilename} .content=${this.content}></pdf-artifact>`;
 		}
 		if (this.isMarkdown) {
-			return html`<markdown-artifact class="block h-full" .filename=${name} .content=${this.content}></markdown-artifact>`;
+			return html`<markdown-artifact class="block h-full" .filename=${actualFilename} .content=${this.content}></markdown-artifact>`;
 		}
 		if (this.isCsv) {
-			return html`<csv-artifact class="block h-full" .filename=${name} .content=${this.content}></csv-artifact>`;
+			return html`<csv-artifact class="block h-full" .filename=${actualFilename} .content=${this.content}></csv-artifact>`;
 		}
 		if (this.isTextPreview) {
-			return html`<text-artifact class="block h-full" .filename=${name} .content=${this.content}></text-artifact>`;
+			return html`<text-artifact class="block h-full" .filename=${actualFilename} .content=${this.content}></text-artifact>`;
 		}
 		return html`
 			<div class="flex h-full items-center justify-center p-6">
@@ -288,6 +290,7 @@ export class CoreServiceChatPanel extends LitElement {
 	//IYH1HC add: active models for the listbox + the user's current selection.
 	@state() private declare activeModels: ActiveModel[];
 	@state() private declare selectedModel: string;
+	@state() private declare selectedReasoning: string; //IYH1HC add: reasoning level (UI state)
 
 	@query("message-editor") private declare _editor: MessageEditor;
 
@@ -315,6 +318,7 @@ export class CoreServiceChatPanel extends LitElement {
 		this.rightPanelWidth = Number(sessionStorage.getItem("core-service-preview-width") || "") || 480;
 		this.activeModels = []; //IYH1HC add
 		this.selectedModel = localStorage.getItem("core-service-selected-model") || ""; //IYH1HC add
+		this.selectedReasoning = localStorage.getItem("core-service-reasoning") || "off"; //IYH1HC add
 	}
 
 	protected override createRenderRoot(): HTMLElement | DocumentFragment {
@@ -364,23 +368,15 @@ export class CoreServiceChatPanel extends LitElement {
 		else localStorage.removeItem("core-service-selected-model");
 	}
 
-	//IYH1HC add: the model listbox shown next to the message editor.
-	private renderModelSelector() {
-		if (this.activeModels.length === 0) return html``;
-		return html`
-			<div class="flex items-center gap-2 px-1 pb-1">
-				<select
-					class="h-7 max-w-[16rem] rounded border border-border bg-background px-2 text-xs text-foreground"
-					.value=${this.selectedModel}
-					@change=${(e: Event) => this.onSelectModel((e.target as HTMLSelectElement).value)}
-				>
-					<option value="">Default model</option>
-					${this.activeModels.map((m) => html`
-						<option value=${`${m.provider}:${m.modelId}`}>${m.label} (${m.provider})</option>
-					`)}
-				</select>
-			</div>
-		`;
+	//IYH1HC add: reasoning level handler for the inline quick selector (UI state only for now).
+	private onSelectReasoning(level: string) {
+		this.selectedReasoning = level;
+		localStorage.setItem("core-service-reasoning", level);
+	}
+
+	//IYH1HC add: active models shaped for the editor's inline model quick-pick popover.
+	private quickModelOptions(): QuickModelOption[] {
+		return this.activeModels.map((m) => ({ value: `${m.provider}:${m.modelId}`, label: m.label, provider: m.provider }));
 	}
 
 	override disconnectedCallback() {
@@ -529,12 +525,17 @@ export class CoreServiceChatPanel extends LitElement {
 								<div class="absolute inset-0 flex items-center justify-center px-6">
 									<div class="w-full max-w-3xl -translate-y-12">
 										<div class="text-center text-2xl md:text-3xl font-medium mb-8">What's can I help?</div>
-										${this.renderModelSelector()}
 										<message-editor
 											.isStreaming=${this.isStreaming}
 											.showAttachmentButton=${true}
 											.showModelSelector=${false}
 											.showThinkingSelector=${false}
+											.useQuickSelector=${true}
+											.quickModels=${this.quickModelOptions()}
+											.selectedModelValue=${this.selectedModel}
+											.onModelChange=${(v: string) => { this.onSelectModel(v); this.requestUpdate(); }}
+											.thinkingLevel=${this.selectedReasoning}
+											.onThinkingChange=${(level: string) => { this.onSelectReasoning(level); this.requestUpdate(); }}
 											.onSend=${(text: string, attachments: Attachment[]) => this.handleSend(text, attachments)}
 											.onAbort=${() => this.handleAbort()}
 										></message-editor>
@@ -553,12 +554,17 @@ export class CoreServiceChatPanel extends LitElement {
 								<!-- Input Area -->
 								<div class="mt-auto shrink-0">
 									<div class="max-w-3xl mx-auto px-2 pb-4">
-										${this.renderModelSelector()}
 										<message-editor
 											.isStreaming=${this.isStreaming}
 											.showAttachmentButton=${true}
 											.showModelSelector=${false}
 											.showThinkingSelector=${false}
+											.useQuickSelector=${true}
+											.quickModels=${this.quickModelOptions()}
+											.selectedModelValue=${this.selectedModel}
+											.onModelChange=${(v: string) => { this.onSelectModel(v); this.requestUpdate(); }}
+											.thinkingLevel=${this.selectedReasoning}
+											.onThinkingChange=${(level: string) => { this.onSelectReasoning(level); this.requestUpdate(); }}
 											.onSend=${(text: string, attachments: Attachment[]) => this.handleSend(text, attachments)}
 											.onAbort=${() => this.handleAbort()}
 										></message-editor>

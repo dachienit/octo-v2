@@ -50,6 +50,9 @@ const CODE_EXTENSIONS = [
 	"perl",
 	"vue",
 	"svelte",
+	"abap",
+	"cds",
+	"csn",
 ];
 
 @customElement("text-artifact")
@@ -77,7 +80,7 @@ export class TextArtifact extends ArtifactElement {
 	}
 
 	private isCode(): boolean {
-		const ext = this.filename.split(".").pop()?.toLowerCase() || "";
+		const ext = this.filename.split(/[?#]/)[0].split(".").pop()?.toLowerCase() || "";
 		return CODE_EXTENSIONS.includes(ext);
 	}
 
@@ -90,6 +93,8 @@ export class TextArtifact extends ArtifactElement {
 			yml: "yaml",
 			ps1: "powershell",
 			bat: "batch",
+			cds: "sql",
+			csn: "json",
 		};
 		return languageMap[ext] || ext;
 	}

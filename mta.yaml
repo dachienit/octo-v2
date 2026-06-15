@@ -1,0 +1,153 @@
+_schema-version: "3.3.0"
+ID: octo
+version: 1.0.0
+description: Octo AI Agent Core Service + Approuter on SAP BTP Cloud Foundry
+
+parameters:
+  enable-parallel-deployments: true
+  deploy_mode: html5-repo
+
+# Build project
+build-parameters:
+  before-all:
+    - builder: custom
+      timeout: 30m
+      commands:
+        - npm ci
+        - npm run build --workspace=core-agent
+        - npm run build --workspace=core-service
+        - npm run build --workspace=web-ui-corp
+        - npm run build --workspace=web-app-corp
+
+modules:
+  # ----------------------------------------------------------------------------
+  # Backend: core-service (HTTP/SSE). Tools run with --sandbox=host inside this
+  # container. $PORT is injected by Cloud Foundry.
+  # ----------------------------------------------------------------------------
+  - name: octo-srv
+    type: nodejs
+    path: core-service
+    parameters:
+      buildpack: nodejs_buildpack
+      command: node dist/main.js --http $PORT workspace
+      memory: 16384M
+      disk-quota: 10239M
+    properties:
+      # Skip login logout UI      
+      OCTO_EDGE_AUTH: xsuaa
+      CORE_SERVICE_HIDE_AUTH_UI: "true"
+      CORE_SERVICE_ALLOW_SIGNUP: "false"
+      NODE_ENV: production
+      # To disable postgresql-db if not available in BTP subaccount
+      CORE_SERVICE_AUTH_ALLOW_EPHEMERAL: "true"
+      # To disable objectstore if not available in BTP subaccount
+      CORE_SERVICE_OBJECTSTORE_ALLOW_EPHEMERAL: "true"
+      CORE_SERVICE_AGENT_WORKERS_ENABLED: "false"
+      CORE_SERVICE_REMINDERS_ENABLED: "false"
+    provides:
+      - name: octo-srv-api
+        properties:
+          srv-url: ${default-url}
+    requires:
+      - name: octo-xsuaa
+      - name: octo-objectstore
+      #- name: octo-postgresql
+      - name: octo-destination
+      - name: octo-connectivity
+      - name: octo-secrets
+    # Assemble a self-contained deploy/ folder: vendors @octo/core-agent as an
+    # npm-pack tarball (file: dep) so the CF buildpack's node_modules relocation
+    # does not break workspace resolution. before-all has already built all dist.
+    build-parameters:
+      builder: custom
+      commands:
+        - node scripts/assemble-deploy.mjs
+      build-result: deploy
+      ignore:
+        - "node_modules/"
+
+  # ----------------------------------------------------------------------------
+  # Approuter: XSUAA login gate, static SPA host, reverse proxy to octo-srv.
+  # The SPA build is copied into approuter/resources at build time.
+  # ----------------------------------------------------------------------------
+  - name: octo-agent
+    type: approuter.nodejs
+    path: approuter
+    parameters:
+      memory: 2048M
+      disk-quota: 8192M
+    requires:
+      - name: octo-xsuaa
+      - name: octo-srv-api
+        group: destinations
+        properties:
+          name: octo-srv
+          url: ~{srv-url}
+          forwardAuthToken: true
+    build-parameters:
+      builder: custom
+      # Cross-platform copy of the built SPA into approuter/resources. Node is used
+      # instead of rm/cp/mkdir so the build works on Windows (mbt) and Linux CI alike.
+      commands:
+        - node -e "const fs=require('fs');fs.rmSync('resources',{recursive:true,force:true});fs.cpSync('../web-app-corp/dist','resources',{recursive:true})"
+      ignore:
+        - "node_modules/"
+
+resources:
+  - name: octo-xsuaa
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: xsuaa
+      service-plan: application
+      path: ./xs-security.json
+
+  # Durable user DB. The CF container filesystem is ephemeral, so the
+  # auth store (users/tokens/federated identities/provider keys) must live in a
+  # bound PostgreSQL service. core-service auto-selects PostgreSQL when this
+  # binding is present (see auth-storage.ts detectPostgres); falls back to SQLite
+  # locally. Plan confirmed via `cf marketplace -e postgresql-db` (this landscape
+  # only offers "standard").
+  #- name: octo-postgresql
+  #  type: org.cloudfoundry.managed-service
+  #  parameters:
+  #    service: postgresql-db
+  #    service-plan: standard
+
+  # Whole-tree data-root durability via object store (snapshot/restore
+  # mirror). Scope is the ENTIRE data root — auth.sqlite, users/, templates/,
+  # workspaces/** — so users/memberships and sessions/artifacts all survive a
+  # restart (the CF filesystem is ephemeral). Binds the existing 'taf-objectstore'
+  # instance the user created by hand (avoids MTA creating a duplicate).
+  # core-service auto-selects it from VCAP_SERVICES (see object-store.ts
+  # detectObjectStore); falls back to ephemeral locally.
+  # SINGLE-WRITER: do NOT scale octo-srv instances > 1 while the mirror is active —
+  # concurrent snapshots would overwrite each other and delete-sync from one
+  # instance could wipe another instance's fresh writes.
+  - name: octo-objectstore
+    type: org.cloudfoundry.existing-service
+    parameters:
+      service-name: taf-objectstore
+
+  # Destination + connectivity for on-prem SAP reach via principal propagation.
+  - name: octo-destination
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: destination
+      service-plan: lite
+
+  - name: octo-connectivity
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: connectivity
+      service-plan: lite
+
+  # Secrets. DO NOT commit real values: override via an mtaext at deploy time
+  # (cf deploy octo_*.mtar -e secrets.mtaext) or set after deploy with
+  # `cf update-user-provided-service`.
+  - name: octo-secrets
+    type: org.cloudfoundry.user-provided-service
+    parameters:
+      config:
+        CORE_SERVICE_ENCRYPTION_KEY: ""
+        SSO_GITHUB_CLIENT_SECRET: ""
+        AICORE_SERVICE_KEY: ""

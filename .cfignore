@@ -1,0 +1,9 @@
+.git/
+node_modules/
+**/node_modules/
+workspace/
+mta_archives/
+.vscode/
+*.log
+**/*.tsbuildinfo
+secrets.mtaext
