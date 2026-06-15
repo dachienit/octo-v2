@@ -42,6 +42,9 @@ interface PendingAuthLogin {
 	rejectManualCode?: (err: Error) => void;
 }
 
+type ConnectorLoginMode = NonNullable<ConnectorRuntime["loginModes"]>[number];
+type JsonObject = Record<string, unknown>;
+
 interface PendingAgentWorkerLogin {
 	userId: string;
 	connectorId: string;
@@ -51,6 +54,7 @@ interface PendingAgentWorkerLogin {
 	url?: string;
 	error?: string;
 	child?: ChildProcessWithoutNullStreams;
+	autoConfirmed?: boolean;
 }
 
 const BINARY_MIME_TYPES: Record<string, string> = {
@@ -457,6 +461,7 @@ export class HttpServer {
 			label: connector.label,
 			kind: connector.kind,
 			authMode: connector.authMode,
+			loginModes: connector.loginModes,
 			connected: connectorHomeHasFiles(usersRoot, userId, connector.id),
 			usedByAgents: connector.usedByAgents ?? [],
 			accessPolicy: connector.accessPolicy,
@@ -490,7 +495,7 @@ export class HttpServer {
 
 	private handleConnectorLogin(req: express.Request, res: express.Response): void {
 		const connector = this.resolveConnector(String(req.params.connector));
-		if (!connector?.command || !connector.loginCommand) {
+		if (!connector || (!connector.loginModes?.length && (!connector.command || !connector.loginCommand))) {
 			res.status(404).json({ error: "Connector login is not configured" });
 			return;
 		}
@@ -507,8 +512,8 @@ export class HttpServer {
 
 	private handleConnectorLogout(req: express.Request, res: express.Response): void {
 		const connector = this.resolveConnector(String(req.params.connector));
-		if (!connector?.command || !connector.logoutCommand) {
-			res.status(404).json({ error: "Connector logout is not configured" });
+		if (!connector) {
+			res.status(404).json({ error: "Unknown connector" });
 			return;
 		}
 		this.logoutConnector(req, res, connector);
@@ -583,21 +588,106 @@ export class HttpServer {
 			res.status(404).json({ error: "Unknown agent worker" });
 			return;
 		}
-		const userId = this.getUserId(req);
-		const usersRoot = this.getUsersRoot();
-		res.json({
-			id: agent,
-			label: connector.label,
-			connected: connectorHomeHasFiles(usersRoot, userId, agent),
-			authMode: connector.authMode,
-			kind: connector.kind,
-			usedByAgents: connector.usedByAgents ?? [],
-		});
+		res.json(this.serializeConnector(req, connector));
+	}
+
+	private isJsonObject(value: unknown): value is JsonObject {
+		return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+	}
+
+	private writeGeminiAuthSettings(home: string, authType: "oauth-personal" | "vertex-ai"): void {
+		const settingsDir = join(home, ".gemini");
+		const settingsPath = join(settingsDir, "settings.json");
+		mkdirSync(settingsDir, { recursive: true });
+
+		let settings: JsonObject = {};
+		if (existsSync(settingsPath)) {
+			try {
+				const parsed = JSON.parse(readFileSync(settingsPath, "utf-8"));
+				if (this.isJsonObject(parsed)) settings = parsed;
+			} catch {
+				settings = {};
+			}
+		}
+
+		const security = this.isJsonObject(settings.security) ? settings.security : {};
+		const auth = this.isJsonObject(security.auth) ? security.auth : {};
+
+		settings.selectedAuthType = authType;
+		settings.security = {
+			...security,
+			auth: {
+				...auth,
+				selectedType: authType,
+			},
+		};
+
+		writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+	}
+
+	private prepareConnectorLogin(
+		userId: string,
+		connector: ConnectorRuntime,
+		selectedMode: ConnectorLoginMode | undefined,
+		home: string,
+	): NodeJS.ProcessEnv {
+		const env = this.getConnectorEnv(userId, connector);
+		if (connector.id !== "gemini") return env;
+
+		const authType = selectedMode?.id === "gcloud-adc" ? "vertex-ai" : "oauth-personal";
+		this.writeGeminiAuthSettings(home, authType);
+
+		if (authType === "vertex-ai") {
+			delete env.GEMINI_API_KEY;
+			delete env.GOOGLE_API_KEY;
+			env.GOOGLE_GENAI_USE_VERTEXAI = "true";
+			return env;
+		}
+
+		delete env.GEMINI_API_KEY;
+		delete env.GOOGLE_API_KEY;
+		delete env.GOOGLE_GENAI_USE_VERTEXAI;
+		delete env.GOOGLE_GENAI_USE_GCA;
+		return env;
+	}
+
+	private maybeAutoConfirmConnectorLogin(
+		entry: PendingAgentWorkerLogin,
+		connector: ConnectorRuntime,
+		selectedMode: ConnectorLoginMode | undefined,
+	): void {
+		if (
+			entry.autoConfirmed ||
+			!entry.child ||
+			connector.id !== "gemini" ||
+			selectedMode?.id !== "gemini-cli"
+		) return;
+
+		if (!/Opening authentication page in your browser\.\s*Do you want to continue\?\s*\[Y\/n\]:/i.test(entry.output)) {
+			return;
+		}
+
+		entry.autoConfirmed = true;
+		entry.child.stdin.write("Y\n");
 	}
 
 	private startConnectorLogin(req: express.Request, res: express.Response, connector: ConnectorRuntime): void {
 		const userId = this.getUserId(req);
 		const loginId = this.createLoginId();
+
+		const { loginMode } = req.body as { loginMode?: string };
+		const selectedMode =
+			connector.loginModes?.find((mode) => mode.id === loginMode) ??
+			connector.loginModes?.[0];
+
+		const command = selectedMode?.command ?? connector.command;
+		const args = selectedMode?.args ?? connector.loginCommand;
+
+		if (!command || !args) {
+			res.status(404).json({ error: "Connector login is not configured" });
+			return;
+		}
+
 		const entry: PendingAgentWorkerLogin = {
 			userId,
 			connectorId: connector.id,
@@ -606,10 +696,12 @@ export class HttpServer {
 			output: "",
 		};
 		this.pendingAgentWorkerLogins.set(loginId, entry);
-		const home = ensureConnectorHome(this.getUsersRoot(), userId, connector.id);
 
-		const child = spawn(connector.command!, connector.loginCommand!, {
-			env: this.getConnectorEnv(userId, connector),
+		const home = ensureConnectorHome(this.getUsersRoot(), userId, connector.id);
+		const env = this.prepareConnectorLogin(userId, connector, selectedMode, home);
+
+		const child = spawn(command, args, {
+			env,
 			cwd: home,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
@@ -618,6 +710,7 @@ export class HttpServer {
 			entry.output += chunk.toString("utf-8");
 			if (entry.output.length > 20000) entry.output = entry.output.slice(-20000);
 			entry.url = entry.url ?? this.extractUrl(entry.output);
+			this.maybeAutoConfirmConnectorLogin(entry, connector, selectedMode);
 		};
 		child.stdout.on("data", onData);
 		child.stderr.on("data", onData);
@@ -633,6 +726,7 @@ export class HttpServer {
 
 		res.status(201).json({
 			loginId,
+			loginMode: selectedMode?.id,
 			agent: connector.id,
 			connector: connector.id,
 			label: connector.label,
@@ -651,7 +745,7 @@ export class HttpServer {
 		}
 		const agent = String(req.params.agent);
 		const connector = this.resolveConnector(agent, "agent-runtime");
-		if (!connector?.command || !connector.loginCommand) {
+		if (!connector || (!connector.loginModes?.length && (!connector.command || !connector.loginCommand))) {
 			res.status(404).json({ error: "Unknown agent worker" });
 			return;
 		}
@@ -667,6 +761,7 @@ export class HttpServer {
 		res.json({
 			status: entry.status,
 			[fieldName]: entry.connectorId,
+			loginMode: (entry as any).loginMode,
 			url: entry.url,
 			output: entry.output,
 			error: entry.error,
@@ -708,15 +803,24 @@ export class HttpServer {
 	private logoutConnector(req: express.Request, res: express.Response, connector: ConnectorRuntime): void {
 		const userId = this.getUserId(req);
 		const home = getConnectorHome(this.getUsersRoot(), userId, connector.id);
-		const child = spawn(connector.command!, connector.logoutCommand!, {
-			env: this.getConnectorEnv(userId, connector),
-			cwd: home,
-			stdio: ["ignore", "ignore", "ignore"],
-		});
-		child.once("exit", () => {
+
+		const removeHome = () => {
 			try { rmSync(home, { recursive: true, force: true }); } catch { /* ignore */ }
-		});
-		res.json({ ok: true });
+		};
+
+		if (connector.command && connector.logoutCommand) {
+			const child = spawn(connector.command, connector.logoutCommand, {
+				env: this.getConnectorEnv(userId, connector),
+				cwd: home,
+				stdio: ["ignore", "ignore", "ignore"],
+			});
+			child.once("exit", removeHome);
+			child.once("error", removeHome);
+			res.json({ ok: true });
+		} else {
+			removeHome();
+			res.json({ ok: true });
+		}
 	}
 
 	private handleAgentWorkerLogout(req: express.Request, res: express.Response): void {
@@ -726,7 +830,7 @@ export class HttpServer {
 		}
 		const agent = String(req.params.agent);
 		const connector = this.resolveConnector(agent, "agent-runtime");
-		if (!connector?.command || !connector.logoutCommand) {
+		if (!connector) {
 			res.status(404).json({ error: "Unknown agent worker" });
 			return;
 		}

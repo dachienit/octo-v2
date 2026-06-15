@@ -59,6 +59,12 @@ export type AgentWorkerStatus = {
 	connected: boolean;
 	kind?: "agent-runtime" | "business-connector";
 	authMode?: "cli" | "oauth" | "api-key" | "browser-sso";
+	loginModes?: Array<{
+		id: string;
+		label: string;
+		description?: string;
+		authMode?: "cli" | "oauth" | "api-key" | "browser-sso";
+	}>;
 	usedByAgents?: string[];
 };
 
@@ -81,6 +87,7 @@ export type CoreServiceFeatures = {
 
 export type AgentWorkerLoginStart = {
 	loginId: string;
+	loginMode?: string;
 	agent: string;
 	connector?: string;
 	label: string;
@@ -93,6 +100,7 @@ export type AgentWorkerLoginStart = {
 
 export type AgentWorkerLoginStatus = {
 	status: "pending" | "complete" | "error";
+	loginMode?: string;
 	agent?: string;
 	connector?: string;
 	url?: string;
@@ -441,11 +449,14 @@ export class CoreServiceClient {
 		}
 	}
 
-	async startConnectorLogin(connector: string): Promise<AgentWorkerLoginStart | null> {
+	async startConnectorLogin(
+		connector: string,
+		options?: { loginMode?: string },
+	): Promise<AgentWorkerLoginStart | null> {
 		const response = await this.fetch(`/auth/connectors/${encodeURIComponent(connector)}/login`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({}),
+			body: JSON.stringify(options ?? {}),
 		});
 		if (!response.ok) return null;
 		return response.json();
