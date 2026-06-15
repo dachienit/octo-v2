@@ -204,6 +204,7 @@ interface ChannelState {
 	running: boolean;
 	runner: AgentRunner;
 	authFilePath?: string;
+	mcpKey: string;
 	agentWorkersEnabled: boolean;
 	remindersEnabled: boolean;
 	store: ChannelStore;
@@ -222,6 +223,20 @@ function getUserAuthFilePath(userId: string): string {
 	return join(dir, "auth.json");
 }
 
+function getRunnerOptions(userId: string, workspaceId: string, authFilePath?: string) {
+	return {
+		authFilePath,
+		userId,
+		usersRoot: join(workingDir, "users"),
+		agentWorkersEnabled: AGENT_WORKERS_ENABLED,
+		remindersEnabled: REMINDERS_ENABLED,
+		mcpServers: workspaceStore.getWorkspaceSettings(userId, workspaceId).mcp?.servers,
+	};
+}
+
+function getWorkspaceMcpKey(userId: string, workspaceId: string): string {
+	return JSON.stringify(workspaceStore.getWorkspaceSettings(userId, workspaceId).mcp?.servers ?? []);
+}
 async function getState(sessionId: string, userId = "web-user", authFilePath?: string): Promise<ChannelState> {
 	const session = workspaceStore.ensureSession({ sessionId, userId });
 	let state = channelStates.get(sessionId);
@@ -238,8 +253,8 @@ async function getState(sessionId: string, userId = "web-user", authFilePath?: s
 		state = {
 			workspaceId: session.workspaceId,
 			running: false,
-			runner: getOrCreateRunner(sessionSandbox, sessionId, channelDir, { authFilePath, userId, usersRoot: join(workingDir, "users"), agentWorkersEnabled: AGENT_WORKERS_ENABLED, remindersEnabled: REMINDERS_ENABLED }),
-			authFilePath,
+			runner: await getOrCreateRunner(sessionSandbox, sessionId, channelDir, getRunnerOptions(userId, session.workspaceId, authFilePath)),//getOrCreateRunner(sessionSandbox, sessionId, channelDir, { authFilePath, userId, usersRoot: join(workingDir, "users"), agentWorkersEnabled: AGENT_WORKERS_ENABLED, remindersEnabled: REMINDERS_ENABLED }),
+			authFilePath,mcpKey: getWorkspaceMcpKey(userId, session.workspaceId),
 			agentWorkersEnabled: AGENT_WORKERS_ENABLED,
 			remindersEnabled: REMINDERS_ENABLED,
 			store: new ChannelStore({ workingDir: join(workspaceRoot, "sessions"), botToken: MOM_SLACK_BOT_TOKEN || "" }),
@@ -257,9 +272,11 @@ async function getState(sessionId: string, userId = "web-user", authFilePath?: s
 			memberUserIds: workspaceStore.getWorkspaceMembers(session.workspaceId).map((member) => member.userId),
 			image: workspaceStore.getWorkspaceSandboxImage(session.workspaceId),
 		});
-		if (state.authFilePath !== authFilePath || state.agentWorkersEnabled !== AGENT_WORKERS_ENABLED || state.remindersEnabled !== REMINDERS_ENABLED) {
-			state.runner = getOrCreateRunner(sessionSandbox, sessionId, channelDir, { authFilePath, userId, usersRoot: join(workingDir, "users"), agentWorkersEnabled: AGENT_WORKERS_ENABLED, remindersEnabled: REMINDERS_ENABLED });
+		const mcpKey = getWorkspaceMcpKey(userId, session.workspaceId);
+		if (state.authFilePath !== authFilePath || state.agentWorkersEnabled !== AGENT_WORKERS_ENABLED || state.remindersEnabled !== REMINDERS_ENABLED || state.mcpKey !== mcpKey) {
+			state.runner = await getOrCreateRunner(sessionSandbox, sessionId, channelDir, getRunnerOptions(userId, session.workspaceId, authFilePath));
 			state.authFilePath = authFilePath;
+			state.mcpKey = mcpKey;
 			state.agentWorkersEnabled = AGENT_WORKERS_ENABLED;
 			state.remindersEnabled = REMINDERS_ENABLED;
 		}

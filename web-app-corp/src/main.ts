@@ -103,6 +103,9 @@ const databaseTables = new Map<string, WorkspaceTableSummary[]>();
 const expandedFolders = new Set<string>();
 const client = new CoreServiceClient(baseUrl, () => authToken);
 
+type McpServerDraft = NonNullable<NonNullable<WorkspaceSettings["mcp"]>["servers"]>[number];
+let workspaceMcpServersDraft: McpServerDraft[] = [];
+
 const chatPanel = new CoreServiceChatPanel();
 chatPanel.baseUrl = baseUrl;
 chatPanel.channelId = channelId;
@@ -792,6 +795,7 @@ async function openWorkspaceSettingsDialog() {
 	]);
 	workspaceSettings = settings;
 	workspaceAgentPromptDraft = workspaceSettings.agent?.prompt ?? "";
+	workspaceMcpServersDraft = cloneMcpServers(workspaceSettings);
 	workspaceSettingsBusy = false;
 	renderApp();
 }
@@ -811,10 +815,69 @@ async function openAgentWorkerSettingsDialog() {
 	]);
 	workspaceSettings = settings;
 	workspaceAgentPromptDraft = workspaceSettings.agent?.prompt ?? "";
+	workspaceMcpServersDraft = cloneMcpServers(workspaceSettings);
 	workspaceSettingsBusy = false;
 	renderApp();
 }
 
+function cloneMcpServers(settings: WorkspaceSettings): McpServerDraft[] {
+	return (settings.mcp?.servers ?? []).map((server) => ({
+		...server,
+		enabled: server.enabled !== false,
+		transport: server.transport ?? (server.url ? "streamable-http" : "stdio"),
+		args: [...(server.args ?? [])],
+		allowedTools: [...(server.allowedTools ?? [])],
+		blockedTools: [...(server.blockedTools ?? [])],
+		env: server.env ? { ...server.env } : undefined,
+		headers: server.headers ? { ...server.headers } : undefined,
+	}));
+}
+
+function normalizeMcpServers(servers: McpServerDraft[]): McpServerDraft[] {
+	return servers
+		.map((server) => ({
+			...server,
+			name: server.name.trim(),
+			command: server.command?.trim() || undefined,
+			url: server.url?.trim() || undefined,
+			toolPrefix: server.toolPrefix?.trim() || undefined,
+			args: server.args?.filter(Boolean),
+			allowedTools: server.allowedTools?.filter(Boolean),
+			blockedTools: server.blockedTools?.filter(Boolean),
+			timeoutMs: server.timeoutMs && server.timeoutMs > 0 ? server.timeoutMs : undefined,
+		}))
+		.filter((server) => server.name && (server.transport === "stdio" ? server.command : server.url));
+}
+
+function addMcpServer() {
+	workspaceMcpServersDraft = [
+		...workspaceMcpServersDraft,
+		{ name: "agentic_news", enabled: true, transport: "streamable-http", url: "https://api.agentic-news.ai/mcp", toolPrefix: "news", timeoutMs: 30000 },
+	];
+	renderApp();
+}
+
+function updateMcpServer(index: number, patch: Partial<McpServerDraft>) {
+	workspaceMcpServersDraft = workspaceMcpServersDraft.map((server, i) => i === index ? { ...server, ...patch } : server);
+	renderApp();
+}
+
+function removeMcpServer(index: number) {
+	workspaceMcpServersDraft = workspaceMcpServersDraft.filter((_, i) => i !== index);
+	renderApp();
+}
+
+function parseCsvList(value: string): string[] {
+	return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function parseJsonObject(value: string): Record<string, string> | undefined {
+	const trimmed = value.trim();
+	if (!trimmed) return undefined;
+	const parsed = JSON.parse(trimmed) as unknown;
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Expected a JSON object.");
+	return parsed as Record<string, string>;
+}
 
 function closeWorkspaceSettingsDialog() {
 	workspaceSettingsDialogOpen = false;
@@ -852,7 +915,7 @@ async function saveWorkspaceSettings(event: Event) {
 				allowed: data.getAll("allowedConnectors").map(String),
 			}
 			: workspaceSettings.connectors,
-		mcp: workspaceSettings.mcp,
+		mcp: workspaceSettingsTab === "connection" ? { servers: normalizeMcpServers(workspaceMcpServersDraft) } : workspaceSettings.mcp,
 	};
 	const saved = await client.updateWorkspaceSettings(workspaceId, next);
 	workspaceSettingsBusy = false;
@@ -2095,6 +2158,54 @@ function renderLlmKeyAndModels() {
 	`;
 }
 
+function renderMcpSettings() {
+	return html`
+		<section class="mt-6 flex flex-col gap-3 border-t border-border pt-5">
+			<div class="flex items-center justify-between gap-3">
+				<div>
+					<div class="text-sm font-medium">MCP tool servers</div>
+					<div class="text-xs text-muted-foreground">Discovered MCP tools are exposed to the agent as separate tools.</div>
+				</div>
+				${Ui5Button({ children: "Add MCP", design: "Transparent", onClick: addMcpServer })}
+			</div>
+			${workspaceMcpServersDraft.length === 0
+				? html`<div class="rounded border border-border p-3 text-xs text-muted-foreground">No MCP servers configured.</div>`
+				: workspaceMcpServersDraft.map((server, index) => html`
+					<div class="rounded border border-border p-3">
+						<div class="mb-3 grid grid-cols-[1fr_180px_auto_auto] gap-2">
+							<ui5-input class="corp-ui5-input" placeholder="Name" value=${server.name} @input=${(e: Event) => updateMcpServer(index, { name: getUi5Value(e) })}></ui5-input>
+							<ui5-select class="corp-ui5-select" @change=${(e: Event) => updateMcpServer(index, { transport: getUi5Value(e) as McpServerDraft["transport"] })}>
+								<ui5-option value="streamable-http" ?selected=${(server.transport ?? "streamable-http") === "streamable-http"}>Streamable HTTP</ui5-option>
+								<ui5-option value="sse" ?selected=${server.transport === "sse"}>SSE</ui5-option>
+								<ui5-option value="stdio" ?selected=${server.transport === "stdio"}>stdio</ui5-option>
+							</ui5-select>
+							<ui5-checkbox class="corp-ui5-checkbox" text="On" ?checked=${server.enabled !== false} @change=${(e: Event) => updateMcpServer(index, { enabled: (e.target as HTMLInputElement).checked })}></ui5-checkbox>
+							${Ui5Button({ className: "corp-tight-icon-button", ui5Icon: "decline", title: "Remove MCP server", onClick: () => removeMcpServer(index) })}
+						</div>
+						${server.transport === "stdio"
+							? html`
+								<div class="grid grid-cols-2 gap-2">
+									<ui5-input class="corp-ui5-input" placeholder="Command" value=${server.command ?? ""} @input=${(e: Event) => updateMcpServer(index, { command: getUi5Value(e) })}></ui5-input>
+									<ui5-input class="corp-ui5-input" placeholder="Args, comma separated" value=${server.args?.join(", ") ?? ""} @input=${(e: Event) => updateMcpServer(index, { args: parseCsvList(getUi5Value(e)) })}></ui5-input>
+								</div>
+								<ui5-textarea class="corp-ui5-textarea mt-2 w-full" placeholder='Environment JSON, e.g. {"TOKEN":"..."}' rows="4" value=${server.env ? JSON.stringify(server.env, null, 2) : ""} @input=${(e: Event) => { try { updateMcpServer(index, { env: parseJsonObject(getUi5Value(e)) }); } catch { /* keep typing */ } }}></ui5-textarea>
+							`
+							: html`
+								<ui5-input class="corp-ui5-input w-full" placeholder="MCP URL" value=${server.url ?? ""} @input=${(e: Event) => updateMcpServer(index, { url: getUi5Value(e) })}></ui5-input>
+								<ui5-textarea class="corp-ui5-textarea mt-2 w-full" placeholder='Headers JSON, e.g. {"Authorization":"Bearer ..."}' rows="4" value=${server.headers ? JSON.stringify(server.headers, null, 2) : ""} @input=${(e: Event) => { try { updateMcpServer(index, { headers: parseJsonObject(getUi5Value(e)) }); } catch { /* keep typing */ } }}></ui5-textarea>
+							`}
+						<div class="mt-2 grid grid-cols-2 gap-2">
+							<ui5-input class="corp-ui5-input" placeholder="Tool prefix" value=${server.toolPrefix ?? ""} @input=${(e: Event) => updateMcpServer(index, { toolPrefix: getUi5Value(e) })}></ui5-input>
+							<ui5-input class="corp-ui5-input" type="Number" placeholder="Timeout ms" value=${server.timeoutMs ? String(server.timeoutMs) : ""} @input=${(e: Event) => updateMcpServer(index, { timeoutMs: Number(getUi5Value(e)) || undefined })}></ui5-input>
+							<ui5-input class="corp-ui5-input" placeholder="Allowed tools, comma separated" value=${server.allowedTools?.join(", ") ?? ""} @input=${(e: Event) => updateMcpServer(index, { allowedTools: parseCsvList(getUi5Value(e)) })}></ui5-input>
+							<ui5-input class="corp-ui5-input" placeholder="Blocked tools, comma separated" value=${server.blockedTools?.join(", ") ?? ""} @input=${(e: Event) => updateMcpServer(index, { blockedTools: parseCsvList(getUi5Value(e)) })}></ui5-input>
+						</div>
+					</div>
+				`)}
+		</section>
+	`;
+}
+
 function renderWorkspaceSettingsDialog() {
 	if (!workspaceSettingsDialogOpen) return "";
 	if (!serviceFeatures.agentWorkers && workspaceSettingsTab === "workers") {
@@ -2166,8 +2277,7 @@ function renderWorkspaceSettingsDialog() {
 										</section>
 									`
 									: workspaceSettingsTab === "connection"
-										? renderBusinessConnectorSettings(sap)
-										: workspaceSettingsTab === "workers"
+											? html`${renderBusinessConnectorSettings(sap)}${renderMcpSettings()}`										: workspaceSettingsTab === "workers"
 											? renderAgentWorkerSettings()
 											: renderSandboxSettings()}
 							</div>

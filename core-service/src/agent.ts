@@ -1,11 +1,15 @@
 import {
+	closeMcpTools,
 	CoreAgent,
+	createMcpTools,
 	formatSkillsForPrompt,
 	getMemory,
 	loadSkills,
 	type CoreAgentEventHandlers,
+	type McpServerConfig,
 	type SandboxConfig,
 } from "@octo/core-agent";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import * as log from "./log.js";
@@ -34,6 +38,7 @@ export interface RunnerOptions {
 	usersRoot?: string;
 	agentWorkersEnabled?: boolean;
 	remindersEnabled?: boolean;
+	mcpServers?: McpServerConfig[];
 }
 
 function truncate(text: string, maxLen: number): string {
@@ -345,23 +350,32 @@ function loadWorkspaceInstructions(workspacePath: string): string {
 
 // Cache one CoreAgent per channel/auth file. AgentSession owns a ModelRegistry
 // bound to its AuthStorage, so recreate the agent when a web user auth path changes.
-const channelAgents = new Map<string, { agent: CoreAgent; authFilePath?: string; agentWorkersEnabled?: boolean; remindersEnabled?: boolean }>();
+const channelAgents = new Map<string, { agent: CoreAgent; authFilePath?: string; agentWorkersEnabled?: boolean; remindersEnabled?: boolean; mcpKey: string; mcpTools: AgentTool<any>[] }>();
 
-export function getOrCreateRunner(
+function getMcpKey(servers: McpServerConfig[] | undefined): string {
+	return JSON.stringify(servers ?? []);
+}
+
+export async function getOrCreateRunner(
 	sandboxConfig: SandboxConfig,
 	channelId: string,
 	channelDir: string,
 	options: RunnerOptions = {},
-): AgentRunner {
+): Promise<AgentRunner> {
 	const existing = channelAgents.get(channelId);
+	const mcpKey = getMcpKey(options.mcpServers);
 	if (
 		existing &&
 		existing.authFilePath === options.authFilePath &&
 		existing.agentWorkersEnabled === options.agentWorkersEnabled &&
-		existing.remindersEnabled === options.remindersEnabled
+		existing.remindersEnabled === options.remindersEnabled &&
+		existing.mcpKey === mcpKey
 	) {
 		return createRunner(existing.agent, sandboxConfig, channelId, channelDir, options.remindersEnabled !== false);
 	}
+
+	const extraTools = await createMcpTools(options.mcpServers);
+	closeMcpTools(existing?.mcpTools);
 
 	const agent = new CoreAgent(channelId, {
 		sandboxConfig,
@@ -370,8 +384,9 @@ export function getOrCreateRunner(
 		userId: options.userId,
 		usersRoot: options.usersRoot,
 		agentWorkersEnabled: options.agentWorkersEnabled,
+		extraTools,
 	});
-	channelAgents.set(channelId, { agent, authFilePath: options.authFilePath, agentWorkersEnabled: options.agentWorkersEnabled, remindersEnabled: options.remindersEnabled });
+	channelAgents.set(channelId, { agent, authFilePath: options.authFilePath, agentWorkersEnabled: options.agentWorkersEnabled, remindersEnabled: options.remindersEnabled, mcpKey, mcpTools: extraTools });
 	return createRunner(agent, sandboxConfig, channelId, channelDir, options.remindersEnabled !== false);
 }
 
