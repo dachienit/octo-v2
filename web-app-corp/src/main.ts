@@ -66,6 +66,10 @@ let agentWorkerBusy = "";
 let agentWorkerLoginOutput = "";
 let businessConnectorBusy = "";
 let businessConnectorLoginOutput = "";
+
+const connectorLoginModes = new Map<string, string>();
+const LOGIN_INPUT_PROMPT_LIMIT = 3;
+const LOGIN_INPUT_PROMPT_PATTERN = /paste|enter|code|verification|continue|\[Y\/n\]/i;
 let agentWorkersCollapsed = localStorage.getItem("agentWorkersCollapsed") === "true";
 let newWorkspaceName = "New workspace";
 let newWorkspaceTemplateId = "sap-cap";
@@ -525,24 +529,44 @@ async function connectAgentWorker(agent: string) {
 	agentWorkerLoginOutput = "";
 	renderApp();
 	try {
-		const login = await client.startConnectorLogin(agent);
+		const login = await client.startConnectorLogin(agent, {
+			loginMode: connectorLoginModes.get(agent),
+		});
 		if (!login) throw new Error("Could not start worker login");
-		if (login.url) window.open(login.url, "_blank", "noopener,noreferrer");
+		
+		const openedUrls = new Set<string>();
+		if (login.url) {
+			openedUrls.add(login.url);
+			window.open(login.url, "_blank", "noopener,noreferrer");
+		}
+		
 		const deadline = Date.now() + 180000;
 		let lastOutput = login.output ?? "";
+		let inputPromptCount = 0;
+		
 		while (Date.now() < deadline) {
 			const status = await client.getConnectorLoginStatus(agent, login.loginId);
 			if (!status) break;
 			lastOutput = status.output ?? lastOutput;
 			agentWorkerLoginOutput = lastOutput;
 			const url = status.url;
-			if (url) window.open(url, "_blank", "noopener,noreferrer");
+			if (url && !openedUrls.has(url)) {
+				openedUrls.add(url);
+				window.open(url, "_blank", "noopener,noreferrer");
+			}
 			renderApp();
 			if (status.status === "complete") break;
 			if (status.status === "error") throw new Error(status.error || "Worker login failed");
-			if (/paste|enter|code|verification/i.test(lastOutput)) {
+			if (LOGIN_INPUT_PROMPT_PATTERN.test(lastOutput)) {
+				inputPromptCount += 1;
+				if (inputPromptCount > LOGIN_INPUT_PROMPT_LIMIT) {
+					throw new Error("Worker login failed after 3 input attempts");
+				}
+
 				const input = prompt(`${login.label} login input:`);
-				if (input) await client.sendConnectorLoginInput(agent, login.loginId, input);
+				if (!input) throw new Error("Worker login cancelled");
+
+				await client.sendConnectorLoginInput(agent, login.loginId, input);
 			}
 			await new Promise((resolve) => setTimeout(resolve, 1500));
 		}
@@ -573,24 +597,44 @@ async function connectBusinessConnector(connectorId: string) {
 	businessConnectorLoginOutput = "";
 	renderApp();
 	try {
-		const login = await client.startConnectorLogin(connectorId);
+		const login = await client.startConnectorLogin(connectorId, {
+			loginMode: connectorLoginModes.get(connectorId),
+		});
 		if (!login) throw new Error("Could not start connector login");
-		if (login.url) window.open(login.url, "_blank", "noopener,noreferrer");
+		
+		const openedUrls = new Set<string>();
+		if (login.url) {
+			openedUrls.add(login.url);
+			window.open(login.url, "_blank", "noopener,noreferrer");
+		}
+		
 		const deadline = Date.now() + 180000;
 		let lastOutput = login.output ?? "";
+		let inputPromptCount = 0;
+		
 		while (Date.now() < deadline) {
 			const status = await client.getConnectorLoginStatus(connectorId, login.loginId);
 			if (!status) break;
 			lastOutput = status.output ?? lastOutput;
 			businessConnectorLoginOutput = lastOutput;
 			const url = status.url;
-			if (url) window.open(url, "_blank", "noopener,noreferrer");
+			if (url && !openedUrls.has(url)) {
+				openedUrls.add(url);
+				window.open(url, "_blank", "noopener,noreferrer");
+			}
 			renderApp();
 			if (status.status === "complete") break;
 			if (status.status === "error") throw new Error(status.error || "Connector login failed");
-			if (/paste|enter|code|verification/i.test(lastOutput)) {
+			if (LOGIN_INPUT_PROMPT_PATTERN.test(lastOutput)) {
+				inputPromptCount += 1;
+				if (inputPromptCount > LOGIN_INPUT_PROMPT_LIMIT) {
+					throw new Error("Connector login failed after 3 input attempts");
+				}
+
 				const input = prompt(`${login.label} login input:`);
-				if (input) await client.sendConnectorLoginInput(connectorId, login.loginId, input);
+				if (!input) throw new Error("Connector login cancelled");
+
+				await client.sendConnectorLoginInput(connectorId, login.loginId, input);
 			}
 			await new Promise((resolve) => setTimeout(resolve, 1500));
 		}
@@ -951,6 +995,36 @@ function renderAgentWorkerSettings() {
 									${worker.authMode ? html`<span> · ${worker.authMode}</span>` : ""}
 									${worker.accessPolicy?.allowedInDocker ? html`<span> · sandbox enabled</span>` : ""}
 								</div>
+								${!worker.connected && worker.loginModes && worker.loginModes.length > 1
+									? html`
+										<div class="mt-2 max-w-xs">
+											<ui5-select
+												class="corp-ui5-select"
+												?disabled=${agentWorkerBusy === worker.id}
+												@change=${(e: Event) => {
+													connectorLoginModes.set(
+														worker.id,
+														getUi5SelectValue(e, connectorLoginModes.get(worker.id) ?? worker.loginModes![0]!.id),
+													);
+												}}
+											>
+												${worker.loginModes.map((mode) => html`
+													<ui5-option
+														value=${mode.id}
+														?selected=${(connectorLoginModes.get(worker.id) ?? worker.loginModes![0]!.id) === mode.id}
+													>
+														${mode.label}
+													</ui5-option>
+												`)}
+											</ui5-select>
+											<div class="mt-1 text-[11px] text-muted-foreground">
+												${worker.loginModes.find(
+													(mode) => mode.id === (connectorLoginModes.get(worker.id) ?? worker.loginModes![0]!.id),
+												)?.description ?? ""}
+											</div>
+										</div>
+									`
+									: ""}
 							</div>
 							<ui5-button
 								class="corp-ui5-button"
@@ -1082,6 +1156,36 @@ function renderBusinessConnectorSettings(sap: WorkspaceSettings["sapConnection"]
 										<span> · host proxy</span>
 										${connector.accessPolicy?.network ? html`<span> · network ${connector.accessPolicy.network}</span>` : ""}
 									</div>
+									${!connector.connected && connector.loginModes && connector.loginModes.length > 1
+										? html`
+											<div class="mt-2 max-w-xs">
+												<ui5-select
+													class="corp-ui5-select"
+													?disabled=${businessConnectorBusy === connector.id}
+													@change=${(e: Event) => {
+														connectorLoginModes.set(
+															connector.id,
+															getUi5SelectValue(e, connectorLoginModes.get(connector.id) ?? connector.loginModes![0]!.id),
+														);
+													}}
+												>
+													${connector.loginModes.map((mode) => html`
+														<ui5-option
+															value=${mode.id}
+															?selected=${(connectorLoginModes.get(connector.id) ?? connector.loginModes![0]!.id) === mode.id}
+														>
+															${mode.label}
+														</ui5-option>
+													`)}
+												</ui5-select>
+												<div class="mt-1 text-[11px] text-muted-foreground">
+													${connector.loginModes.find(
+														(mode) => mode.id === (connectorLoginModes.get(connector.id) ?? connector.loginModes![0]!.id),
+													)?.description ?? ""}
+												</div>
+											</div>
+										`
+										: ""}
 									</div>
 									<ui5-checkbox
 										class="corp-ui5-checkbox"
@@ -1613,7 +1717,7 @@ function renderApp() {
 							onClick: toggleSidebar,
 							title: sidebarOpen ? "Collapse sessions" : "Expand sessions",
 						})}
-						<span class="text-base font-semibold text-foreground">Bot Chat</span>
+						<span class="text-base font-semibold text-foreground">Octo Chat</span>
 					</div>
 					<div class="flex items-center gap-2">
 						${Ui5Button({

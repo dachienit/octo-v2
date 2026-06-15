@@ -34,6 +34,14 @@ export type ConnectorRuntime = {
 	command?: string;
 	statusCommand?: string[];
 	loginCommand?: string[];
+	loginModes?: Array<{
+		id: string;
+		label: string;
+		description?: string;
+		authMode?: ConnectorAuthMode;
+		command: string;
+		args: string[];
+	}>;
 	logoutCommand?: string[];
 	usedByAgents?: string[];
 	accessPolicy: ConnectorAccessPolicy;
@@ -57,10 +65,27 @@ const CONNECTOR_DEFINITIONS: Array<Omit<ConnectorRuntime, "env" | "mounts">> = [
 		id: "gemini",
 		label: "Gemini",
 		kind: "agent-runtime",
-		authMode: "cli",
+		authMode: "browser-sso",
 		command: "gemini",
-		loginCommand: ["auth", "login"],
-		logoutCommand: ["auth", "logout"],
+		loginCommand: [],
+		loginModes: [
+			{
+				id: "gemini-cli",
+				label: "Gemini CLI",
+				description: "Interactive Gemini CLI sign-in with Google.",
+				authMode: "browser-sso",
+				command: "gemini",
+				args: [],
+			},
+			{
+				id: "gcloud-adc",
+				label: "Vertex AI via gcloud",
+				description: "Google Cloud Application Default Credentials for Vertex AI.",
+				authMode: "cli",
+				command: "gcloud",
+				args: ["auth", "application-default", "login"],
+			},
+		],
 		usedByAgents: ["gemini"],
 		accessPolicy: { connectorId: "gemini", allowedInHost: true, allowedInDocker: true, mountMode: "rw", network: "required" },
 	},
@@ -125,16 +150,20 @@ export function ensureConnectorHome(usersRoot: string, userId: string, connector
 }
 
 export function connectorHomeHasFiles(usersRoot: string, userId: string, connectorId: string): boolean {
-	return directoryHasFiles(getConnectorHome(usersRoot, userId, connectorId));
+	const home = getConnectorHome(usersRoot, userId, connectorId);
+	if (connectorId === "gemini") {
+		return directoryHasFiles(home, (path) => path !== join(home, ".gemini", "settings.json"));
+	}
+	return directoryHasFiles(home);
 }
 
-export function directoryHasFiles(dir: string): boolean {
+export function directoryHasFiles(dir: string, includeFile: (path: string) => boolean = () => true): boolean {
 	if (!existsSync(dir)) return false;
 	for (const entry of readdirSync(dir, { withFileTypes: true })) {
 		const path = join(dir, entry.name);
 		if (entry.isDirectory()) {
-			if (directoryHasFiles(path)) return true;
-		} else {
+			if (directoryHasFiles(path, includeFile)) return true;
+		} else if (includeFile(path)) {
 			return true;
 		}
 	}
@@ -148,7 +177,10 @@ function runtimeHome(ctx: ConnectorRuntimeContext, connectorId: string): string 
 function connectorEnv(connectorId: string, home: string): Record<string, string> {
 	const env: Record<string, string> = { HOME: home };
 	if (connectorId === "codex") env.CODEX_HOME = home;
-	if (connectorId === "gemini") env.GEMINI_CONFIG_DIR = home;
+	if (connectorId === "gemini") {
+		env.GEMINI_CONFIG_DIR = home;
+		env.CLOUDSDK_CONFIG = join(home, "gcloud");
+	}
 	if (connectorId === "claude") env.CLAUDE_CONFIG_DIR = home;
 	if (connectorId === "github") env.GH_CONFIG_DIR = home;
 	if (connectorId === "sap-adt") {
