@@ -1,4 +1,4 @@
-import { spawn } from "child_process";
+//import { spawn } from "child_process";
 //IYH1HC add: Node fs/path APIs for cross-platform file I/O on the host
 import { mkdir, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs/promises";
 import { dirname, isAbsolute, posix, resolve } from "node:path";

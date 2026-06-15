@@ -81,6 +81,115 @@ body {
 	--font-sans: var(--sapFontFamily, "72", Arial, Helvetica, sans-serif);
 }
 
+/* IYH1HC add: SAP Joule "AI Light" theme — lavender base, purple→pink accents.
+   Uses base Fiori Horizon and overrides both the SAP Horizon params (--sapXxx, so
+   UI5 web components recolor) and the semantic tokens. html.joule has higher
+   specificity than UI5's :root, so these win. */
+html.joule {
+	--sapBackgroundColor: #f6f1ff;
+	--sapTextColor: #2a1b4a;
+	--sapTile_Background: #ffffff;
+	--sapGroup_ContentBackground: #ffffff;
+	--sapButton_Emphasized_Background: #7a5af8;
+	--sapButton_Emphasized_TextColor: #ffffff;
+	--sapButton_Background: #ffffff;
+	--sapButton_TextColor: #7a5af8;
+	--sapList_Background: #ffffff;
+	--sapContent_LabelColor: #6b5b8a;
+	--sapList_SelectionBackgroundColor: #efe3ff;
+	--sapLinkColor: #9b3fd6;
+	--sapList_BorderColor: #e3d6ff;
+	--sapField_BorderColor: #b9a6e6;
+	--sapContent_FocusColor: #7a5af8;
+	--sapShell_Background: #efe7ff;
+	--sapShell_TextColor: #2a1b4a;
+	--sapShell_InteractiveBackground: #ffffff;
+	--sapShell_InteractiveTextColor: #7a5af8;
+	--sapShell_BorderColor: #e3d6ff;
+
+	--background: #f6f1ff;
+	--foreground: #2a1b4a;
+	--card: #ffffff;
+	--card-foreground: #2a1b4a;
+	--popover: #ffffff;
+	--popover-foreground: #2a1b4a;
+	--primary: #7a5af8;
+	--primary-foreground: #ffffff;
+	--secondary: #ffffff;
+	--secondary-foreground: #7a5af8;
+	--muted: #ffffff;
+	--muted-foreground: #6b5b8a;
+	--accent: #efe3ff;
+	--accent-foreground: #9b3fd6;
+	--destructive: #aa0808;
+	--destructive-foreground: #ffffff;
+	--border: #e3d6ff;
+	--input: #b9a6e6;
+	--ring: #7a5af8;
+	--sidebar: #efe7ff;
+	--sidebar-foreground: #2a1b4a;
+	--sidebar-primary: #7a5af8;
+	--sidebar-primary-foreground: #ffffff;
+	--sidebar-accent: #ffffff;
+	--sidebar-accent-foreground: #7a5af8;
+	--sidebar-border: #e3d6ff;
+	--sidebar-ring: #7a5af8;
+	--joule-gradient: linear-gradient(135deg, #6a5af9 0%, #b14fd8 50%, #ff7eb3 100%);
+}
+
+/* IYH1HC add: SAP Joule "AI Dark" theme — deep indigo base, neon purple→pink. */
+html.joule.dark {
+	--sapBackgroundColor: #160f2e;
+	--sapTextColor: #ece8ff;
+	--sapTile_Background: #1e1640;
+	--sapGroup_ContentBackground: #1e1640;
+	--sapButton_Emphasized_Background: #8b6dff;
+	--sapButton_Emphasized_TextColor: #160f2e;
+	--sapButton_Background: #241b4a;
+	--sapButton_TextColor: #c9b6ff;
+	--sapList_Background: #160f2e;
+	--sapContent_LabelColor: #b7add9;
+	--sapList_SelectionBackgroundColor: #2a1f55;
+	--sapLinkColor: #e3b0ff;
+	--sapList_BorderColor: #342a5e;
+	--sapField_BorderColor: #4a3d7a;
+	--sapContent_FocusColor: #8b6dff;
+	--sapShell_Background: #120a26;
+	--sapShell_TextColor: #ece8ff;
+	--sapShell_InteractiveBackground: #1e1640;
+	--sapShell_InteractiveTextColor: #c9b6ff;
+	--sapShell_BorderColor: #342a5e;
+
+	--background: #160f2e;
+	--foreground: #ece8ff;
+	--card: #1e1640;
+	--card-foreground: #ece8ff;
+	--popover: #1e1640;
+	--popover-foreground: #ece8ff;
+	--primary: #8b6dff;
+	--primary-foreground: #160f2e;
+	--secondary: #241b4a;
+	--secondary-foreground: #c9b6ff;
+	--muted: #160f2e;
+	--muted-foreground: #b7add9;
+	--accent: #2a1f55;
+	--accent-foreground: #e3b0ff;
+	--destructive: #ff8888;
+	--destructive-foreground: #ffffff;
+	--border: #342a5e;
+	--input: #4a3d7a;
+	--ring: #8b6dff;
+	--sidebar: #120a26;
+	--sidebar-foreground: #ece8ff;
+	--sidebar-primary: #8b6dff;
+	--sidebar-primary-foreground: #160f2e;
+	--sidebar-accent: #1e1640;
+	--sidebar-accent-foreground: #c9b6ff;
+	--sidebar-border: #342a5e;
+	--sidebar-ring: #8b6dff;
+	--joule-gradient: linear-gradient(135deg, #7c5cff 0%, #c060e0 50%, #ff8ac0 100%);
+}
+
 * {
 	scrollbar-width: thin;
 	scrollbar-color: var(--color-border) rgba(0, 0, 0, 0);
@@ -132,4 +241,23 @@ body {
 	border: 1px solid rgba(255, 107, 0, 0.25);
 	backdrop-filter: blur(10px);
 	max-width: 100%;
+}
+
+/* IYH1HC add: SAP Joule signature gradient accents (light-DOM surfaces only). */
+html.joule .corp-app-title {
+	background: var(--joule-gradient);
+	-webkit-background-clip: text;
+	background-clip: text;
+	color: transparent;
+}
+
+/* Joule-toned user message bubble (overrides the orange gradient above). */
+html.joule .user-message-container {
+	background: linear-gradient(135deg, rgba(122, 90, 248, 0.14), rgba(177, 79, 216, 0.12), rgba(255, 126, 179, 0.14));
+	border-color: rgba(177, 79, 216, 0.3);
+}
+
+/* Highlight the active theme in the selector dropdown. */
+.corp-menu-button-active {
+	background: var(--accent);
 }

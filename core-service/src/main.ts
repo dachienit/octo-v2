@@ -2,6 +2,31 @@
 
 import "dotenv/config";
 
+//IYH1HC add: On Cloud Foundry the credentials of a user-provided service (e.g.
+//IYH1HC add: `octo-secrets`) are injected into VCAP_SERVICES, NOT as plain env vars,
+//IYH1HC add: while the code reads process.env directly. Hydrate process.env from every
+//IYH1HC add: bound user-provided service's credentials (real env vars keep priority).
+//IYH1HC add: No-op locally where VCAP_SERVICES is absent.
+function loadUserProvidedCredentials(): void {
+	const raw = process.env.VCAP_SERVICES;
+	if (!raw) return;
+	try {
+		const services = JSON.parse(raw) as Record<string, Array<{ credentials?: Record<string, unknown> }>>;
+		const userProvided = services["user-provided"] ?? [];
+		for (const instance of userProvided) {
+			const credentials = instance?.credentials ?? {};
+			for (const [key, value] of Object.entries(credentials)) {
+				if (process.env[key] === undefined && value !== null && value !== undefined) {
+					process.env[key] = typeof value === "string" ? value : String(value);
+				}
+			}
+		}
+	} catch (err) {
+		console.error("[vcap] failed to parse VCAP_SERVICES:", err instanceof Error ? err.message : err);
+	}
+}
+loadUserProvidedCredentials();
+
 // Wire proxy before any fetch calls (earendil, OAuth2, etc.).
 // Node.js built-in fetch (undici) does not respect HTTP_PROXY/HTTPS_PROXY automatically.
 const _proxyUrl =
@@ -21,6 +46,8 @@ import { downloadChannel } from "./download.js";
 import { createEventsWatcher, createWorkspaceEventsWatcher } from "./events.js";
 import { createHttpContext, HttpServer } from "./http.js";
 import * as log from "./log.js";
+//IYH1HC add: object store mirror for durable sessions/artifacts (A3 part 2).
+import { detectObjectStore, ObjectStoreMirror } from "./object-store.js";
 import { parseSandboxArg, type SandboxConfig, validateSandbox } from "@octo/core-agent";
 import { markWorkspaceSandboxActive, markWorkspaceSandboxIdle, resolveWorkspaceSandbox, startWorkspaceSandboxIdleCleanup } from "./sandbox-manager.js";
 import { createSlackContext, SlackBot as SlackBotClass } from "./slack.js";
@@ -68,8 +95,11 @@ function parseArgs(): ParsedArgs {
 			if (next && !next.startsWith("-") && /^\d+$/.test(next)) {
 				httpPort = parseInt(next, 10);
 				i++;
+			//IYH1HC add: on Cloud Foundry the start command is `--http $PORT`; if $PORT is
+			//IYH1HC add: unset/empty the flag arrives bare, so fall back to env PORT then 3030.
 			} else {
-				httpPort = 3030;
+				const envPort = parseInt(process.env.PORT ?? "", 10);
+				httpPort = Number.isFinite(envPort) ? envPort : 3030;
 			}
 		} else if (!arg.startsWith("-")) {
 			workingDir = arg;
@@ -119,6 +149,38 @@ if (!hasSlack && !hasHttp) {
 }
 
 await validateSandbox(sandbox);
+
+//IYH1HC add: A3 part 2 — restore sessions/artifacts from the Object Store BEFORE
+//IYH1HC add: WorkspaceStore reads workingDir. Gating mirrors createAuthStorage:
+//IYH1HC add: bound + reachable → mirror runs regardless of the flag; missing/unreachable
+//IYH1HC add: → CORE_SERVICE_OBJECTSTORE_ALLOW_EPHEMERAL=true warns + runs ephemeral,
+//IYH1HC add: otherwise fail-fast in production (the CF FS is ephemeral; silent loss is worse).
+const osConfig = detectObjectStore();
+const allowObjectStoreEphemeral = process.env.CORE_SERVICE_OBJECTSTORE_ALLOW_EPHEMERAL === "true";
+let objectStore: ObjectStoreMirror | undefined;
+if (osConfig) {
+	const mirror = new ObjectStoreMirror({ config: osConfig, dataRoot: workingDir });
+	try {
+		await mirror.verify();
+		await mirror.restore();
+		objectStore = mirror;
+		console.log(`[object-store] backend enabled (bucket ${mirror.bucketName}), workspace tree restored`);
+	} catch (err) {
+		if (process.env.NODE_ENV === "production" && !allowObjectStoreEphemeral) throw err;
+		console.warn(
+			"[object-store] WARNING: object store unreachable, running with ephemeral sessions/artifacts:",
+			err instanceof Error ? err.message : err,
+		);
+	}
+} else if (process.env.NODE_ENV === "production" && !allowObjectStoreEphemeral) {
+	throw new Error(
+		"[object-store] No objectstore binding while NODE_ENV=production — bind taf-objectstore " +
+			"or set CORE_SERVICE_OBJECTSTORE_ALLOW_EPHEMERAL=true to accept ephemeral sessions/artifacts.",
+	);
+} else {
+	console.log("[object-store] no binding — workspace tree is ephemeral");
+}
+
 const workspaceStore = new WorkspaceStore(workingDir);
 
 function sandboxLabel(config: SandboxConfig): string {
@@ -259,6 +321,12 @@ const handler: BotHandler = {
 			} finally {
 				state.running = false;
 				markWorkspaceSandboxIdle(sandbox, { workspaceId: state.workspaceId, image: workspaceImage });
+				//IYH1HC add: snapshot this run's sessions/artifacts to the Object Store.
+				//IYH1HC add: Fire-and-forget so the session queue isn't blocked; the mirror
+				//IYH1HC add: serializes overlapping snapshots internally.
+				// void objectStore ?.snapshot({ workspaceId: state.workspaceId, sessionId: channelId })
+				//	.catch((err) => log.logWarning("[object-store] run-end snapshot error", err instanceof Error ? err.message : String(err)));
+				
 			}
 		});
 		state.queue = run.catch(() => {});
@@ -352,8 +420,10 @@ if (hasHttp) {
 		sandboxConfig: sandbox,
 		features: { agentWorkers: AGENT_WORKERS_ENABLED, reminders: REMINDERS_ENABLED },
 		handler,
+		//IYH1HC add: expose mirror state at GET /objectstore/status (undefined → ephemeral).
+		getObjectStoreStatus: () => objectStore?.status(),
 	});
-	httpServer.start();
+	await httpServer.start(); //IYH1HC comment: await — start() is now async (auth storage bootstrap)
 }
 
 // Start event watchers for each adapter.
@@ -383,19 +453,36 @@ if (hasSlack) {
 	bot.start();
 }
 
-// Handle shutdown
-process.on("SIGINT", () => {
-	log.logInfo("Shutting down...");
-	stopSandboxIdleCleanup?.();
-	eventsWatcher?.stop();
-	workspaceEventsWatcher?.stop();
-	process.exit(0);
-});
+//IYH1HC add: periodic full snapshot so changes between run-end snapshots (and any
+//IYH1HC add: file written outside a run) reach the bucket. <=0 disables. The mirror
+//IYH1HC add: serializes against run-end snapshots, so overlaps are safe.
+//const snapshotIntervalMs = parsePositiveIntEnv("CORE_SERVICE_OBJECTSTORE_SNAPSHOT_INTERVAL_MS", 300_000);
+let snapshotTimer: NodeJS.Timeout | undefined;
+/* if (objectStore && snapshotIntervalMs > 0) {
+	snapshotTimer = setInterval(() => {
+		void objectStore ?.snapshot()
+			.catch((err) => log.logWarning("[object-store] interval snapshot error", err instanceof Error ? err.message : String(err)));
+	}, snapshotIntervalMs);
+	snapshotTimer.unref?.();
+	log.logInfo(`Object store snapshot interval enabled (${snapshotIntervalMs}ms)`);
+} */
 
-process.on("SIGTERM", () => {
+// Handle shutdown
+//IYH1HC add: shared async shutdown so SIGINT/SIGTERM both flush a final snapshot
+//IYH1HC add: (best-effort within CF's ~10s grace) before exiting.
+async function shutdown(): Promise<void> {
 	log.logInfo("Shutting down...");
 	stopSandboxIdleCleanup?.();
 	eventsWatcher?.stop();
 	workspaceEventsWatcher?.stop();
+	if (snapshotTimer) clearInterval(snapshotTimer);
+	try {
+		await objectStore?.snapshot();
+	} catch (err) {
+		log.logWarning("[object-store] shutdown snapshot error", err instanceof Error ? err.message : String(err));
+	}
 	process.exit(0);
-});
+}
+
+process.on("SIGINT", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());

@@ -4,6 +4,7 @@ import "@ui5/webcomponents/dist/CheckBox.js";
 import "@ui5/webcomponents/dist/Input.js";
 import "@ui5/webcomponents/dist/Option.js";
 import "@ui5/webcomponents/dist/Select.js";
+import "@ui5/webcomponents/dist/Switch.js";
 import "@ui5/webcomponents/dist/TextArea.js";
 import "@ui5/webcomponents-fiori/dist/Assets.js";
 import "@ui5/webcomponents-icons/dist/add.js";
@@ -15,6 +16,7 @@ import "@ui5/webcomponents-icons/dist/folder-blank.js";
 import "@ui5/webcomponents-icons/dist/Assets.js";
 import "@ui5/webcomponents-icons/dist/light-mode.js";
 import "@ui5/webcomponents-icons/dist/navigation-left-arrow.js";
+import "@ui5/webcomponents-icons/dist/palette.js"; //IYH1HC add: theme selector icon
 import "@ui5/webcomponents-icons/dist/navigation-right-arrow.js";
 import "@ui5/webcomponents-icons/dist/navigation-down-arrow.js";
 import "@ui5/webcomponents-icons/dist/refresh.js";

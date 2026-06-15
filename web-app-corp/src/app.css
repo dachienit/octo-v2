@@ -55,3 +55,13 @@ ui5-button.corp-ui5-button::part(icon) {
 	display: inline-block;
 	vertical-align: middle;
 }
+
+/* Monaco-style monospace for code-like text (model ids), matching the editor stack. */
+.corp-mono {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+/* Keep the Fiori switch compact inside dense model rows. */
+ui5-switch.corp-ui5-switch {
+	margin: 0;
+}

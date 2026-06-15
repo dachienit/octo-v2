@@ -1,0 +1,40 @@
+{
+  "welcomeFile": "/index.html",
+  "authenticationMethod": "route",
+  "sessionTimeout": 60,
+  "routes": [
+    {
+      "source": "^/api/(sessions/[^/]+/messages|chat)$",
+      "target": "/$1",
+      "destination": "octo-srv",
+      "authenticationType": "xsuaa",
+      "csrfProtection": false
+    },
+    {
+      "source": "^/api/(.*)$",
+      "target": "/$1",
+      "destination": "octo-srv",
+      "authenticationType": "xsuaa",
+      "csrfProtection": false
+    },
+    {
+      "source": "^/(assets/.*)$",
+      "localDir": "resources",
+      "authenticationType": "xsuaa"
+    },
+    {
+      "source": "^/(.+\\.[^/.]+)$",
+      "localDir": "resources",
+      "authenticationType": "xsuaa"
+    },
+    {
+      "source": "^(.*)$",
+      "target": "/index.html",
+      "localDir": "resources",
+      "replace": {
+        "pathSuffixes": ["index.html"]
+      },
+      "authenticationType": "xsuaa"
+    }
+  ]
+}

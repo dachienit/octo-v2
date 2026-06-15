@@ -2,14 +2,27 @@ import { icon } from "@mariozechner/mini-lit";
 import { Button } from "@mariozechner/mini-lit/dist/Button.js";
 import { Select, type SelectOption } from "@mariozechner/mini-lit/dist/Select.js";
 import type { Model } from "@octo/core-agent/web";
-import { html, LitElement } from "lit";
+import { html, LitElement, render as litRender } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { createRef, ref } from "lit/directives/ref.js";
-import { Brain, Loader2, Paperclip, Send, Sparkles, Square } from "lucide";
+import { ArrowUp, Brain, Check, ChevronDown, ChevronRight, Loader2, Paperclip, Plus, Send, Sparkles, Square } from "lucide";
 import { type Attachment, loadAttachment } from "../utils/attachment-utils.js";
 import { i18n } from "../utils/i18n.js";
 import "./AttachmentTile.js";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+
+//IYH1HC add: reasoning levels for the inline quick selector (mirrors backend ThinkingLevel).
+type ReasoningValue = "off" | "minimal" | "low" | "medium" | "high";
+const REASONING_LEVELS: { value: ReasoningValue; label: string }[] = [
+	{ value: "off", label: "Off" },
+	{ value: "minimal", label: "Minimal" },
+	{ value: "low", label: "Low" },
+	{ value: "medium", label: "Medium" },
+	{ value: "high", label: "High" },
+];
+
+//IYH1HC add: shape of an entry in the inline model quick-pick list.
+export type QuickModelOption = { value: string; label: string; provider: string };
 
 @customElement("message-editor")
 export class MessageEditor extends LitElement {
@@ -43,11 +56,21 @@ export class MessageEditor extends LitElement {
 	@property() declare maxFiles: number;
 	@property() declare maxFileSize: number;
 	@property() declare acceptedTypes: string;
+	//IYH1HC add: inline combined model + reasoning quick selector (used by the corp chat panel).
+	@property() declare useQuickSelector: boolean;
+	@property() declare quickModels: QuickModelOption[];
+	@property() declare selectedModelValue: string;
+	@property() declare onModelChange: ((value: string) => void) | undefined;
 
 	@state() declare processingFiles: boolean;
 	@state() declare isDragging: boolean;
+	@state() declare quickMenuOpen: boolean; //IYH1HC add
+	@state() declare quickSubmenuOpen: boolean; //IYH1HC add
+	@state() declare quickMenuAnchor: DOMRect | null; //IYH1HC add: trigger rect for fixed-position popover
 
 	private fileInputRef = createRef<HTMLInputElement>();
+	private quickAnchorRef = createRef<HTMLDivElement>(); //IYH1HC add
+	private menuPortal?: HTMLDivElement; //IYH1HC add: body-level host for the quick menu
 
 	constructor() {
 		super();
@@ -70,6 +93,14 @@ export class MessageEditor extends LitElement {
 			"image/*,application/pdf,.docx,.pptx,.xlsx,.xls,.txt,.md,.json,.xml,.html,.css,.js,.ts,.jsx,.tsx,.yml,.yaml";
 		this.processingFiles = false;
 		this.isDragging = false;
+		//IYH1HC add: quick selector defaults.
+		this.useQuickSelector = false;
+		this.quickModels = [];
+		this.selectedModelValue = "";
+		this.onModelChange = undefined;
+		this.quickMenuOpen = false;
+		this.quickSubmenuOpen = false;
+		this.quickMenuAnchor = null;
 	}
 
 	protected override createRenderRoot(): HTMLElement | DocumentFragment {
@@ -255,6 +286,157 @@ export class MessageEditor extends LitElement {
 		}
 	}
 
+	override updated() {
+		this.syncQuickMenuPortal(); //IYH1HC add: keep the body-level quick menu in sync
+	}
+
+	//IYH1HC add: open/close the quick menu, capturing the trigger rect so the popover
+	// can be positioned with `fixed` (escapes ancestor overflow/stacking and renders in front).
+	private toggleQuickMenu() {
+		if (this.quickMenuOpen) {
+			this.quickMenuOpen = false;
+			this.quickSubmenuOpen = false;
+			return;
+		}
+		this.quickMenuAnchor = this.quickAnchorRef.value?.getBoundingClientRect() ?? null;
+		this.quickMenuOpen = true;
+		this.quickSubmenuOpen = false;
+	}
+
+	//IYH1HC add: combined model + reasoning trigger button (corp quick selector).
+	private renderQuickSelector() {
+		const selected = this.quickModels.find((m) => m.value === this.selectedModelValue);
+		const modelLabel = selected?.label ?? i18n("Default");
+		const levelLabel = REASONING_LEVELS.find((l) => l.value === String(this.thinkingLevel))?.label ?? "Off";
+		return html`
+			<div class="relative" ${ref(this.quickAnchorRef)}>
+				${Button({
+					variant: "ghost",
+					size: "sm",
+					className: "h-8 gap-1 text-xs",
+					onClick: () => this.toggleQuickMenu(),
+					children: html`
+						<span class="max-w-[10rem] truncate font-medium">${modelLabel}</span>
+						<span class="text-muted-foreground">${levelLabel}</span>
+						${icon(ChevronDown, "sm")}
+					`,
+				})}
+			</div>
+		`;
+	}
+
+	//IYH1HC add: render the quick menu into a body-level portal (or tear it down) so it always
+	// floats in front, unaffected by ancestor transforms/overflow/stacking. Driven from updated().
+	private syncQuickMenuPortal() {
+		if (this.useQuickSelector && this.quickMenuOpen) {
+			if (!this.menuPortal) {
+				this.menuPortal = document.createElement("div");
+				document.body.appendChild(this.menuPortal);
+			}
+			litRender(this.renderQuickMenuContent(), this.menuPortal);
+		} else if (this.menuPortal) {
+			litRender(html``, this.menuPortal);
+			this.menuPortal.remove();
+			this.menuPortal = undefined;
+		}
+	}
+
+	override disconnectedCallback() {
+		super.disconnectedCallback();
+		if (this.menuPortal) {
+			litRender(html``, this.menuPortal);
+			this.menuPortal.remove();
+			this.menuPortal = undefined;
+		}
+	}
+
+	//IYH1HC add: the popover panel (Reasoning + collapsible Model section), opening upward.
+	// Styled with SAP/Fiori theme tokens (bg-popover / accent / sapFontFamily / sapContent_Shadow2)
+	// so it matches the rest of the Fiori corp shell. The Model section expands INLINE (no side
+	// flyout) to avoid overlapping the chat area.
+	private renderQuickMenuContent() {
+		const selected = this.quickModels.find((m) => m.value === this.selectedModelValue);
+		const modelLabel = selected?.label ?? i18n("Default");
+		const closeMenu = () => {
+			this.quickMenuOpen = false;
+			this.quickSubmenuOpen = false;
+		};
+		const pickModel = (value: string) => {
+			this.onModelChange?.(value);
+			closeMenu();
+		};
+		//IYH1HC add: position the popover with `fixed` relative to the trigger rect so it floats
+		// in front of everything and opens upward, capped to the free space above (never clips).
+		const a = this.quickMenuAnchor;
+		const right = a ? Math.max(8, Math.round(window.innerWidth - a.right)) : 8;
+		const bottom = a ? Math.round(window.innerHeight - a.top + 8) : 64;
+		const maxH = a ? Math.max(180, Math.round(a.top - 16)) : 360;
+		const panelStyle = `position: fixed; right: ${right}px; bottom: ${bottom}px; max-height: ${maxH}px; box-shadow: var(--sapContent_Shadow2, 0 6px 20px rgba(0,0,0,0.18)); font-family: var(--sapFontFamily, inherit);`;
+		return html`
+			<div class="fixed inset-0 z-[999]" @click=${closeMenu}></div>
+			<div
+				class="z-[1000] w-64 overflow-y-auto rounded-md border border-border bg-popover py-1 text-sm text-popover-foreground"
+				style=${panelStyle}
+				@click=${(e: Event) => e.stopPropagation()}
+			>
+				<div class="px-3 py-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">${i18n("Reasoning")}</div>
+				${REASONING_LEVELS.map((lvl) => {
+					const active = String(this.thinkingLevel) === lvl.value;
+					return html`
+						<button
+							type="button"
+							class="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-accent ${active ? "text-accent-foreground" : ""}"
+							@click=${() => this.onThinkingChange?.(lvl.value)}
+						>
+							<span class="flex-1">${lvl.label}</span>
+							${active ? icon(Check, "sm") : ""}
+						</button>
+					`;
+				})}
+				<div class="my-1 h-px bg-border"></div>
+				<button
+					type="button"
+					class="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-accent"
+					@click=${() => {
+						this.quickSubmenuOpen = !this.quickSubmenuOpen;
+					}}
+				>
+					<span class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">${i18n("Model")}</span>
+					<span class="ml-auto min-w-0 truncate text-muted-foreground">${modelLabel}</span>
+					${icon(this.quickSubmenuOpen ? ChevronDown : ChevronRight, "sm")}
+				</button>
+				${this.quickSubmenuOpen
+					? html`
+						<div class="border-t border-border">
+							<button
+								type="button"
+								class="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-accent ${this.selectedModelValue === "" ? "text-accent-foreground" : ""}"
+								@click=${() => pickModel("")}
+							>
+								<span class="flex-1">${i18n("Default")}</span>
+								${this.selectedModelValue === "" ? icon(Check, "sm") : ""}
+							</button>
+							${this.quickModels.map((m) => {
+								const active = this.selectedModelValue === m.value;
+								return html`
+									<button
+										type="button"
+										class="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-accent ${active ? "text-accent-foreground" : ""}"
+										@click=${() => pickModel(m.value)}
+									>
+										<span class="min-w-0 flex-1 truncate">${m.label}</span>
+										<span class="shrink-0 text-xs text-muted-foreground">${m.provider}</span>
+										${active ? icon(Check, "sm") : ""}
+									</button>
+								`;
+							})}
+						</div>
+					`
+					: ""}
+			</div>
+		`;
+	}
+
 	override render() {
 		// Check if current model supports thinking/reasoning
 		const model = this.currentModel;
@@ -337,13 +519,13 @@ export class MessageEditor extends LitElement {
 										size: "icon",
 										className: "h-8 w-8",
 										onClick: this.handleAttachmentClick,
-										children: icon(Paperclip, "sm"),
+										children: icon(this.useQuickSelector ? Plus : Paperclip, "sm"), //IYH1HC add: "+" affordance in quick mode
 									})}
 								`
 								: ""
 						}
 						${
-							supportsThinking && this.showThinkingSelector
+							supportsThinking && this.showThinkingSelector && !this.useQuickSelector
 								? html`
 								${Select({
 									value: this.thinkingLevel,
@@ -370,8 +552,9 @@ export class MessageEditor extends LitElement {
 
 					<!-- Model selector and send on the right -->
 					<div class="flex gap-2 items-center">
+						${this.useQuickSelector ? this.renderQuickSelector() : ""}
 						${
-							this.showModelSelector && this.currentModel
+							!this.useQuickSelector && this.showModelSelector && this.currentModel
 								? html`
 								${Button({
 									variant: "ghost",
@@ -404,7 +587,19 @@ export class MessageEditor extends LitElement {
 									className: "h-8 w-8",
 								})}
 							`
-								: html`
+								: this.useQuickSelector
+									? html`
+										<button
+											type="button"
+											class="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+											?disabled=${(!this.value.trim() && this.attachments.length === 0) || this.processingFiles}
+											@click=${this.handleSend}
+											title=${i18n("Send")}
+										>
+											${icon(ArrowUp, "sm")}
+										</button>
+									`
+									: html`
 								${Button({
 									variant: "ghost",
 									size: "icon",

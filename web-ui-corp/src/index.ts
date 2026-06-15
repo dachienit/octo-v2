@@ -27,6 +27,7 @@ export {
 	type LlmProviderConfig, // IYH1HC add
 	type LlmModelOption, // IYH1HC add
 	type ActiveModel, // IYH1HC add
+	type CustomModelConfig, // IYH1HC add
 } from "./adapters/core-service.js";
 export { CoreServiceChatPanel } from "./components/CoreServiceChatPanel.js";
 
