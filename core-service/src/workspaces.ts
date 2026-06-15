@@ -39,7 +39,21 @@ export interface WorkspaceSettings {
 		allowed?: string[];
 	};
 	mcp?: {
-		servers?: Array<{ name: string; command: string; enabled?: boolean }>;
+		servers?: Array<{
+			name: string;
+			enabled?: boolean;
+			transport?: "stdio" | "streamable-http" | "sse";
+			command?: string;
+			args?: string[];
+			url?: string;
+			headers?: Record<string, string>;
+			env?: Record<string, string>;
+			toolPrefix?: string;
+			allowedTools?: string[];
+			blockedTools?: string[];
+			timeoutMs?: number;
+			required?: boolean;
+		}>;	
 	};
 }
 

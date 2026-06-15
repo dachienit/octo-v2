@@ -34,6 +34,8 @@ export type {
 	MountSpec,
 } from "./connectors.js";
 export { AgentSettingsManager } from "./settings.js";
+export { closeMcpTools, createMcpTools } from "./mcp/index.js";
+export type { McpServerConfig, McpToolCallResult, McpToolMetadata, McpTransport } from "./mcp/index.js";
 export type { AgentCompactionSettings, AgentRetrySettings, AgentSettings } from "./settings.js";
 export { cancelAcpJob, listAcpJobs } from "./extensions/acp-job-registry.js";
 export type { AcpJobSnapshot, AcpJobStatus } from "./extensions/acp-job-registry.js";
