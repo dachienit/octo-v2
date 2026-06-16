@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import { Dirent, appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
-import { basename, extname, isAbsolute, join, resolve } from "path";
+import { basename, extname, isAbsolute, join, relative, resolve } from "path"; //IYH1HC add: relative (cross-platform containment check)
 import {
 	getModel,
 	getModels,
@@ -339,19 +339,29 @@ export class HttpServer {
 		}
 
 		const root = resolve(this.workingDir);
-		const resolved = resolve(filePath.startsWith("/") ? filePath : join(this.workingDir, filePath));
-		if (resolved !== root && !resolved.startsWith(`${root}/`)) {
+		//IYH1HC comment: const resolved = resolve(filePath.startsWith("/") ? filePath : join(this.workingDir, filePath));
+		const resolved = resolve(isAbsolute(filePath) ? filePath : join(this.workingDir, filePath)); //IYH1HC add: isAbsolute handles Windows drive paths
+
+		//IYH1HC add: containment check via path.relative — cross-platform. The previous
+		// startsWith(`${root}/`) hardcoded a forward slash, so it never matched the backslash
+		// paths that resolve()/join() produce on Windows, returning 403 for every file/artifact.
+		//IYH1HC comment: if (resolved !== root && !resolved.startsWith(`${root}/`)) {
+		const relFromRoot = relative(root, resolved);
+		if (relFromRoot === "" || relFromRoot.startsWith("..") || isAbsolute(relFromRoot)) {
 			res.status(403).json({ error: "Forbidden" });
 			return undefined;
 		}
 
 		const workspaceRoot = resolve(join(this.workingDir, "workspaces"));
-		if (resolved === workspaceRoot || !resolved.startsWith(`${workspaceRoot}/`)) {
+		//IYH1HC comment: if (resolved === workspaceRoot || !resolved.startsWith(`${workspaceRoot}/`)) {
+		const relFromWorkspaces = relative(workspaceRoot, resolved); //IYH1HC add
+		if (relFromWorkspaces === "" || relFromWorkspaces.startsWith("..") || isAbsolute(relFromWorkspaces)) {
 			res.status(403).json({ error: "Forbidden" });
 			return undefined;
 		}
 
-		const workspaceId = resolved.slice(workspaceRoot.length + 1).split(/[\\/]/)[0];
+		//IYH1HC comment: const workspaceId = resolved.slice(workspaceRoot.length + 1).split(/[\\/]/)[0];
+		const workspaceId = relFromWorkspaces.split(/[\\/]/)[0]; //IYH1HC add
 		try {
 			this.workspaceStore.assertWorkspaceAccess(this.getUserId(req), workspaceId);
 		} catch (err) {
