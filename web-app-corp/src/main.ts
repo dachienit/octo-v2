@@ -1,8 +1,8 @@
-import { configureFioriTheme, CoreServiceChatPanel, CoreServiceClient, translations, type AcpJob, type AuthUser, type ConnectorStatus, type CoreServiceFeatures, type CustomModelConfig, type LlmConfig, type SessionInfo, type SsoConfig, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSandboxStatus, type WorkspaceScheduledEvent, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTemplate, type WorkspaceTree } from "@octo/web-ui-corp";
+import { configureFioriTheme, CoreServiceChatPanel, CoreServiceClient, translations, type AcpJob, type AuthUser, type ConnectorStatus, type CoreServiceFeatures, type CustomModelConfig, type LlmConfig, type SapDestination, type SapLocalSystem, type SapTreeManifestEntry, type SessionInfo, type SsoConfig, type WorkspaceInfo, type WorkspaceNode, type WorkspaceSandboxStatus, type WorkspaceScheduledEvent, type WorkspaceSettings, type WorkspaceTableSummary, type WorkspaceTemplate, type WorkspaceTree } from "@octo/web-ui-corp";
 import { setTranslations } from "@mariozechner/mini-lit";
 import { html, render } from "lit";
 import { icon } from "@mariozechner/mini-lit";
-import { ChevronDown, ChevronRight, File, Folder, FolderOpen, KeyRound, LogOut, MessageSquare, Plus, Table2, Trash2, X } from "lucide";
+import { Box, Brackets, ChevronDown, ChevronRight, Database, Eye, File, FileCode, FileText, Folder, FolderCog, FolderOpen, KeyRound, LoaderCircle, LogOut, MessageSquare, Plug, Plus, ShieldCheck, SquareTerminal, Table2, Tag, Tags, Trash2 } from "lucide";
 import "./app.css";
 
 applyAppTheme();
@@ -90,6 +90,26 @@ let agentWorkerBusy = "";
 let agentWorkerLoginOutput = "";
 let businessConnectorBusy = "";
 let businessConnectorLoginOutput = "";
+
+//IYH1HC add — SAP ADT connection panel state.
+let sapDestinations: SapDestination[] = [];
+let sapDestinationsLoaded = false;
+let sapNewDestination = "";
+let sapNewAlias = "";
+let sapBusy = "";
+let sapError = "";
+//IYH1HC SSO add — local on-prem (Kerberos/SPNEGO) connect state.
+let sapConnMode: "destination" | "local" = "local";
+let sapLocalSystems: SapLocalSystem[] = [];
+let sapLocalSystemsLoaded = false;
+let sapLocalSelected = ""; // `${systemId}|${client}` key
+let sapLocalUrl = "";
+let sapLocalSpn = "";
+let sapLocalClient = "";
+let sapLocalLanguage = "";
+//IYH1HC add — Materialized ADT tree manifests, keyed by connection name:
+//IYH1HC add — relKey -> { lazy (an ADT folder to expand), loaded, hasUri (empty file to hydrate) }.
+const sapTreeManifests = new Map<string, Record<string, SapTreeManifestEntry>>();
 
 const connectorLoginModes = new Map<string, string>();
 const LOGIN_INPUT_PROMPT_LIMIT = 3;
@@ -337,6 +357,7 @@ async function loadSessions() {
 async function loadWorkspace() {
 	if (!channelId) return;
 	workspaceTree = (await client.getWorkspace(channelId!)) ?? { artifacts: [], skills: [] };
+	await loadSapManifests(); //IYH1HC add — keep ADT tree manifests in sync with the file tree.
 	await refreshAcpJobs(false);
 	renderApp();
 }
@@ -755,6 +776,138 @@ async function disconnectBusinessConnector(connectorId: string) {
 		await refreshBusinessConnectors(false);
 	} finally {
 		businessConnectorBusy = "";
+		renderApp();
+	}
+}
+
+//IYH1HC add — SAP ADT connection panel handlers.
+//IYH1HC add — Refresh the materialized-tree manifests for every SAP connection so the
+//IYH1HC add — Artifacts tree knows which folders are lazy ADT nodes and which files need hydration.
+async function loadSapManifests() {
+	if (!workspaceId) return;
+	const conns = workspaceSettings.sapConnections ?? [];
+	await Promise.all(
+		conns.map(async (c) => {
+			sapTreeManifests.set(c.name, await client.getSapTreeManifest(workspaceId!, c.name));
+		}),
+	);
+}
+
+//IYH1HC add — Map a workspace-tree path to its ADT connection + manifest entry, if any.
+//IYH1HC add — Paths look like `workspaces/<id>/artifacts/<conn>/<relKey>`.
+function sapTreeLookup(path: string): { conn: string; relKey: string; info: SapTreeManifestEntry } | null {
+	const marker = "/artifacts/";
+	const idx = path.indexOf(marker);
+	if (idx < 0) return null;
+	const rest = path.slice(idx + marker.length); // <conn>/<relKey...>
+	const slash = rest.indexOf("/");
+	const conn = slash < 0 ? rest : rest.slice(0, slash);
+	const relKey = slash < 0 ? "" : rest.slice(slash + 1);
+	const manifest = sapTreeManifests.get(conn);
+	if (!manifest) return null;
+	const info = manifest[relKey];
+	return info ? { conn, relKey, info } : null;
+}
+
+async function loadSapDestinations() {
+	if (!workspaceId) return;
+	sapBusy = "destinations";
+	sapError = "";
+	renderApp();
+	try {
+		sapDestinations = await client.listSapDestinations(workspaceId);
+		sapDestinationsLoaded = true;
+		if (!sapNewDestination && sapDestinations.length > 0) {
+			sapNewDestination = sapDestinations[0]!.name;
+		}
+	} finally {
+		sapBusy = "";
+		renderApp();
+	}
+}
+
+async function createSapConnection() {
+	const destination = sapNewDestination.trim();
+	if (!workspaceId || !destination) return;
+	const alias = (sapNewAlias || destination).trim();
+	sapBusy = "create";
+	sapError = "";
+	renderApp();
+	try {
+		const { connection, error } = await client.createSapConnection(workspaceId, { destination, name: alias });
+		if (error) sapError = error;
+		if (connection) {
+			//IYH1HC add — On success: surface the new connection's folder in the Artifacts tree
+			//IYH1HC add — (collapsed, lazy) and auto-close the settings popup. On failure we keep
+			//IYH1HC add — the popup open with sapError so the user can retry.
+			sapNewAlias = "";
+			workspaceSettings = await client.getWorkspaceSettings(workspaceId);
+			workspaceOpen = true;
+			await loadWorkspace();
+			closeWorkspaceSettingsDialog();
+		}
+	} finally {
+		sapBusy = "";
+		renderApp();
+	}
+}
+
+//IYH1HC SSO add — load on-prem systems from the local SAP Logon landscape and prefill the form.
+async function loadLocalSystems() {
+	if (!workspaceId) return;
+	sapBusy = "local-systems";
+	sapError = "";
+	renderApp();
+	try {
+		sapLocalSystems = await client.listLocalSapSystems(workspaceId);
+		sapLocalSystemsLoaded = true;
+		if (!sapLocalSelected && sapLocalSystems.length > 0) selectLocalSystem(sapLocalSystems[0]!);
+	} finally {
+		sapBusy = "";
+		renderApp();
+	}
+}
+
+//IYH1HC SSO add — prefill the editable URL/SPN/client/language fields from a picked system.
+function selectLocalSystem(sys: SapLocalSystem) {
+	sapLocalSelected = `${sys.systemId}|${sys.client ?? ""}`;
+	sapLocalUrl = sys.adtUrl;
+	sapLocalSpn = sys.spn;
+	sapLocalClient = sys.client ?? "";
+	sapLocalLanguage = sapLocalLanguage || "EN";
+	if (!sapNewAlias) sapNewAlias = sys.client ? `${sys.systemId}_${sys.client}` : sys.systemId;
+}
+
+//IYH1HC SSO add — create a local on-prem connection via Kerberos/SPNEGO (no password).
+async function createLocalConnection() {
+	const url = sapLocalUrl.trim();
+	const spn = sapLocalSpn.trim();
+	if (!workspaceId || !url || !spn) return;
+	const selected = sapLocalSystems.find((s) => `${s.systemId}|${s.client ?? ""}` === sapLocalSelected);
+	const alias = (sapNewAlias || selected?.systemId || url).trim();
+	sapBusy = "create";
+	sapError = "";
+	renderApp();
+	try {
+		const { connection, error } = await client.createLocalSapConnection(workspaceId, {
+			url,
+			spn,
+			systemId: selected?.systemId,
+			name: alias,
+			client: sapLocalClient.trim() || undefined,
+			language: sapLocalLanguage.trim() || undefined,
+		});
+		if (error) sapError = error;
+		if (connection) {
+			//IYH1HC SSO add — same post-connect behavior as the destination flow.
+			sapNewAlias = "";
+			workspaceSettings = await client.getWorkspaceSettings(workspaceId);
+			workspaceOpen = true;
+			await loadWorkspace();
+			closeWorkspaceSettingsDialog();
+		}
+	} finally {
+		sapBusy = "";
 		renderApp();
 	}
 }
@@ -1181,13 +1334,50 @@ function toggleWorkspace() {
 	renderApp();
 }
 
-function toggleFolder(path: string) {
-	if (expandedFolders.has(path)) expandedFolders.delete(path);
-	else expandedFolders.add(path);
+async function toggleFolder(path: string) {
+	if (expandedFolders.has(path)) {
+		expandedFolders.delete(path);
+		renderApp();
+		return;
+	}
+	//IYH1HC add — Lazily materialize ADT folders the first time they are expanded:
+	//IYH1HC add — list the node's children on the backend, then refetch the file tree.
+	const sap = sapTreeLookup(path);
+	if (sap && sap.info.lazy && !sap.info.loaded) {
+		sapBusy = `expand:${path}`;
+		sapError = "";
+		expandedFolders.add(path);
+		renderApp();
+		try {
+			const { ok, error } = await client.expandSapTree(workspaceId!, sap.conn, path);
+			if (!ok && error) sapError = error;
+			await loadWorkspace(); // refetch tree (+ manifests) so the new children show up.
+		} finally {
+			sapBusy = "";
+			renderApp();
+		}
+		return;
+	}
+	expandedFolders.add(path);
 	renderApp();
 }
 
 async function openWorkspaceFile(path: string) {
+	//IYH1HC add — Hydrate empty ADT-backed files (fetch + persist source) before previewing.
+	const sap = sapTreeLookup(path);
+	if (sap && sap.info.hasUri) {
+		sapBusy = `hydrate:${path}`;
+		sapError = "";
+		renderApp();
+		try {
+			const { error } = await client.hydrateSapFile(workspaceId!, sap.conn, path);
+			if (error) sapError = error;
+			else await loadWorkspace(); // refresh manifests (file is no longer empty).
+		} finally {
+			sapBusy = "";
+			renderApp();
+		}
+	}
 	const title = normalizeWorkspaceArtifactFilename(path);
 	(chatPanel as any).openFilePreview?.(path, title);
 }
@@ -1481,7 +1671,9 @@ function renderConnectorStatusBadge(connector: ConnectorStatus) {
 	`;
 }
 
-function renderBusinessConnectorSettings(sap: WorkspaceSettings["sapConnection"]) {
+//IYH1HC comment — the `sap` (legacy single connection) param is no longer rendered;
+//IYH1HC add — SAP ADT now uses the multi-connection panel (renderSapAdtPanel).
+function renderBusinessConnectorSettings(_sap: WorkspaceSettings["sapConnection"]) {
 	const allowedConnectors = new Set(workspaceSettings.connectors?.allowed ?? []);
 	return html`
 		<section class="flex flex-col gap-4">
@@ -1552,45 +1744,7 @@ function renderBusinessConnectorSettings(sap: WorkspaceSettings["sapConnection"]
 										${businessConnectorBusy === connector.id ? "Working..." : connector.connected ? "Disconnect" : "Connect"}
 									</ui5-button>
 								</div>
-								${connector.id === "sap-adt" ? html`
-									<details class="mt-3 rounded border border-border/70 bg-muted/20 px-3 py-2">
-										<summary class="cursor-pointer text-xs font-medium text-muted-foreground">Connection parameters</summary>
-										<div class="mt-3 flex flex-col gap-3">
-											<div class="text-xs text-muted-foreground">Optional defaults passed to SAP ADT commands and profile setup.</div>
-											<div class="grid grid-cols-2 gap-2">
-												<ui5-input
-													class="corp-ui5-input"
-													placeholder="System URL"
-													name="sapSystemUrl"
-													value=${sap?.systemUrl ?? ""}
-												></ui5-input>
-												<ui5-input
-													class="corp-ui5-input"
-													placeholder="Client"
-													name="sapClient"
-													value=${sap?.client ?? ""}
-												></ui5-input>
-												<ui5-input
-													class="corp-ui5-input"
-													placeholder="Username"
-													name="sapUsername"
-													value=${sap?.username ?? ""}
-												></ui5-input>
-												<ui5-select class="corp-ui5-select" name="sapAuthType">
-													<ui5-option value="basic" ?selected=${(sap?.authType ?? "basic") === "basic"}>Basic</ui5-option>
-													<ui5-option value="destination" ?selected=${sap?.authType === "destination"}>Destination</ui5-option>
-													<ui5-option value="oauth" ?selected=${sap?.authType === "oauth"}>OAuth</ui5-option>
-												</ui5-select>
-											</div>
-											<ui5-input
-												class="corp-ui5-input"
-												placeholder="Profile or destination name"
-												name="sapDestinationName"
-												value=${sap?.destinationName ?? ""}
-											></ui5-input>
-										</div>
-									</details>
-								` : ""}
+								${connector.id === "sap-adt" ? renderSapAdtPanel() : ""}
 						</div>
 					`)}
 			</div>
@@ -1604,15 +1758,168 @@ function renderBusinessConnectorSettings(sap: WorkspaceSettings["sapConnection"]
 	`;
 }
 
+//IYH1HC add — SAP ADT connection panel. Two modes:
+//IYH1HC SSO add —   * On-Premise (SSO): local Kerberos/SPNEGO, no password, system auto-seeded from SAP Logon.
+//IYH1HC add —       * BTP destination: the original approuter + Principal Propagation flow.
+//IYH1HC add — On success the popup closes and the object tree appears in the Artifacts panel.
+function renderSapAdtPanel() {
+	return html`
+		<details class="mt-3 rounded border border-border/70 bg-muted/20 px-3 py-2" open>
+			<summary class="cursor-pointer text-xs font-medium text-muted-foreground">SAP ADT connections</summary>
+			<div class="mt-3 flex flex-col gap-3">
+				<!--IYH1HC SSO add — mode toggle -->
+				<div class="flex gap-1">
+					<ui5-button
+						class="corp-ui5-button"
+						design=${sapConnMode === "local" ? "Emphasized" : "Transparent"}
+						@click=${() => { sapConnMode = "local"; sapError = ""; if (!sapLocalSystemsLoaded) void loadLocalSystems(); else renderApp(); }}
+					>On-Premise (SSO)</ui5-button>
+					<ui5-button
+						class="corp-ui5-button"
+						design=${sapConnMode === "destination" ? "Emphasized" : "Transparent"}
+						@click=${() => { sapConnMode = "destination"; sapError = ""; if (!sapDestinationsLoaded) void loadSapDestinations(); else renderApp(); }}
+					>BTP destination</ui5-button>
+				</div>
+
+				${sapConnMode === "local"
+					? html`
+						<!--IYH1HC SSO add — local on-prem (Kerberos/SPNEGO) connect form -->
+						<div class="flex flex-col gap-2 rounded border border-border/60 bg-background p-2">
+							<div class="text-xs font-medium">Add on-premise connection (SSO)</div>
+							<ui5-select
+								class="corp-ui5-select"
+								@change=${(e: Event) => { const v = getUi5SelectValue(e, sapLocalSelected); const sys = sapLocalSystems.find((s) => `${s.systemId}|${s.client ?? ""}` === v); if (sys) selectLocalSystem(sys); renderApp(); }}
+							>
+								${sapLocalSystems.length === 0
+									? html`<ui5-option value="">${sapLocalSystemsLoaded ? "No systems found" : "Load systems..."}</ui5-option>`
+									: sapLocalSystems.map((s) => { const key = `${s.systemId}|${s.client ?? ""}`; return html`
+										<ui5-option value=${key} ?selected=${sapLocalSelected === key}>
+											${s.systemId}${s.client ? ` (${s.client})` : ""}${s.description ? ` — ${s.description}` : ""}
+										</ui5-option>
+									`; })}
+							</ui5-select>
+							<div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+								<ui5-input class="corp-ui5-input" placeholder="ADT URL (https://host)" .value=${sapLocalUrl} @input=${(e: Event) => { sapLocalUrl = (e.target as HTMLInputElement & { value: string }).value; }}></ui5-input>
+								<ui5-input class="corp-ui5-input" placeholder="SPN (e.g. SAP/S1RSNCAD)" .value=${sapLocalSpn} @input=${(e: Event) => { sapLocalSpn = (e.target as HTMLInputElement & { value: string }).value; }}></ui5-input>
+								<ui5-input class="corp-ui5-input" placeholder="Client (e.g. 011)" .value=${sapLocalClient} @input=${(e: Event) => { sapLocalClient = (e.target as HTMLInputElement & { value: string }).value; }}></ui5-input>
+								<ui5-input class="corp-ui5-input" placeholder="Language (e.g. EN)" .value=${sapLocalLanguage} @input=${(e: Event) => { sapLocalLanguage = (e.target as HTMLInputElement & { value: string }).value; }}></ui5-input>
+								<ui5-input class="corp-ui5-input" placeholder="Alias (e.g. S1R_011)" .value=${sapNewAlias} @input=${(e: Event) => { sapNewAlias = (e.target as HTMLInputElement & { value: string }).value; }}></ui5-input>
+							</div>
+							<div class="flex items-center gap-2">
+								<ui5-button class="corp-ui5-button" ?disabled=${sapBusy !== ""} @click=${() => void loadLocalSystems()}>
+									${sapBusy === "local-systems" ? "Loading..." : "Refresh systems"}
+								</ui5-button>
+								<ui5-button class="corp-ui5-button" design="Emphasized" ?disabled=${sapBusy !== "" || !sapLocalUrl || !sapLocalSpn} @click=${() => void createLocalConnection()}>
+									${sapBusy === "create" ? "Connecting..." : "Connect (SSO)"}
+								</ui5-button>
+							</div>
+							<div class="text-[11px] text-muted-foreground">No password — uses your Windows logon (Kerberos/SPNEGO). Runs locally on your machine; on-prem is reached directly (no proxy).</div>
+						</div>
+					`
+					: html`
+						<!-- BTP destination connect form -->
+						<div class="flex flex-col gap-2 rounded border border-border/60 bg-background p-2">
+							<div class="text-xs font-medium">Add connection</div>
+							<div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+								<ui5-select
+									class="corp-ui5-select"
+									@change=${(e: Event) => { sapNewDestination = getUi5SelectValue(e, sapNewDestination); if (!sapNewAlias) sapNewAlias = sapNewDestination; }}
+								>
+									${sapDestinations.length === 0
+										? html`<ui5-option value="">${sapDestinationsLoaded ? "No destinations found" : "Load destinations..."}</ui5-option>`
+										: sapDestinations.map((dest) => html`
+											<ui5-option value=${dest.name} ?selected=${sapNewDestination === dest.name}>
+												${dest.name}${dest.proxyType ? ` (${dest.proxyType})` : ""}
+											</ui5-option>
+										`)}
+								</ui5-select>
+								<ui5-input
+									class="corp-ui5-input"
+									placeholder="Alias (e.g. T4X_011_EN)"
+									.value=${sapNewAlias}
+									@input=${(e: Event) => { sapNewAlias = (e.target as HTMLInputElement & { value: string }).value; }}
+								></ui5-input>
+							</div>
+							<div class="flex items-center gap-2">
+								<ui5-button class="corp-ui5-button" ?disabled=${sapBusy !== ""} @click=${() => void loadSapDestinations()}>
+									${sapBusy === "destinations" ? "Loading..." : "Refresh destinations"}
+								</ui5-button>
+								<ui5-button class="corp-ui5-button" design="Emphasized" ?disabled=${sapBusy !== "" || !sapNewDestination} @click=${() => void createSapConnection()}>
+									${sapBusy === "create" ? "Connecting..." : "Connect"}
+								</ui5-button>
+							</div>
+						</div>
+					`}
+
+				${sapError ? html`<div class="rounded border border-destructive/40 bg-destructive/5 px-2 py-1 text-[11px] text-destructive">${sapError}</div>` : ""}
+
+				<!--IYH1HC add: On a successful connect this popup auto-closes and the connection's
+				     object tree appears in the Artifacts panel. No connection list / Test / Remove here. -->
+			</div>
+		</details>
+	`;
+}
+
+//IYH1HC add — Per-ADT-type icon for object leaves in the Artifacts tree (Eclipse-style).
+const SAP_TYPE_ICON: Record<string, typeof File> = {
+	"CLAS/OC": Box,
+	"INTF/OI": Plug,
+	"PROG/P": FileCode,
+	"PROG/I": FileCode,
+	"FUGR/F": FolderCog,
+	"FUGR/FF": FileCode,
+	"TABL/DT": Table2,
+	"TABL/DS": Table2,
+	"TTYP/DA": Brackets,
+	"VIEW/DV": Eye,
+	"DDLS/DF": Database,
+	"DCLS/DL": ShieldCheck,
+	"DTEL/DE": Tag,
+	"DOMA/DD": Tags,
+	"MSAG/N": MessageSquare,
+	"TRAN/T": SquareTerminal,
+	"SFPF/5F": FileText,
+	"SFPI/5I": Plug,
+};
+
+//IYH1HC add — A path belongs to a connection's ADT object tree when it sits at or
+//IYH1HC add — below `artifacts/<conn>/Local Object ($TMP)` for a connection we have a manifest for.
+function isSapObjectTreeFolder(path: string): boolean {
+	for (const conn of sapTreeManifests.keys()) {
+		if (path.includes(`/artifacts/${conn}/Local Object ($TMP)`)) return true;
+	}
+	return false;
+}
+
+//IYH1HC add — Recursively count object files (leaves) under a node = Eclipse object count.
+function countSapObjects(node: WorkspaceNode): number {
+	if (node.type !== "directory") return 1;
+	return (node.children ?? []).reduce((sum, c) => sum + countSapObjects(c), 0);
+}
+
+//IYH1HC add — Eclipse-style display name for an ADT object file: prefer the manifest
+//IYH1HC add — label (real object name), else strip the abapGit extension and uppercase.
+function sapDisplayName(node: WorkspaceNode, info: SapTreeManifestEntry | undefined): string {
+	if (info?.label) return info.label;
+	const base = node.name.split(".")[0] ?? node.name;
+	return base.replace(/#/g, "/").toUpperCase();
+}
+
 function renderTree(nodes: WorkspaceNode[], depth = 0) {
 	return nodes.map((node) => {
 		if (node.type === "directory") {
 			const open = expandedFolders.has(node.path);
+			//IYH1HC add — ADT object-tree folders show an Eclipse-style object count, and a
+			//IYH1HC add — spinner in place of the chevron while their on-prem expand call runs.
+			const isSapFolder = isSapObjectTreeFolder(node.path);
+			const expanding = sapBusy === `expand:${node.path}`;
+			const count = isSapFolder ? countSapObjects(node) : -1;
 			return html`<div>
-				<button class="w-full text-left px-2 py-1 hover:bg-accent rounded flex items-center gap-1 text-xs" style="padding-left: ${depth * 12 + 2}px" @click=${() => toggleFolder(node.path)}>
-					<span class="inline-flex h-4 w-4 shrink-0 items-center justify-center [&>svg]:h-4 [&>svg]:w-4">${icon(open ? ChevronDown : ChevronRight, "xs")}</span>
+				<button class="w-full text-left px-2 py-1 hover:bg-accent rounded flex items-center gap-1 text-xs" style="padding-left: ${depth * 12 + 2}px" @click=${() => void toggleFolder(node.path)}>
+					<span class="inline-flex h-4 w-4 shrink-0 items-center justify-center [&>svg]:h-4 [&>svg]:w-4">${expanding ? icon(LoaderCircle, "xs", "animate-spin") : icon(open ? ChevronDown : ChevronRight, "xs")}</span>
 					<span class="inline-flex h-4 w-4 shrink-0 items-center justify-center [&>svg]:h-4 [&>svg]:w-4">${icon(open ? FolderOpen : Folder, "xs")}</span>
 					<span class="truncate">${node.name}</span>
+					${count >= 0 ? html`<span class="shrink-0 text-[11px] text-muted-foreground">(${count})</span>` : ""}
 				</button>
 				${open && node.children ? html`<div>${renderTree(node.children, depth + 1)}</div>` : ""}
 			</div>`;
@@ -1620,7 +1927,19 @@ function renderTree(nodes: WorkspaceNode[], depth = 0) {
 		if (isDuckDbFile(node.path)) {
 			return renderDatabaseFile(node, depth);
 		}
-		return html`<button class="w-full text-left px-2 py-1 hover:bg-accent rounded flex items-center gap-1 text-xs" style="padding-left: ${depth * 12 + 2}px" @click=${() => openWorkspaceFile(node.path)}>
+		//IYH1HC add — ADT object files: per-type icon, Eclipse display name + description,
+		//IYH1HC add — and a spinner while the source is being hydrated on first open.
+		const sap = sapTreeLookup(node.path);
+		if (sap?.info.hasUri) {
+			const hydrating = sapBusy === `hydrate:${node.path}`;
+			const leafIcon = (sap.info.typeId && SAP_TYPE_ICON[sap.info.typeId]) || File;
+			return html`<button class="w-full text-left px-2 py-1 hover:bg-accent rounded flex items-center gap-1 text-xs" style="padding-left: ${depth * 12 + 2}px" @click=${() => void openWorkspaceFile(node.path)}>
+				<span class="inline-flex h-4 w-4 shrink-0 items-center justify-center [&>svg]:h-4 [&>svg]:w-4">${hydrating ? icon(LoaderCircle, "xs", "animate-spin") : icon(leafIcon, "xs")}</span>
+				<span class="truncate">${sapDisplayName(node, sap.info)}</span>
+				${sap.info.description ? html`<span class="truncate text-[11px] italic text-muted-foreground">${sap.info.description}</span>` : ""}
+			</button>`;
+		}
+		return html`<button class="w-full text-left px-2 py-1 hover:bg-accent rounded flex items-center gap-1 text-xs" style="padding-left: ${depth * 12 + 2}px" @click=${() => void openWorkspaceFile(node.path)}>
 			<span class="inline-flex h-4 w-4 shrink-0 items-center justify-center [&>svg]:h-4 [&>svg]:w-4">${icon(File, "xs")}</span>
 			<span class="truncate">${node.name}</span>
 		</button>`;
@@ -2233,7 +2552,7 @@ function renderWorkspaceSettingsDialog() {
 						<ui5-button
 							class="corp-ui5-button corp-tab-button"
 							design=${workspaceSettingsTab === "connection" ? "Emphasized" : "Transparent"}
-							@click=${() => { workspaceSettingsTab = "connection"; renderApp(); }}
+							@click=${() => { workspaceSettingsTab = "connection"; if (sapConnMode === "local") { if (!sapLocalSystemsLoaded) void loadLocalSystems(); } else if (!sapDestinationsLoaded) { void loadSapDestinations(); } renderApp(); }}
 						>
 							Connection
 						</ui5-button>

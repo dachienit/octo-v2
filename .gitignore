@@ -20,6 +20,10 @@ logs/
 .env.*
 !.env.example
 
+# Service keys (XSUAA / connectivity / destination) — never commit or deploy
+*-key.json
+**/*-key.json
+
 # OS
 .DS_Store
 Thumbs.db
@@ -42,3 +46,4 @@ approuter/resources/
 core-service/deploy/
 
 CLAUDE*.md
+adt-cli.md

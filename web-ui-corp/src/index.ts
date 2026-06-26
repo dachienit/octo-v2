@@ -28,6 +28,11 @@ export {
 	type LlmModelOption, // IYH1HC add
 	type ActiveModel, // IYH1HC add
 	type CustomModelConfig, // IYH1HC add
+	type SapConnection, // IYH1HC add
+	type SapDestination, // IYH1HC add
+	type SapLocalSystem, // IYH1HC SSO add
+	type SapNode, // IYH1HC add
+	type SapTreeManifestEntry, // IYH1HC add
 } from "./adapters/core-service.js";
 export { CoreServiceChatPanel } from "./components/CoreServiceChatPanel.js";
 

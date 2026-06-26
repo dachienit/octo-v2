@@ -78,6 +78,11 @@ modules:
       disk-quota: 8192M
     requires:
       - name: octo-xsuaa
+      # IYH1HC SAP connection add — destination + connectivity so the approuter's
+      # ADT smart-proxy (start.js / lib/adt-proxy.js) can resolve on-prem
+      # destinations and tunnel via the connectivity proxy with principal propagation.
+      - name: octo-destination
+      - name: octo-connectivity
       - name: octo-srv-api
         group: destinations
         properties:
@@ -148,6 +153,6 @@ resources:
     type: org.cloudfoundry.user-provided-service
     parameters:
       config:
-        CORE_SERVICE_ENCRYPTION_KEY: ""
+        CORE_SERVICE_ENCRYPTION_KEY: "75c7e8b8ca58483bbbe94d96ed7e9ac2"
         SSO_GITHUB_CLIENT_SECRET: ""
         AICORE_SERVICE_KEY: ""

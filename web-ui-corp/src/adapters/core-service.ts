@@ -163,6 +163,55 @@ export type WorkspaceTree = {
 	skills: WorkspaceNode[];
 };
 
+//IYH1HC add — SAP ADT connection model (multi-connection per workspace).
+export type SapConnection = {
+	name: string;
+	destinationName: string;
+	url?: string;
+	authType?: string;
+	client?: string;
+	language?: string;
+	status?: "connected" | "error" | "unknown";
+	createdAt?: string;
+};
+
+export type SapDestination = {
+	name: string;
+	type?: string;
+	url?: string;
+	authentication?: string;
+	proxyType?: string;
+	description?: string;
+};
+
+//IYH1HC SSO add — On-prem system discovered from the developer's local SAP Logon landscape.
+export type SapLocalSystem = {
+	systemId: string;
+	client?: string;
+	adtUrl: string;
+	spn: string;
+	description?: string;
+	type?: string;
+	source?: string;
+};
+
+export type SapNode = {
+	typeId: string;
+	name: string;
+	uri: string | null;
+	description?: string;
+};
+
+//IYH1HC add — one entry of the materialized ADT tree manifest (per relative path).
+export type SapTreeManifestEntry = {
+	lazy: boolean; // an ADT folder that must be expanded via the backend
+	loaded: boolean; // for lazy folders: have children been materialized yet
+	hasUri: boolean; // an ADT-backed object file awaiting hydration
+	typeId?: string; // ADT object type (for per-type icon)
+	label?: string; // Eclipse-style display name (uppercase, no extension)
+	description?: string; // short description (shown italic, like Eclipse)
+};
+
 export type WorkspaceSettings = {
 	agent?: {
 		prompt?: string;
@@ -176,6 +225,7 @@ export type WorkspaceSettings = {
 		authType?: "basic" | "destination" | "oauth";
 		destinationName?: string;
 	};
+	sapConnections?: SapConnection[]; //IYH1HC add
 	tools?: {
 		enabled?: string[];
 	};
@@ -839,6 +889,134 @@ export class CoreServiceClient {
 			return response.json();
 		} catch {
 			return null;
+		}
+	}
+
+	//IYH1HC add — SAP ADT connection management.
+	async listSapDestinations(workspaceId: string): Promise<SapDestination[]> {
+		try {
+			const response = await this.fetch(`/workspaces/${encodeURIComponent(workspaceId)}/sap-adt/destinations`);
+			if (!response.ok) return [];
+			const data = await response.json() as { destinations?: SapDestination[] };
+			return data.destinations ?? [];
+		} catch {
+			return [];
+		}
+	}
+
+	async createSapConnection(
+		workspaceId: string,
+		input: { destination: string; name: string; client?: string; language?: string },
+	): Promise<{ connection: SapConnection | null; error?: string }> {
+		try {
+			const response = await this.fetch(`/workspaces/${encodeURIComponent(workspaceId)}/sap-adt/connections`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(input),
+			});
+			const data = await response.json().catch(() => ({})) as { connection?: SapConnection; error?: string };
+			return { connection: data.connection ?? null, error: response.ok ? undefined : (data.error ?? `HTTP ${response.status}`) };
+		} catch (err) {
+			return { connection: null, error: err instanceof Error ? err.message : String(err) };
+		}
+	}
+
+	//IYH1HC SSO add — list on-prem systems from the developer's SAP Logon landscape.
+	async listLocalSapSystems(workspaceId: string): Promise<SapLocalSystem[]> {
+		try {
+			const response = await this.fetch(`/workspaces/${encodeURIComponent(workspaceId)}/sap-adt/local-systems`);
+			if (!response.ok) return [];
+			const data = await response.json() as { systems?: SapLocalSystem[] };
+			return data.systems ?? [];
+		} catch {
+			return [];
+		}
+	}
+
+	//IYH1HC SSO add — create a local on-prem connection authenticated by Kerberos/SPNEGO (no password).
+	async createLocalSapConnection(
+		workspaceId: string,
+		input: { url: string; spn: string; systemId?: string; name: string; client?: string; language?: string },
+	): Promise<{ connection: SapConnection | null; error?: string }> {
+		try {
+			const response = await this.fetch(`/workspaces/${encodeURIComponent(workspaceId)}/sap-adt/connections`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ mode: "sso", ...input }),
+			});
+			const data = await response.json().catch(() => ({})) as { connection?: SapConnection; error?: string };
+			return { connection: data.connection ?? null, error: response.ok ? undefined : (data.error ?? `HTTP ${response.status}`) };
+		} catch (err) {
+			return { connection: null, error: err instanceof Error ? err.message : String(err) };
+		}
+	}
+
+	async deleteSapConnection(workspaceId: string, name: string): Promise<boolean> {
+		try {
+			const response = await this.fetch(
+				`/workspaces/${encodeURIComponent(workspaceId)}/sap-adt/connections/${encodeURIComponent(name)}`,
+				{ method: "DELETE" },
+			);
+			return response.ok;
+		} catch {
+			return false;
+		}
+	}
+
+	async testSapConnection(workspaceId: string, name: string): Promise<{ ok: boolean; error?: string }> {
+		try {
+			const response = await this.fetch(
+				`/workspaces/${encodeURIComponent(workspaceId)}/sap-adt/connections/${encodeURIComponent(name)}/test`,
+				{ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) },
+			);
+			const data = await response.json().catch(() => ({})) as { ok?: boolean; error?: string };
+			return { ok: !!data.ok, error: data.error };
+		} catch (err) {
+			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+	}
+
+	//IYH1HC add — ADT object tree materialized into the workspace Artifacts panel.
+	// Returns a map of manifest-relative path -> entry so the UI knows which folders
+	// to lazily expand, which empty files to hydrate, and how to label object files.
+	async getSapTreeManifest(workspaceId: string, name: string): Promise<Record<string, SapTreeManifestEntry>> {
+		try {
+			const response = await this.fetch(
+				`/workspaces/${encodeURIComponent(workspaceId)}/sap-adt/connections/${encodeURIComponent(name)}/tree/manifest`,
+			);
+			if (!response.ok) return {};
+			const data = await response.json() as { manifest?: Record<string, SapTreeManifestEntry> };
+			return data.manifest ?? {};
+		} catch {
+			return {};
+		}
+	}
+
+	//IYH1HC add — Materialize the children of an ADT folder node on disk (lazy expand).
+	async expandSapTree(workspaceId: string, name: string, path: string): Promise<{ ok: boolean; error?: string }> {
+		try {
+			const response = await this.fetch(
+				`/workspaces/${encodeURIComponent(workspaceId)}/sap-adt/connections/${encodeURIComponent(name)}/tree/expand`,
+				{ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) },
+			);
+			const data = await response.json().catch(() => ({})) as { ok?: boolean; error?: string };
+			return { ok: response.ok && !!data.ok, error: response.ok ? undefined : (data.error ?? `HTTP ${response.status}`) };
+		} catch (err) {
+			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+		}
+	}
+
+	//IYH1HC add — Fetch and persist the source of an empty ADT-backed file before opening it.
+	async hydrateSapFile(workspaceId: string, name: string, path: string): Promise<{ source: string | null; error?: string }> {
+		try {
+			const response = await this.fetch(
+				`/workspaces/${encodeURIComponent(workspaceId)}/sap-adt/connections/${encodeURIComponent(name)}/tree/hydrate`,
+				{ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) },
+			);
+			const data = await response.json().catch(() => ({})) as { source?: string; error?: string };
+			return { source: data.source ?? null, error: response.ok ? undefined : (data.error ?? `HTTP ${response.status}`) };
+		} catch (err) {
+			return { source: null, error: err instanceof Error ? err.message : String(err) };
 		}
 	}
 

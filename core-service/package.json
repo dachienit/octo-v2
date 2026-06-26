@@ -27,6 +27,7 @@
 		"@aws-sdk/client-bedrock-runtime": "^3.1050.0",
 		"@aws-sdk/client-s3": "^3.1050.0",
 		"@octo/core-agent": "*",
+		"adt-cli": "file:../../adt-cli",
 		"@sap/xsenv": "^5.6.0",
 		"@sap/xssec": "^4.8.0",
 		"@slack/socket-mode": "^2.0.0",

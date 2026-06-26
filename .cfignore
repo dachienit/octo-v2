@@ -7,3 +7,5 @@ mta_archives/
 *.log
 **/*.tsbuildinfo
 secrets.mtaext
+*-key.json
+**/*-key.json

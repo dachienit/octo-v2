@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import { Dirent, appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
+import { createRequire } from "module"; //IYH1HC add: resolve the vendored adt-cli bin from this ESM module
 import { basename, extname, isAbsolute, join, relative, resolve } from "path"; //IYH1HC add: relative (cross-platform containment check)
 import {
 	getModel,
@@ -21,12 +22,41 @@ import { CoreServiceAuth } from "./auth.js";
 import { decryptSecret, encryptSecret } from "./crypto.js"; //IYH1HC add
 import { prepareBoschOpenAIEndpoint } from "./extensions/bosch-genai-adapter.js"; //IYH1HC add
 import { GithubSsoProvider, loadSsoConfig } from "./sso.js"; //IYH1HC add
+//IYH1HC SAP connection add — Eclipse-style ADT object tree materialization helpers.
+import {
+	ADT_TREE_FILE,
+	LOCAL_OBJECTS_ROOT,
+	applyPlan,
+	initialManifest,
+	manifestView,
+	planChildren,
+	readManifest,
+	writeManifest,
+	type AdtListResult,
+} from "./sapTree.js";
+//IYH1HC SSO add — local SAP Logon landscape parser (on-prem systems + ADT URL + Kerberos SPN).
+import { listLocalSapSystems, type SapLocalSystem } from "./sapLandscape.js";
 import * as log from "./log.js";
 import { getWorkspaceSandboxStatus } from "./sandbox-manager.js";
 import type { BotContext, BotHandler } from "./types.js";
 import { WorkspaceDatabase } from "./workspace-database.js";
 import { WorkspaceStore } from "./workspaces.js";
+import type { SapConnection, WorkspaceRole } from "./workspaces.js"; //IYH1HC add
 import type { SandboxConfig } from "@octo/core-agent";
+
+//IYH1HC add — In an ESM module `require` is not defined; createRequire gives us a
+//IYH1HC add — resolver so we can locate the vendored adt-cli executable on disk.
+const localRequire = createRequire(import.meta.url);
+
+//IYH1HC add — One destination row as emitted by `adt auth destinations list` (remote view).
+interface SapRemoteDest {
+	Name: string;
+	Type?: string;
+	URL?: string;
+	Authentication?: string;
+	ProxyType?: string;
+	Description?: string;
+}
 
 // ============================================================================
 // HTTP context adapter
@@ -262,6 +292,19 @@ export class HttpServer {
 		app.post("/workspaces",     (req, res) => this.handleCreateWorkspace(req, res));
 		app.get("/workspaces/:workspaceId/settings", (req, res) => this.handleWorkspaceSettings(req, res));
 		app.patch("/workspaces/:workspaceId/settings", (req, res) => this.handleUpdateWorkspaceSettings(req, res));
+		//IYH1HC add — SAP ADT connection management (destination → adt-cli profile + lazy tree).
+		app.get("/workspaces/:workspaceId/sap-adt/destinations", (req, res) => { void this.handleSapListDestinations(req, res); });
+		//IYH1HC SSO add — local (on-prem) systems discovered from the developer's SAP Logon landscape.
+		app.get("/workspaces/:workspaceId/sap-adt/local-systems", (req, res) => { void this.handleSapListLocalSystems(req, res); });
+		app.post("/workspaces/:workspaceId/sap-adt/connections", (req, res) => { void this.handleSapCreateConnection(req, res); });
+		app.delete("/workspaces/:workspaceId/sap-adt/connections/:name", (req, res) => { void this.handleSapDeleteConnection(req, res); });
+		app.post("/workspaces/:workspaceId/sap-adt/connections/:name/test", (req, res) => { void this.handleSapTestConnection(req, res); });
+		app.get("/workspaces/:workspaceId/sap-adt/connections/:name/nodes", (req, res) => { void this.handleSapListNodes(req, res); });
+		app.get("/workspaces/:workspaceId/sap-adt/connections/:name/source", (req, res) => { void this.handleSapGetSource(req, res); });
+		//IYH1HC SAP connection add — lazy ADT object tree materialized into the workspace Artifacts panel.
+		app.post("/workspaces/:workspaceId/sap-adt/connections/:name/tree/expand", (req, res) => { void this.handleSapExpandTree(req, res); });
+		app.post("/workspaces/:workspaceId/sap-adt/connections/:name/tree/hydrate", (req, res) => { void this.handleSapHydrateFile(req, res); });
+		app.get("/workspaces/:workspaceId/sap-adt/connections/:name/tree/manifest", (req, res) => { void this.handleSapTreeManifest(req, res); });
 		app.get("/workspaces/:workspaceId/sandbox", (req, res) => { void this.handleWorkspaceSandbox(req, res); });
 		app.get("/workspaces/:workspaceId/events", (req, res) => this.handleWorkspaceEvents(req, res));
 		app.delete("/workspaces/:workspaceId/events/:filename", (req, res) => this.handleDeleteWorkspaceEvent(req, res));
@@ -856,6 +899,515 @@ export class HttpServer {
 			: root;
 		if (resolved !== root && !resolved.startsWith(`${root}/`)) return undefined;
 		return resolved;
+	}
+
+	// ==========================================================================
+	//IYH1HC add — SAP ADT connection management
+	// ==========================================================================
+
+	// Run the vendored adt-cli (spawned via the current Node binary + an absolute
+	// path to its bin, never a bare PATH lookup). The SAP ADT connector home isolates
+	// each user's adt-cli profile store; ADT_USER_JWT carries the request-scoped user
+	// token for principal propagation, and ADT_PROFILE selects the connection profile.
+	private runAdtCli(
+		userId: string,
+		argv: string[],
+		//IYH1HC SAP connection add — destinationName + routerBase drive env `destinations` injection (BTP approuter smart-proxy)
+		opts: { userJwt?: string; cwd?: string; profileName?: string; timeoutMs?: number; destinationName?: string; routerBase?: string } = {},
+	): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+		return new Promise((resolveP) => {
+			const connector = this.resolveConnector("sap-adt", "business-connector");
+			if (!connector) {
+				resolveP({ stdout: "", stderr: "sap-adt connector is not configured", exitCode: 1 });
+				return;
+			}
+			let adtBin: string;
+			try {
+				adtBin = localRequire.resolve("adt-cli/bin/adt.js");
+			} catch (err) {
+				resolveP({ stdout: "", stderr: `adt-cli is not installed: ${(err as Error).message}`, exitCode: 1 });
+				return;
+			}
+			const usersRoot = this.getUsersRoot();
+			const home = getConnectorHome(usersRoot, userId, connector.id);
+			const env: NodeJS.ProcessEnv = {
+				//IYH1HC SSO add — inherit the service process env (PATH, SystemRoot/windir, DNS)
+				//IYH1HC SSO add — so the native Kerberos/SSPI addon and direct networking work for
+				//IYH1HC SSO add — local "sso" connections. Per-user isolation still comes from
+				//IYH1HC SSO add — ADT_CLI_HOME (profile store) + request-scoped ADT_USER_JWT below.
+				...process.env,
+				...this.getConnectorEnv(userId, connector),
+				// adt-cli persists profiles under ADT_CLI_HOME; set it explicitly because
+				// os.homedir() ignores HOME on Windows, which would break local isolation.
+				ADT_CLI_HOME: join(home, ".adt-cli"),
+			};
+			if (opts.userJwt) env.ADT_USER_JWT = opts.userJwt;
+			if (opts.profileName) env.ADT_PROFILE = opts.profileName;
+			//IYH1HC SAP connection add — On BTP, adt-cli reaches the on-prem ABAP system through the
+			//IYH1HC SAP connection add — app's own approuter (octo-agent) ADT smart-proxy. We inject a local
+			//IYH1HC SAP connection add — destination pointing at <approuter>/adt-proxy/<dest> with forwardAuthToken,
+			//IYH1HC SAP connection add — so adt-cli sends the user JWT (ADT_USER_JWT) as Bearer and the proxy resolves
+			//IYH1HC SAP connection add — the destination + connectivity + principal propagation. Never set ADT_BEARER:
+			//IYH1HC SAP connection add — it short-circuits adt-cli's auth before the destination URL is resolved.
+			if (opts.destinationName && opts.routerBase) {
+				env.destinations = JSON.stringify([
+					{
+						name: opts.destinationName,
+						url: `${opts.routerBase.replace(/\/+$/, "")}/adt-proxy/${encodeURIComponent(opts.destinationName)}`,
+						forwardAuthToken: true,
+					},
+				]);
+			}
+			const cwd = opts.cwd && existsSync(opts.cwd) ? opts.cwd : this.workingDir;
+			const timeoutMs = Math.min(Math.max(opts.timeoutMs ?? 120000, 1000), 300000);
+			const child = spawn(process.execPath, [adtBin, ...argv], { env, cwd, stdio: ["ignore", "pipe", "pipe"] });
+			let stdout = "";
+			let stderr = "";
+			let settled = false;
+			const cap = (text: string) => (text.length > 10 * 1024 * 1024 ? text.slice(-10 * 1024 * 1024) : text);
+			const timer = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
+			child.stdout.on("data", (chunk: Buffer) => { stdout = cap(stdout + chunk.toString("utf-8")); });
+			child.stderr.on("data", (chunk: Buffer) => { stderr = cap(stderr + chunk.toString("utf-8")); });
+			child.on("error", (err) => {
+				clearTimeout(timer);
+				if (settled) return;
+				settled = true;
+				resolveP({ stdout, stderr: stderr || err.message, exitCode: 1 });
+			});
+			child.on("close", (code) => {
+				clearTimeout(timer);
+				if (settled) return;
+				settled = true;
+				resolveP({ stdout, stderr, exitCode: code ?? 0 });
+			});
+		});
+	}
+
+	private extractUserJwt(req: express.Request): string | undefined {
+		const match = req.header("Authorization")?.match(/^Bearer\s+(.+)$/i);
+		return match?.[1]?.trim();
+	}
+
+	//IYH1HC SAP connection add — Base URL of the app's own approuter (octo-agent), used to build the
+	//IYH1HC SAP connection add — ADT smart-proxy endpoint. On BTP the approuter sets x-forwarded-host/-proto
+	//IYH1HC SAP connection add — when it proxies /api/* to octo-srv, so we derive it from the request and
+	//IYH1HC SAP connection add — avoid a circular MTA dependency. ADT_ROUTER_URL overrides it for local dev.
+	private resolveRouterBase(req: express.Request): string | undefined {
+		if (process.env.ADT_ROUTER_URL) return process.env.ADT_ROUTER_URL;
+		const host = req.header("x-forwarded-host") || req.header("host");
+		if (!host) return undefined;
+		const proto = req.header("x-forwarded-proto") || "https";
+		return `${proto}://${host}`;
+	}
+
+	//IYH1HC SAP connection add — Resolve a stored connection's SAP destination name (the adt-cli profile
+	//IYH1HC SAP connection add — name and the destination name can differ), used to build the smart-proxy URL.
+	private getConnectionDestination(userId: string, workspaceId: string, name: string): string | undefined {
+		return this.workspaceStore.getSapConnections(userId, workspaceId).find((c) => c.name === name)?.destinationName;
+	}
+
+	// Connection name doubles as the adt-cli profile name and an on-disk folder name,
+	// so it must be filesystem/profile safe.
+	private sanitizeConnectionName(raw: unknown): string {
+		return String(raw ?? "").trim().replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 64);
+	}
+
+	// Returns the workspace role, or sends a 404/403 and returns undefined.
+	private assertSapAccess(req: express.Request, res: express.Response, requireWrite: boolean): { userId: string; workspaceId: string } | undefined {
+		const userId = this.getUserId(req);
+		const workspaceId = String(req.params.workspaceId);
+		let role: WorkspaceRole;
+		try {
+			role = this.workspaceStore.assertWorkspaceAccess(userId, workspaceId);
+		} catch {
+			res.status(404).json({ error: "Workspace not found or access denied" });
+			return undefined;
+		}
+		if (requireWrite && role === "viewer") {
+			res.status(403).json({ error: "Workspace is read-only for viewers" });
+			return undefined;
+		}
+		return { userId, workspaceId };
+	}
+
+	// GET /workspaces/:id/sap-adt/destinations
+	private async handleSapListDestinations(req: express.Request, res: express.Response): Promise<void> {
+		const ctx = this.assertSapAccess(req, res, false);
+		if (!ctx) return;
+		const userJwt = this.extractUserJwt(req);
+		const result = await this.runAdtCli(ctx.userId, ["-q", "auth", "destinations", "list"], { userJwt });
+		if (result.exitCode !== 0) {
+			res.status(502).json({ error: result.stderr || "Failed to list destinations" });
+			return;
+		}
+		let parsed: { remote?: { error?: string; subaccount?: SapRemoteDest[]; instance?: SapRemoteDest[] } };
+		try {
+			parsed = JSON.parse(result.stdout);
+		} catch {
+			res.status(502).json({ error: "Invalid destinations output", raw: result.stdout });
+			return;
+		}
+		const remote = parsed.remote && !parsed.remote.error ? parsed.remote : { subaccount: [], instance: [] };
+		const destinations = [...(remote.subaccount ?? []), ...(remote.instance ?? [])].map((d) => ({
+			name: d.Name,
+			type: d.Type,
+			url: d.URL,
+			authentication: d.Authentication,
+			proxyType: d.ProxyType,
+			description: d.Description,
+		}));
+		res.json({ destinations });
+	}
+
+	// GET /workspaces/:id/sap-adt/local-systems
+	//IYH1HC SSO add — On-prem systems discovered from the developer's SAP Logon landscape
+	//IYH1HC SSO add — (ADT URL + Kerberos SPN), used to seed the "On-Premise (SSO)" connect form.
+	private async handleSapListLocalSystems(req: express.Request, res: express.Response): Promise<void> {
+		const ctx = this.assertSapAccess(req, res, false);
+		if (!ctx) return;
+		try {
+			const systems: SapLocalSystem[] = listLocalSapSystems();
+			res.json({ systems });
+		} catch (e) {
+			res.status(500).json({ error: (e as Error).message || "Failed to read SAP Logon landscape" });
+		}
+	}
+
+	//IYH1HC SSO add — Create a LOCAL on-prem connection authenticated by Kerberos/SPNEGO
+	//IYH1HC SSO add — (no password). Mirrors the destination flow but logs in via
+	//IYH1HC SSO add — `adt auth login basicsso` against a direct URL + SPN (no BTP proxy/JWT).
+	private async createLocalSsoConnection(ctx: { userId: string; workspaceId: string }, req: express.Request, res: express.Response): Promise<void> {
+		const body = req.body as { url?: unknown; spn?: unknown; systemId?: unknown; name?: unknown; client?: unknown; language?: unknown };
+		const url = String(body.url ?? "").trim();
+		const spn = String(body.spn ?? "").trim();
+		if (!url || !spn) {
+			res.status(400).json({ error: "url and spn are required for an SSO connection" });
+			return;
+		}
+		const systemId = body.systemId ? String(body.systemId).trim() : undefined;
+		const name = this.sanitizeConnectionName(body.name || systemId || url);
+		if (!name) {
+			res.status(400).json({ error: "A valid connection name is required" });
+			return;
+		}
+		const client = body.client ? String(body.client) : undefined;
+		const language = body.language ? String(body.language) : undefined;
+
+		const folder = join(this.workspaceStore.getWorkspaceRoot(ctx.workspaceId), "artifacts", name);
+		mkdirSync(folder, { recursive: true });
+
+		//IYH1HC comment — const argv = ["-q", "auth", "login", "sso", "--url", url, "--spn", spn, "--insecure", "--name", name];
+		//IYH1HC add — adt-cli renamed the on-prem Kerberos/SPNEGO subcommand "sso" -> "basicsso"
+		//IYH1HC add — (legacy "sso" removed); spawning the old name fails with "unknown command".
+		const argv = ["-q", "auth", "login", "basicsso", "--url", url, "--spn", spn, "--insecure", "--name", name];
+		if (client) argv.push("--client", client);
+		if (language) argv.push("--language", language);
+		//IYH1HC SSO add — no destinationName/routerBase/userJwt: adt-cli connects DIRECTLY to the
+		//IYH1HC SSO add — on-prem system (no BTP approuter proxy / user JWT). TLS for the insecure
+		//IYH1HC SSO add — wdisp endpoint is handled inside adt-cli's AdtClient (NODE_TLS bypass when
+		//IYH1HC SSO add — --insecure); Node global fetch does not auto-honor HTTPS_PROXY, so the
+		//IYH1HC SSO add — route stays direct without any proxy-skip logic in bin/adt.js.
+		const result = await this.runAdtCli(ctx.userId, argv, { cwd: folder, profileName: name });
+		const connected = result.exitCode === 0;
+
+		writeFileSync(
+			join(folder, ".adt-connection.json"),
+			`${JSON.stringify({ connectionName: name, authType: "sso", url, spn, systemId, client, language }, null, 2)}\n`,
+		);
+
+		if (connected) {
+			mkdirSync(join(folder, LOCAL_OBJECTS_ROOT), { recursive: true });
+			mkdirSync(join(folder, "Artifacts"), { recursive: true });
+			writeManifest(folder, initialManifest());
+		}
+
+		const connection: SapConnection = {
+			name,
+			authType: "sso",
+			url,
+			spn,
+			systemId,
+			client,
+			language,
+			status: connected ? "connected" : "error",
+			createdAt: new Date().toISOString(),
+		};
+		const next = this.workspaceStore.getSapConnections(ctx.userId, ctx.workspaceId).filter((c) => c.name !== name);
+		next.push(connection);
+		this.workspaceStore.setSapConnections(ctx.userId, ctx.workspaceId, next);
+
+		if (!connected) {
+			res.status(502).json({ connection, error: result.stderr || "SSO connection verification failed" });
+			return;
+		}
+		res.json({ connection });
+	}
+
+	// POST /workspaces/:id/sap-adt/connections
+	private async handleSapCreateConnection(req: express.Request, res: express.Response): Promise<void> {
+		const ctx = this.assertSapAccess(req, res, true);
+		if (!ctx) return;
+		//IYH1HC SSO add — local on-prem connect (Kerberos/SPNEGO) has a different shape than
+		//IYH1HC SSO add — the BTP destination flow; dispatch on the "mode" field.
+		if (["local", "sso"].includes(String((req.body as { mode?: unknown }).mode ?? "").trim().toLowerCase())) {
+			await this.createLocalSsoConnection(ctx, req, res);
+			return;
+		}
+		const body = req.body as { destination?: unknown; name?: unknown; client?: unknown; language?: unknown };
+		const destination = String(body.destination ?? "").trim();
+		if (!destination) {
+			res.status(400).json({ error: "destination is required" });
+			return;
+		}
+		const name = this.sanitizeConnectionName(body.name || destination);
+		if (!name) {
+			res.status(400).json({ error: "A valid connection name is required" });
+			return;
+		}
+		const client = body.client ? String(body.client) : undefined;
+		const language = body.language ? String(body.language) : undefined;
+		const userJwt = this.extractUserJwt(req);
+
+		//IYH1HC add — Create the connection folder under the workspace artifacts dir so it
+		//IYH1HC add — shows up in the workspace file tree (which is rooted at .../artifacts).
+		const folder = join(this.workspaceStore.getWorkspaceRoot(ctx.workspaceId), "artifacts", name);
+		mkdirSync(folder, { recursive: true });
+
+		const argv = ["-q", "auth", "login", "destination", "--destination", destination, "--name", name];
+		if (client) argv.push("--client", client);
+		if (language) argv.push("--language", language);
+		if (userJwt) argv.push("--user-jwt", userJwt);
+		//IYH1HC SAP connection add — verify step hits on-prem, so route it through the approuter ADT smart-proxy.
+		const result = await this.runAdtCli(ctx.userId, argv, { userJwt, cwd: folder, profileName: name, destinationName: destination, routerBase: this.resolveRouterBase(req) });
+		const connected = result.exitCode === 0;
+
+		writeFileSync(
+			join(folder, ".adt-connection.json"),
+			`${JSON.stringify({ connectionName: name, destination, client, language }, null, 2)}\n`,
+		);
+
+		//IYH1HC SAP connection add — On a successful connect, seed the Eclipse-style ADT
+		//IYH1HC SAP connection add — object tree: a synthetic "Local Object ($TMP)" root folder
+		//IYH1HC SAP connection add — plus a sidecar manifest. Children are materialized lazily on expand.
+		if (connected) {
+			mkdirSync(join(folder, LOCAL_OBJECTS_ROOT), { recursive: true });
+			//IYH1HC SAP connection add — empty sibling folder for agent-generated artifacts.
+			mkdirSync(join(folder, "Artifacts"), { recursive: true });
+			writeManifest(folder, initialManifest());
+		}
+
+		const connection: SapConnection = {
+			name,
+			destinationName: destination,
+			client,
+			language,
+			status: connected ? "connected" : "error",
+			createdAt: new Date().toISOString(),
+		};
+		const next = this.workspaceStore.getSapConnections(ctx.userId, ctx.workspaceId).filter((c) => c.name !== name);
+		next.push(connection);
+		this.workspaceStore.setSapConnections(ctx.userId, ctx.workspaceId, next);
+
+		if (!connected) {
+			res.status(502).json({ connection, error: result.stderr || "Connection verification failed" });
+			return;
+		}
+		res.json({ connection });
+	}
+
+	// DELETE /workspaces/:id/sap-adt/connections/:name
+	private async handleSapDeleteConnection(req: express.Request, res: express.Response): Promise<void> {
+		const ctx = this.assertSapAccess(req, res, true);
+		if (!ctx) return;
+		const name = this.sanitizeConnectionName(req.params.name);
+		const userJwt = this.extractUserJwt(req);
+		// Best-effort profile removal; ignore failures (profile may already be gone).
+		await this.runAdtCli(ctx.userId, ["-q", "auth", "profile", "delete", name], { userJwt });
+		const next = this.workspaceStore.getSapConnections(ctx.userId, ctx.workspaceId).filter((c) => c.name !== name);
+		this.workspaceStore.setSapConnections(ctx.userId, ctx.workspaceId, next);
+		res.json({ ok: true }); // the on-disk folder is intentionally kept.
+	}
+
+	// POST /workspaces/:id/sap-adt/connections/:name/test
+	private async handleSapTestConnection(req: express.Request, res: express.Response): Promise<void> {
+		const ctx = this.assertSapAccess(req, res, false);
+		if (!ctx) return;
+		const name = this.sanitizeConnectionName(req.params.name);
+		const userJwt = this.extractUserJwt(req);
+		//IYH1HC SAP connection add — route the on-prem verify through the approuter ADT smart-proxy.
+		const destinationName = this.getConnectionDestination(ctx.userId, ctx.workspaceId, name);
+		const result = await this.runAdtCli(ctx.userId, ["-q", "auth", "login", "test", "--name", name], { userJwt, profileName: name, destinationName, routerBase: this.resolveRouterBase(req) });
+		const ok = result.exitCode === 0;
+		const connections = this.workspaceStore.getSapConnections(ctx.userId, ctx.workspaceId);
+		const conn = connections.find((c) => c.name === name);
+		if (conn) {
+			conn.status = ok ? "connected" : "error";
+			this.workspaceStore.setSapConnections(ctx.userId, ctx.workspaceId, connections);
+		}
+		res.status(ok ? 200 : 502).json({ ok, status: ok ? "connected" : "error", error: ok ? undefined : result.stderr });
+	}
+
+	// GET /workspaces/:id/sap-adt/connections/:name/nodes?package=$TMP[&parentType=][&parentName=]
+	private async handleSapListNodes(req: express.Request, res: express.Response): Promise<void> {
+		const ctx = this.assertSapAccess(req, res, false);
+		if (!ctx) return;
+		const name = this.sanitizeConnectionName(req.params.name);
+		const pkg = String(req.query.package ?? "$TMP");
+		const userJwt = this.extractUserJwt(req);
+		const argv = ["-q", "object", "list", "--package", pkg, "--json"];
+		if (typeof req.query.parentType === "string" && req.query.parentType) argv.push("--parent-type", req.query.parentType);
+		if (typeof req.query.parentName === "string" && req.query.parentName) argv.push("--parent-name", req.query.parentName);
+		//IYH1HC SAP connection add — route the on-prem object list through the approuter ADT smart-proxy.
+		const destinationName = this.getConnectionDestination(ctx.userId, ctx.workspaceId, name);
+		const result = await this.runAdtCli(ctx.userId, argv, { userJwt, profileName: name, destinationName, routerBase: this.resolveRouterBase(req) });
+		if (result.exitCode !== 0) {
+			res.status(502).json({ error: result.stderr || "Failed to list nodes" });
+			return;
+		}
+		let nodes: unknown;
+		try {
+			nodes = JSON.parse(result.stdout);
+		} catch {
+			res.status(502).json({ error: "Invalid nodes output", raw: result.stdout });
+			return;
+		}
+		res.json({ nodes });
+	}
+
+	// GET /workspaces/:id/sap-adt/connections/:name/source?uri=...
+	private async handleSapGetSource(req: express.Request, res: express.Response): Promise<void> {
+		const ctx = this.assertSapAccess(req, res, false);
+		if (!ctx) return;
+		const name = this.sanitizeConnectionName(req.params.name);
+		const uri = String(req.query.uri ?? "");
+		if (!uri) {
+			res.status(400).json({ error: "uri is required" });
+			return;
+		}
+		const userJwt = this.extractUserJwt(req);
+		//IYH1HC SAP connection add — route the on-prem source read through the approuter ADT smart-proxy.
+		const destinationName = this.getConnectionDestination(ctx.userId, ctx.workspaceId, name);
+		const result = await this.runAdtCli(ctx.userId, ["-q", "object", "source", uri], { userJwt, profileName: name, destinationName, routerBase: this.resolveRouterBase(req) });
+		if (result.exitCode !== 0) {
+			res.status(502).json({ error: result.stderr || "Failed to read source" });
+			return;
+		}
+		res.json({ source: result.stdout });
+	}
+
+	//IYH1HC SAP connection add — Map a workspace-tree node path to its key within a
+	//IYH1HC SAP connection add — connection's ADT tree manifest (path relative to
+	//IYH1HC SAP connection add — artifacts/<name>/). Guards against traversal outside the folder.
+	private resolveSapTreeRelKey(workspaceId: string, connName: string, inputPath: string): string | null {
+		if (!inputPath) return null;
+		let p = String(inputPath).replace(/\\/g, "/").replace(/^\/+/, "");
+		const fullPrefix = `workspaces/${workspaceId}/artifacts/`;
+		if (p.startsWith(fullPrefix)) p = p.slice(fullPrefix.length);
+		else if (p.startsWith("artifacts/")) p = p.slice("artifacts/".length);
+		if (p === connName) return "";
+		const connPrefix = `${connName}/`;
+		if (!p.startsWith(connPrefix)) return null;
+		const relKey = p.slice(connPrefix.length);
+		if (!relKey || relKey.split("/").some((seg) => seg === "." || seg === "..")) return null;
+		return relKey;
+	}
+
+	//IYH1HC SAP connection add — Resolve the on-disk connection folder for a workspace.
+	private sapConnDir(workspaceId: string, connName: string): string {
+		return join(this.workspaceStore.getWorkspaceRoot(workspaceId), "artifacts", connName);
+	}
+
+	// POST /workspaces/:id/sap-adt/connections/:name/tree/expand  body { path }
+	//IYH1HC SAP connection add — Lazily materialize the children of an ADT folder node:
+	//IYH1HC SAP connection add — list via nodestructure, then create category folders + empty
+	//IYH1HC SAP connection add — object files on disk and record them in the manifest.
+	private async handleSapExpandTree(req: express.Request, res: express.Response): Promise<void> {
+		const ctx = this.assertSapAccess(req, res, false);
+		if (!ctx) return;
+		const name = this.sanitizeConnectionName(req.params.name);
+		const connDir = this.sapConnDir(ctx.workspaceId, name);
+		const relKey = this.resolveSapTreeRelKey(ctx.workspaceId, name, String((req.body as { path?: unknown })?.path ?? ""));
+		if (relKey == null) {
+			res.status(400).json({ error: "Invalid path" });
+			return;
+		}
+		const manifest = readManifest(connDir);
+		const entry = manifest.entries[relKey];
+		if (!entry || entry.kind !== "package" || !entry.adtParentType || !entry.adtParentName) {
+			res.status(404).json({ error: "Not an expandable ADT node" });
+			return;
+		}
+		if (entry.loaded) {
+			res.json({ ok: true, alreadyLoaded: true });
+			return;
+		}
+		const userJwt = this.extractUserJwt(req);
+		const destinationName = this.getConnectionDestination(ctx.userId, ctx.workspaceId, name);
+		const argv = ["-q", "object", "list", "--parent-type", entry.adtParentType, "--parent-name", entry.adtParentName, "--json"];
+		const result = await this.runAdtCli(ctx.userId, argv, { userJwt, profileName: name, destinationName, routerBase: this.resolveRouterBase(req) });
+		if (result.exitCode !== 0) {
+			res.status(502).json({ error: result.stderr || "Failed to expand node" });
+			return;
+		}
+		let listed: AdtListResult;
+		try {
+			listed = JSON.parse(result.stdout) as AdtListResult;
+		} catch {
+			res.status(502).json({ error: "Invalid object list output", raw: result.stdout });
+			return;
+		}
+		const plan = planChildren(listed);
+		applyPlan(connDir, relKey, plan, manifest);
+		entry.loaded = true;
+		writeManifest(connDir, manifest);
+		res.json({ ok: true, count: plan.length });
+	}
+
+	// POST /workspaces/:id/sap-adt/connections/:name/tree/hydrate  body { path }
+	//IYH1HC SAP connection add — On first open of an empty ADT-backed file, fetch its source
+	//IYH1HC SAP connection add — and write it to disk so the agent can read and @mention it.
+	private async handleSapHydrateFile(req: express.Request, res: express.Response): Promise<void> {
+		const ctx = this.assertSapAccess(req, res, false);
+		if (!ctx) return;
+		const name = this.sanitizeConnectionName(req.params.name);
+		const connDir = this.sapConnDir(ctx.workspaceId, name);
+		const relKey = this.resolveSapTreeRelKey(ctx.workspaceId, name, String((req.body as { path?: unknown })?.path ?? ""));
+		if (!relKey) {
+			res.status(400).json({ error: "Invalid path" });
+			return;
+		}
+		const manifest = readManifest(connDir);
+		const entry = manifest.entries[relKey];
+		if (!entry || entry.kind !== "object" || !entry.adtUri) {
+			res.status(404).json({ error: "Not an ADT-backed file" });
+			return;
+		}
+		const abs = join(connDir, relKey);
+		const existing = existsSync(abs) ? readFileSync(abs, "utf8") : "";
+		if (existing.length > 0) {
+			res.json({ source: existing, cached: true });
+			return;
+		}
+		const userJwt = this.extractUserJwt(req);
+		const destinationName = this.getConnectionDestination(ctx.userId, ctx.workspaceId, name);
+		const result = await this.runAdtCli(ctx.userId, ["-q", "object", "source", entry.adtUri], { userJwt, profileName: name, destinationName, routerBase: this.resolveRouterBase(req) });
+		if (result.exitCode !== 0) {
+			res.status(502).json({ error: result.stderr || "Failed to read source" });
+			return;
+		}
+		writeFileSync(abs, result.stdout);
+		res.json({ source: result.stdout });
+	}
+
+	// GET /workspaces/:id/sap-adt/connections/:name/tree/manifest
+	//IYH1HC SAP connection add — Tell the frontend which tree paths are lazy ADT folders
+	//IYH1HC SAP connection add — (call expand) and which are empty ADT-backed files (call hydrate).
+	private handleSapTreeManifest(req: express.Request, res: express.Response): void {
+		const ctx = this.assertSapAccess(req, res, false);
+		if (!ctx) return;
+		const name = this.sanitizeConnectionName(req.params.name);
+		const connDir = this.sapConnDir(ctx.workspaceId, name);
+		res.json({ manifest: manifestView(readManifest(connDir)) });
 	}
 
 	private handleAgentWorkers(req: express.Request, res: express.Response): void {
@@ -1537,10 +2089,13 @@ export class HttpServer {
 		const makeTree = (rootPath: string, relativeBase: string): WorkspaceNode[] => {
 			if (!existsSync(rootPath)) return [];
 			const walk = (absDir: string, relDir: string): WorkspaceNode[] => {
-				const entries = readdirSync(absDir, { withFileTypes: true }).sort((a: Dirent, b: Dirent) => {
-					if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
-					return a.name.localeCompare(b.name);
-				});
+				const entries = readdirSync(absDir, { withFileTypes: true })
+					//IYH1HC SAP connection add — hide SAP connection sidecar manifests from the file tree.
+					.filter((e: Dirent) => e.name !== ADT_TREE_FILE && e.name !== ".adt-connection.json")
+					.sort((a: Dirent, b: Dirent) => {
+						if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+						return a.name.localeCompare(b.name);
+					});
 				return entries.map((entry) => {
 					const relPath = relDir ? `${relDir}/${entry.name}` : entry.name;
 					const normalizedPath = relativeBase ? `${relativeBase}/${relPath}` : relPath;
