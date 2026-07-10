@@ -284,6 +284,9 @@ export class CoreAgent {
 	private runErrorMessage: string | undefined;
 	private runTotalUsage = freshUsage();
 	private runLastAssistantText: string | undefined;
+	//IYH1HC stream add: increments on each assistant message "start" stream event within a run;
+	// combined with contentIndex it forms the unique blockId for delta correlation.
+	private assistantMsgSeq = 0;
 
 	constructor(channelId: string, options: CoreAgentOptions) {
 		this.channelId = channelId;
@@ -378,7 +381,9 @@ export class CoreAgent {
 				const e = event as AgentEvent & { type: "tool_execution_start" };
 				const args = e.args as { label?: string };
 				this.pendingTools.set(e.toolCallId, { toolName: e.toolName, args: e.args, startTime: Date.now() });
-				events.onToolStart?.(e.toolName, args.label || e.toolName, e.args as Record<string, unknown>);
+				//IYH1HC stream comment events.onToolStart?.(e.toolName, args.label || e.toolName, e.args as Record<string, unknown>);
+				//IYH1HC stream add: pass toolCallId so transports can correlate lifecycle events
+				events.onToolStart?.(e.toolName, args.label || e.toolName, e.args as Record<string, unknown>, e.toolCallId);
 			} else if (event.type === "tool_execution_end") {
 				const e = event as AgentEvent & { type: "tool_execution_end" };
 				const resultStr = extractToolResultText(e.result);
@@ -393,6 +398,7 @@ export class CoreAgent {
 					durationMs,
 					resultStr,
 					e.isError,
+					e.toolCallId, //IYH1HC stream add
 				);
 			} else if (event.type === "tool_execution_update") {
 				const e = event as AgentEvent & { type: "tool_execution_update" };
@@ -404,7 +410,33 @@ export class CoreAgent {
 					label,
 					(pending?.args as Record<string, unknown>) ?? {},
 					resultStr,
+					e.toolCallId, //IYH1HC stream add
 				);
+			//IYH1HC stream add: forward token-level assistant stream events (previously dropped).
+			// pi re-emits every AssistantMessageEvent through message_update while the LLM streams.
+			} else if (event.type === "message_update") {
+				const e = event as AgentEvent & { type: "message_update" };
+				const ame = e.assistantMessageEvent;
+				if (ame.type === "start") {
+					this.assistantMsgSeq++;
+				} else if (ame.type === "text_start" || ame.type === "thinking_start") {
+					const kind = ame.type === "text_start" ? "text" : "thinking";
+					events.onBlockStart?.(`${this.assistantMsgSeq}:${ame.contentIndex}`, kind);
+				} else if (ame.type === "text_delta" || ame.type === "thinking_delta") {
+					const kind = ame.type === "text_delta" ? "text" : "thinking";
+					events.onBlockDelta?.(`${this.assistantMsgSeq}:${ame.contentIndex}`, kind, ame.delta);
+				} else if (ame.type === "text_end" || ame.type === "thinking_end") {
+					const kind = ame.type === "text_end" ? "text" : "thinking";
+					events.onBlockEnd?.(`${this.assistantMsgSeq}:${ame.contentIndex}`, kind, ame.content);
+				} else if (ame.type === "toolcall_end") {
+					// Args are complete here; execution starts later (tool_execution_start).
+					events.onToolCall?.(ame.toolCall.id, ame.toolCall.name, ame.toolCall.arguments);
+				}
+				// toolcall_start/toolcall_delta (raw JSON fragments) and done/error are intentionally ignored.
+			} else if (event.type === "turn_start") {
+				events.onTurnStart?.();
+			} else if (event.type === "turn_end") {
+				events.onTurnEnd?.();
 			} else if (event.type === "message_end") {
 				const e = event as AgentEvent & { type: "message_end" };
 				if (e.message.role === "assistant") {
@@ -421,6 +453,14 @@ export class CoreAgent {
 						this.runTotalUsage.cost.cacheRead += msg.usage.cost.cacheRead;
 						this.runTotalUsage.cost.cacheWrite += msg.usage.cost.cacheWrite;
 						this.runTotalUsage.cost.total += msg.usage.cost.total;
+						//IYH1HC stream add: authoritative per-message usage for live token accounting
+						events.onUsage?.(
+							{ ...msg.usage, cost: { ...msg.usage.cost } },
+							msg.stopReason,
+							//IYH1HC stream add: which model actually served this step (responseModel
+							// is the gateway-reported id when it differs from the requested one)
+							{ provider: String(msg.provider ?? ""), id: String(msg.responseModel || msg.model || "") },
+						);
 					}
 					const content = e.message.content as any[];
 					const thinkingParts = content.filter((p) => p.type === "thinking").map((p) => p.thinking as string);
@@ -613,6 +653,7 @@ export class CoreAgent {
 		this.runErrorMessage = undefined;
 		this.runTotalUsage = freshUsage();
 		this.runLastAssistantText = undefined;
+		this.assistantMsgSeq = 0; //IYH1HC stream add
 
 		// Build timestamped user message
 		const now = new Date();

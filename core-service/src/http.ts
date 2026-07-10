@@ -20,8 +20,9 @@ import {
 import express from "express";
 import { CoreServiceAuth } from "./auth.js";
 import { decryptSecret, encryptSecret } from "./crypto.js"; //IYH1HC add
-import { prepareBoschOpenAIEndpoint } from "./extensions/bosch-genai-adapter.js"; //IYH1HC add
+import { prepareBoschAnthropicEndpoint, prepareBoschGoogleEndpoint, prepareBoschOpenAIEndpoint } from "./extensions/bosch-genai-adapter.js"; //IYH1HC add
 import { GithubSsoProvider, loadSsoConfig } from "./sso.js"; //IYH1HC add
+import type { ObjectStoreGateway } from "./object-store.js"; //IYH1HC add: per-user restore/snapshot via gateway
 //IYH1HC SAP connection add — Eclipse-style ADT object tree materialization helpers.
 import {
 	ADT_TREE_FILE,
@@ -39,6 +40,8 @@ import { listLocalSapSystems, type SapLocalSystem } from "./sapLandscape.js";
 import * as log from "./log.js";
 import { getWorkspaceSandboxStatus } from "./sandbox-manager.js";
 import type { BotContext, BotHandler } from "./types.js";
+import { truncateToolResult, type AgentTrailEvent, type AgentUsage } from "./agent-events.js"; //IYH1HC stream add
+import { TrailStore, readTrail } from "./trail-store.js"; //IYH1HC stream add
 import { WorkspaceDatabase } from "./workspace-database.js";
 import { WorkspaceStore } from "./workspaces.js";
 import type { SapConnection, WorkspaceRole } from "./workspaces.js"; //IYH1HC add
@@ -120,14 +123,69 @@ export function createHttpContext(opts: {
 	userId?: string;
 	authFilePath?: string;
 	model?: { provider: string; modelId: string; apiKey?: string; baseUrl?: string; apiType?: string }; //IYH1HC add
+	structured?: boolean; //IYH1HC stream add: client opted in to the structured trail protocol
 }): BotContext {
-	const { channelId, userName, text, ts, send, workingDir, attachments = [], userId = "web-user", authFilePath, model } = opts; //IYH1HC comment: added `model`
+	//IYH1HC stream comment const { channelId, userName, text, ts, send, workingDir, attachments = [], userId = "web-user", authFilePath, model } = opts; //IYH1HC comment: added `model`
+	const { channelId, userName, text, ts, send, workingDir, attachments = [], userId = "web-user", authFilePath, model, structured = false } = opts; //IYH1HC stream add
 
 	const logToFile = (entry: object) => {
 		const dir = join(workingDir, "sessions", channelId);
 		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 		appendFileSync(join(dir, "log.jsonl"), `${JSON.stringify(entry)}\n`);
 	};
+
+	//IYH1HC stream add: structured trail emitter — assigns the per-run seq, coalesces token
+	// deltas (40ms / 2KB per block) to bound SSE event rate, truncates tool results for the
+	// wire while the append-only trail.jsonl keeps the full text for audit.
+	let emitAgentEvent: ((event: AgentTrailEvent) => void) | undefined;
+	let flushAgentEvents: (() => void) | undefined;
+	if (structured) {
+		const trailStore = new TrailStore(join(workingDir, "sessions", channelId), ts);
+		const FLUSH_MS = 40;
+		const FLUSH_CHARS = 2048;
+		let seq = 0;
+		const nextSeq = () => ++seq;
+		const pendingDeltas = new Map<string, { kind: "text" | "thinking"; delta: string }>();
+		let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+		const flushDeltas = () => {
+			if (flushTimer) {
+				clearTimeout(flushTimer);
+				flushTimer = null;
+			}
+			for (const [blockId, p] of pendingDeltas) {
+				send({ type: "block", seq: nextSeq(), phase: "delta", blockId, kind: p.kind, delta: p.delta });
+			}
+			pendingDeltas.clear();
+		};
+
+		emitAgentEvent = (event: AgentTrailEvent) => {
+			if (event.type === "block" && event.phase === "delta") {
+				const pending = pendingDeltas.get(event.blockId);
+				if (pending) pending.delta += event.delta;
+				else pendingDeltas.set(event.blockId, { kind: event.kind, delta: event.delta });
+				if ((pendingDeltas.get(event.blockId)?.delta.length ?? 0) >= FLUSH_CHARS) {
+					flushDeltas();
+				} else if (!flushTimer) {
+					flushTimer = setTimeout(flushDeltas, FLUSH_MS);
+				}
+				return;
+			}
+			// Flush buffered deltas before any non-delta event to preserve total order.
+			flushDeltas();
+			const stamped = { ...event, seq: nextSeq() } as AgentTrailEvent;
+			trailStore.append(stamped);
+			if (stamped.type === "tool" && stamped.phase === "end") {
+				const { text: resultText, truncated } = truncateToolResult(stamped.result);
+				send({ ...stamped, result: resultText, resultTruncated: truncated });
+			} else if (stamped.type === "tool" && stamped.phase === "update") {
+				send({ ...stamped, partialResult: truncateToolResult(stamped.partialResult).text });
+			} else {
+				send(stamped);
+			}
+		};
+		flushAgentEvents = flushDeltas;
+	}
 
 	return {
 		message: {
@@ -146,7 +204,10 @@ export function createHttpContext(opts: {
 		users: [{ id: userId, userName, displayName: userName }],
 
 		respond: async (responseText: string, shouldLog = true) => {
-			send({ type: "delta", text: responseText });
+			//IYH1HC stream comment send({ type: "delta", text: responseText });
+			//IYH1HC stream add: structured clients receive content as block events — suppress
+			// the legacy flattened delta to avoid double rendering, but keep log.jsonl intact.
+			if (!structured) send({ type: "delta", text: responseText });
 			if (shouldLog) {
 				const responseTs = (Date.now() / 1000).toFixed(6);
 				logToFile({ date: new Date().toISOString(), ts: responseTs, user: "bot", text: responseText, attachments: [], isBot: true });
@@ -160,7 +221,8 @@ export function createHttpContext(opts: {
 		},
 
 		respondInThread: async (responseText: string) => {
-			send({ type: "thread", text: responseText });
+			//IYH1HC stream comment send({ type: "thread", text: responseText });
+			if (!structured) send({ type: "thread", text: responseText }); //IYH1HC stream add
 			const responseTs = (Date.now() / 1000).toFixed(6);
 			logToFile({ date: new Date().toISOString(), ts: responseTs, user: "bot", text: responseText, attachments: [], isBot: true, isThread: true });
 		},
@@ -180,6 +242,10 @@ export function createHttpContext(opts: {
 		deleteMessage: async () => {
 			send({ type: "delete" });
 		},
+
+		//IYH1HC stream add
+		emitAgentEvent,
+		flushAgentEvents,
 	};
 }
 
@@ -209,6 +275,18 @@ export function createHttpContext(opts: {
  *   { type: "delete" }
  *   { type: "done",    stopReason: string }
  *   { type: "error",   message: string }
+ *
+ * IYH1HC stream add — structured trail events (only when the client POSTs structured:true;
+ * `delta`/`thread` are then suppressed, all other legacy events keep flowing):
+ *   { type: "turn",   seq, phase: "start"|"end", turnIndex, ts }
+ *   { type: "block",  seq, phase: "start"|"delta"|"end", blockId, kind: "text"|"thinking", delta?/content?, ts? }
+ *   { type: "tool",   seq, phase: "call"|"start"|"update"|"end", toolCallId, toolName, args?, label?,
+ *                     partialResult?, result?, resultTruncated?, isError?, durationMs?, ts? }
+ *   { type: "skill",  seq, name, path, toolCallId, ts }
+ *   { type: "usage",  seq, scope: "message"|"run", usage: {input,output,cacheRead,cacheWrite,cost}, contextTokens?, contextWindow? }
+ *   { type: "compaction", seq, phase: "start"|"end", reason?, tokensBefore?, aborted? }
+ *   { type: "retry",  seq, attempt, maxAttempts, errorMessage? }
+ * Full definitions: ./agent-events.ts; audit persistence: ./trail-store.ts (trail.jsonl).
  */
 export class HttpServer {
 	private port: number;
@@ -216,24 +294,30 @@ export class HttpServer {
 	private handler: BotHandler;
 	private workspaceStore: WorkspaceStore;
 	private sandboxConfig: SandboxConfig;
-	private features: { agentWorkers: boolean; reminders: boolean };
+	private features: { agentWorkers: boolean; reminders: boolean; connection: boolean; llmProviders: string[] | null; appTitle: string | null }; //IYH1HC add connection + llmProviders + appTitle
 	private auth: CoreServiceAuth;
 	private pendingAuthLogins = new Map<string, PendingAuthLogin>();
 	private sso: GithubSsoProvider | null; //IYH1HC add
 	private pendingAgentWorkerLogins = new Map<string, PendingAgentWorkerLogin>();
 	//IYH1HC add: returns the object-store mirror state, or undefined when ephemeral.
 	private getObjectStoreStatus?: () => unknown;
+	//IYH1HC add: gateway object store — fire-and-forget workspace snapshot on tree reads.
+	private objectStore?: ObjectStoreGateway;
 
-	constructor(config: { port: number; workingDir: string; handler: BotHandler; workspaceStore: WorkspaceStore; sandboxConfig: SandboxConfig; features?: { agentWorkers?: boolean; reminders?: boolean }; getObjectStoreStatus?: () => unknown }) {
+	constructor(config: { port: number; workingDir: string; handler: BotHandler; workspaceStore: WorkspaceStore; sandboxConfig: SandboxConfig; features?: { agentWorkers?: boolean; reminders?: boolean; connection?: boolean; llmProviders?: string[] | null; appTitle?: string | null }; getObjectStoreStatus?: () => unknown; objectStore?: ObjectStoreGateway }) {
 		this.port = config.port;
 		this.workingDir = config.workingDir;
 		this.handler = config.handler;
 		this.workspaceStore = config.workspaceStore;
 		this.sandboxConfig = config.sandboxConfig;
 		this.getObjectStoreStatus = config.getObjectStoreStatus; //IYH1HC add
+		this.objectStore = config.objectStore; //IYH1HC add
 		this.features = {
 			agentWorkers: config.features?.agentWorkers !== false,
 			reminders: config.features?.reminders !== false,
+			connection: config.features?.connection !== false, //IYH1HC add
+			llmProviders: config.features?.llmProviders ?? null, //IYH1HC add: null → all providers allowed
+			appTitle: config.features?.appTitle ?? null, //IYH1HC add: null → keep index.html default title
 		};
 		this.auth = new CoreServiceAuth(config.workingDir);
 		//IYH1HC add: build the SSO provider from env (null when SSO is disabled).
@@ -366,6 +450,12 @@ export class HttpServer {
 
 	private getUserId(req: express.Request, fallback?: string): string {
 		return String(req.user?.id || req.header("x-user-id") || req.query.userId || fallback || "web-user");
+	}
+
+	//IYH1HC add: resolve display name from the authenticated principal (reliable on BTP/XSUAA),
+	// falling back to client-supplied name only when no session user is present.
+	private getUserName(req: express.Request, fallback?: string): string {
+		return String(req.user?.displayName || req.user?.email || fallback || "user");
 	}
 
 	private getUserAuthFilePath(userId: string): string {
@@ -803,7 +893,7 @@ export class HttpServer {
 	}
 
 	private handleFeatures(res: express.Response): void {
-		res.json({ features: { agentWorkers: this.features.agentWorkers, reminders: this.features.reminders } });
+		res.json({ features: { agentWorkers: this.features.agentWorkers, reminders: this.features.reminders, connection: this.features.connection, llmProviders: this.features.llmProviders, appTitle: this.features.appTitle } }); //IYH1HC add connection + llmProviders + appTitle
 	}
 
 	private handleConnectors(req: express.Request, res: express.Response): void {
@@ -1859,12 +1949,17 @@ export class HttpServer {
 
 	private async handleChat(req: express.Request, res: express.Response, routeSessionId?: string): Promise<void> {
 		type AttachmentPayload = { fileName: string; mimeType: string; content: string };
-		const { channelId, sessionId: bodySessionId, workspaceId, text, userName = "user", attachments = [], model: modelSel } = req.body as {
+		//IYH1HC stream comment const { channelId, sessionId: bodySessionId, workspaceId, text, userName = "user", attachments = [], model: modelSel } = req.body as {
+		const { channelId, sessionId: bodySessionId, workspaceId, text, userName = "user", attachments = [], model: modelSel, structured = false } = req.body as {
 			channelId?: string; sessionId?: string; workspaceId?: string; text?: string; userName?: string; attachments?: AttachmentPayload[];
 			model?: { provider?: string; modelId?: string }; //IYH1HC add
+			structured?: boolean; //IYH1HC stream add: opt-in to the structured trail SSE protocol
 		};
 		const sessionId = routeSessionId || bodySessionId || channelId;
 		const userId = this.getUserId(req, userName);
+		//IYH1HC add: trust the authenticated principal for the display identity (BTP/XSUAA forwards it),
+		// not the client-supplied body userName which degrades to "user" behind edge auth.
+		const resolvedUserName = this.getUserName(req, userName);
 
 		//IYH1HC add: resolve the per-run model override (decrypt the user's key here).
 		let resolvedModel: BotContext["model"];
@@ -1895,16 +1990,50 @@ export class HttpServer {
 				// the user's full Azure URL (…/deployments/<dep>/chat/completions?api-version=…) is
 				// reduced to its deployment base here; the bosch-genai fetch adapter re-attaches the
 				// api-version query + api-key header at request time. The Responses API default
-				// ({endpoint}/responses) is not exposed by these gateways → 404. google/anthropic keep
-				// their defaults (generateContent / v1/messages).
+				// ({endpoint}/responses) is not exposed by these gateways → 404.
+				//IYH1HC add: google/anthropic ride the farm's Vertex publisher endpoint
+				// (api/google/v1/publishers/{pub}/models/{id}:{method}); the adapter splits the
+				// pasted URL into the SDK baseUrl + real model id and bridges auth/body at fetch
+				// time. Falls back to cm.name when the URL carries no model segment.
 				const isOpenAiBase = cm.baseProvider === "openai";
+				//IYH1HC comment: baseUrl: isOpenAiBase ? prepareBoschOpenAIEndpoint(cm.endpoint) : cm.endpoint,
+				//IYH1HC comment: modelId: cm.name, // placeholder; the gateway routes by endpoint
+				let baseUrl: string;
+				let modelId = cm.name;
+				if (isOpenAiBase) {
+					baseUrl = prepareBoschOpenAIEndpoint(cm.endpoint);
+				} else if (cm.baseProvider === "google") {
+					const g = prepareBoschGoogleEndpoint(cm.endpoint);
+					baseUrl = g.baseUrl;
+					modelId = g.modelId ?? cm.name;
+				} else {
+					const a = prepareBoschAnthropicEndpoint(cm.endpoint);
+					baseUrl = a.baseUrl;
+					modelId = a.modelId ?? cm.name;
+				}
 				resolvedModel = {
 					provider: cm.baseProvider,   // openai|google|anthropic → drives header/body format
-					modelId: cm.name,            // placeholder; the gateway routes by endpoint
+					modelId,
 					apiKey,
-					baseUrl: isOpenAiBase ? prepareBoschOpenAIEndpoint(cm.endpoint) : cm.endpoint,
+					baseUrl,
 					apiType: isOpenAiBase ? "openai-completions" : undefined,
 				};
+			}
+		}
+		//IYH1HC add: make the per-run model resolution visible in the server log so users
+		// can verify the picker selection drives the outbound call (model self-reports lie).
+		// A selection that cannot be resolved silently falls back to the default env model —
+		// surface that as a warning instead of leaving it invisible.
+		if (modelSel?.provider && modelSel?.modelId) {
+			if (resolvedModel) {
+				log.logInfo(
+					`[llm] run model: ${resolvedModel.provider}/${resolvedModel.modelId}` +
+					(resolvedModel.baseUrl ? ` @ ${resolvedModel.baseUrl}` : ""),
+				);
+			} else {
+				log.logWarning(
+					`[llm] model selection ${modelSel.provider}/${modelSel.modelId} could not be resolved; falling back to the default model`,
+				);
 			}
 		}
 
@@ -1924,9 +2053,17 @@ export class HttpServer {
 
 		res.writeHead(200, {
 			"Content-Type": "text/event-stream",
-			"Cache-Control": "no-cache",
+			//IYH1HC stream comment: was "Cache-Control": "no-cache",
+			//IYH1HC stream add: no-transform bypasses the approuter gzip on BTP — compression@1.7.4
+			// buffers SSE chunks until the run ends unless Cache-Control contains no-transform.
+			"Cache-Control": "no-cache, no-transform",
 			Connection: "keep-alive",
+			"X-Accel-Buffering": "no", //IYH1HC stream add: disable buffering in nginx-style proxies
 		});
+		//IYH1HC stream add: push headers + a first byte immediately so intermediaries commit to
+		// streaming and the client sees the connection open before the first real event.
+		res.flushHeaders();
+		res.write(":ok\n\n");
 
 		const send: SseEmitter = (event) => {
 			if (!res.writableEnded) res.write(`data: ${JSON.stringify(event)}\n\n`);
@@ -1950,7 +2087,7 @@ export class HttpServer {
 
 		const ctx = createHttpContext({
 			channelId: sessionId,
-			userName,
+			userName: resolvedUserName, //IYH1HC comment: was `userName` (body); now principal-derived
 			text,
 			ts,
 			send,
@@ -1959,23 +2096,26 @@ export class HttpServer {
 			userId,
 			authFilePath: this.getUserAuthFilePath(userId),
 			model: resolvedModel, //IYH1HC add
+			structured, //IYH1HC stream add
 		});
 
 		appendFileSync(
 			join(channelDir, "log.jsonl"),
-			`${JSON.stringify({ date: new Date().toISOString(), ts, user: userId, userName, text, attachments: savedAttachments, isBot: false })}\n`,
+			`${JSON.stringify({ date: new Date().toISOString(), ts, user: userId, userName: resolvedUserName, text, attachments: savedAttachments, isBot: false })}\n`,
 		);
 
 		log.logInfo(`[${sessionId}] HTTP: Starting run: ${text.substring(0, 50)}`);
 
 		try {
 			await this.handler.handleEvent(sessionId, ctx);
+			ctx.flushAgentEvents?.(); //IYH1HC stream add: drain buffered deltas before done
 			send({ type: "done" });
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			log.logWarning(`[${sessionId}] HTTP run error`, msg);
 			send({ type: "error", message: msg });
 		} finally {
+			ctx.flushAgentEvents?.(); //IYH1HC stream add: abort path — no dangling flush timer
 			res.end();
 		}
 	}
@@ -2121,6 +2261,12 @@ export class HttpServer {
 			res.status(403).json({ error: err instanceof Error ? err.message : String(err) });
 			return;
 		}
+		//IYH1HC add: durability tick — the UI hits this on the workspace refresh button (and
+		//IYH1HC add: on session load/switch); flush this workspace's subtree to the object
+		//IYH1HC add: store. Fire-and-forget so the response is never delayed; snapshot()
+		//IYH1HC add: serializes internally and mtime-dedups, so repeated calls are cheap.
+		void this.objectStore?.snapshot({ workspaceId: session.workspaceId, sessionId: channelId })
+			.catch((err) => log.logWarning("[object-store] workspace snapshot error", err instanceof Error ? err.message : String(err)));
 		const workspaceRoot = this.workspaceStore.getWorkspaceRoot(session.workspaceId);
 		const artifactsRoot = join(workspaceRoot, "artifacts");
 		const workspaceSkillsRoot = join(workspaceRoot, "skills");
@@ -2158,7 +2304,34 @@ export class HttpServer {
 
 	private handleMessages(req: express.Request, channelId: string, res: express.Response): void {
 		type ContextEntry = { type: string; timestamp?: string; message?: Record<string, any> };
-		type ChatMessage = { role: "user" | "assistant"; text: string; attachments?: string[]; thread?: string; files?: Array<{ path: string; title?: string }> };
+		//IYH1HC stream add: structured replay block — mirrors the live StreamBlock model so a
+		// page reload reconstructs the same trail. Additive: legacy text/thread/files remain.
+		type ReplayBlock =
+			| { kind: "thinking"; content: string }
+			| { kind: "text"; content: string }
+			| {
+				kind: "tool";
+				toolCallId: string;
+				toolName: string;
+				label?: string;
+				args: Record<string, any>;
+				result?: string;
+				resultTruncated?: boolean;
+				isError?: boolean;
+				durationMs?: number;
+				skill?: { name: string; path: string };
+			};
+		//IYH1HC stream comment type ChatMessage = { role: "user" | "assistant"; text: string; attachments?: string[]; thread?: string; files?: Array<{ path: string; title?: string }> };
+		type ChatMessage = {
+			role: "user" | "assistant";
+			text: string;
+			attachments?: string[];
+			thread?: string;
+			files?: Array<{ path: string; title?: string }>;
+			blocks?: ReplayBlock[]; //IYH1HC stream add
+			usage?: AgentUsage; //IYH1HC stream add
+			model?: string; //IYH1HC stream add: "provider/id" of the last model that served the turn
+		};
 
 		const formatArgs = (args: Record<string, any>): string => {
 			const lines: string[] = [];
@@ -2189,6 +2362,17 @@ export class HttpServer {
 		const contextFile = join(workspaceRoot, "sessions", channelId, "context.jsonl");
 		const messages: ChatMessage[] = [];
 
+		//IYH1HC stream add: enrich replay with audit-trail facts keyed by toolCallId —
+		// exact durations and skill invocations only exist in trail.jsonl (context.jsonl
+		// carries neither, and is rewritten on compaction while the trail is append-only).
+		const trailDurations = new Map<string, number>();
+		const trailSkills = new Map<string, { name: string; path: string }>();
+		for (const record of readTrail(join(workspaceRoot, "sessions", channelId))) {
+			const ev = record.event;
+			if (ev.type === "tool" && ev.phase === "end") trailDurations.set(ev.toolCallId, ev.durationMs);
+			else if (ev.type === "skill") trailSkills.set(ev.toolCallId, { name: ev.name, path: ev.path });
+		}
+
 		if (existsSync(contextFile)) {
 			try {
 				const lines = readFileSync(contextFile, "utf-8").trim().split("\n").filter(Boolean);
@@ -2199,7 +2383,8 @@ export class HttpServer {
 
 				type ToolCall = { id: string; name: string; label?: string; args: Record<string, any> };
 				type ToolResult = { toolCallId: string; toolName: string; text: string; isError: boolean };
-				type Turn = { userText: string; attachments: string[]; toolCalls: ToolCall[]; toolResults: ToolResult[]; assistantTexts: string[] };
+				//IYH1HC stream comment type Turn = { userText: string; attachments: string[]; toolCalls: ToolCall[]; toolResults: ToolResult[]; assistantTexts: string[] };
+				type Turn = { userText: string; attachments: string[]; toolCalls: ToolCall[]; toolResults: ToolResult[]; assistantTexts: string[]; blocks: ReplayBlock[]; usage?: AgentUsage; model?: string }; //IYH1HC stream add
 				const normalizeAttachedFilePath = (rawPath: string): string => {
 					const dockerWorkspacePrefix = `/workspace/workspaces/${session.workspaceId}/`;
 					if (rawPath === `/workspace/workspaces/${session.workspaceId}`) return workspaceRoot;
@@ -2234,15 +2419,52 @@ export class HttpServer {
 						const textPart = (msg.content as any[])?.find((c: any) => c.type === "text");
 						if (!textPart?.text) continue;
 						const { text: cleanText, attachments } = extractAttachments(stripPrefix(textPart.text));
-						turns.push({ userText: cleanText, attachments, toolCalls: [], toolResults: [], assistantTexts: [] });
+						//IYH1HC stream comment turns.push({ userText: cleanText, attachments, toolCalls: [], toolResults: [], assistantTexts: [] });
+						turns.push({ userText: cleanText, attachments, toolCalls: [], toolResults: [], assistantTexts: [], blocks: [] }); //IYH1HC stream add
 					} else if (msg.role === "assistant") {
 						if (turns.length === 0) continue;
 						const turn = turns[turns.length - 1];
 						for (const part of (msg.content as any[]) || []) {
 							if (part.type === "toolCall") {
 								turn.toolCalls.push({ id: part.id, name: part.name, label: part.arguments?.label, args: part.arguments ?? {} });
+								//IYH1HC stream add: ordered structured block (result joined below)
+								turn.blocks.push({
+									kind: "tool",
+									toolCallId: part.id,
+									toolName: part.name,
+									label: part.arguments?.label,
+									args: part.arguments ?? {},
+									durationMs: trailDurations.get(part.id),
+									skill: trailSkills.get(part.id),
+								});
 							} else if (part.type === "text" && part.text?.trim()) {
 								turn.assistantTexts.push(part.text.trim());
+								turn.blocks.push({ kind: "text", content: part.text.trim() }); //IYH1HC stream add
+							//IYH1HC stream add: thinking parts were previously dropped from replay
+							} else if (part.type === "thinking" && part.thinking?.trim()) {
+								turn.blocks.push({ kind: "thinking", content: part.thinking.trim() });
+							}
+						}
+						//IYH1HC stream add: remember which model served the turn (last one wins)
+						if (msg.model) {
+							turn.model = msg.provider ? `${msg.provider}/${msg.responseModel || msg.model}` : String(msg.responseModel || msg.model);
+						}
+						//IYH1HC stream add: accumulate authoritative usage per turn
+						if (msg.usage) {
+							const u = msg.usage as AgentUsage;
+							if (!turn.usage) {
+								turn.usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+							}
+							turn.usage.input += u.input ?? 0;
+							turn.usage.output += u.output ?? 0;
+							turn.usage.cacheRead += u.cacheRead ?? 0;
+							turn.usage.cacheWrite += u.cacheWrite ?? 0;
+							if (u.cost) {
+								turn.usage.cost.input += u.cost.input ?? 0;
+								turn.usage.cost.output += u.cost.output ?? 0;
+								turn.usage.cost.cacheRead += u.cost.cacheRead ?? 0;
+								turn.usage.cost.cacheWrite += u.cost.cacheWrite ?? 0;
+								turn.usage.cost.total += u.cost.total ?? 0;
 							}
 						}
 					} else if (msg.role === "toolResult") {
@@ -2250,6 +2472,16 @@ export class HttpServer {
 						const turn = turns[turns.length - 1];
 						const text = (msg.content as any[])?.find((c: any) => c.type === "text")?.text ?? "";
 						turn.toolResults.push({ toolCallId: msg.toolCallId, toolName: msg.toolName, text, isError: msg.isError });
+						//IYH1HC stream add: join result into the matching structured tool block
+						const toolBlock = turn.blocks.find(
+							(b) => b.kind === "tool" && b.toolCallId === msg.toolCallId && b.result === undefined,
+						) as Extract<ReplayBlock, { kind: "tool" }> | undefined;
+						if (toolBlock) {
+							const { text: truncatedResult, truncated } = truncateToolResult(text);
+							toolBlock.result = truncatedResult;
+							toolBlock.resultTruncated = truncated;
+							toolBlock.isError = msg.isError;
+						}
 					}
 				}
 
@@ -2280,8 +2512,20 @@ export class HttpServer {
 					}
 
 					const thread = threadParts.length > 0 ? threadParts.join("\n\n") : undefined;
-					if (mainText || thread) {
-						messages.push({ role: "assistant", text: mainText, thread, files: files.length > 0 ? files : undefined });
+					//IYH1HC stream comment if (mainText || thread) {
+					//IYH1HC stream comment 	messages.push({ role: "assistant", text: mainText, thread, files: files.length > 0 ? files : undefined });
+					//IYH1HC stream comment }
+					//IYH1HC stream add: also emit assistant turns that only carry structured blocks
+					if (mainText || thread || turn.blocks.length > 0) {
+						messages.push({
+							role: "assistant",
+							text: mainText,
+							thread,
+							files: files.length > 0 ? files : undefined,
+							blocks: turn.blocks.length > 0 ? turn.blocks : undefined,
+							usage: turn.usage,
+							model: turn.model, //IYH1HC stream add
+						});
 					}
 				}
 			} catch { /* unreadable file */ }

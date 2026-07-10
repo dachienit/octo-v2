@@ -133,7 +133,7 @@ export class CoreServiceAuth {
 	}
 
 	//IYH1HC comment: requireAuth was synchronous (opaque token only); it is now async to
-	//IYH1HC comment: validate a forwarded XSUAA JWT first when OCTO_EDGE_AUTH=xsuaa.
+	//IYH1HC comment: validate a forwarded XSUAA JWT first when MIRATI_STUDIO_EDGE_AUTH=xsuaa.
 	async requireAuth(req: express.Request, res: express.Response, next: express.NextFunction): Promise<void> {
 		const token = this.extractBearerToken(req);
 		if (!token) {

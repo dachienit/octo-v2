@@ -116,7 +116,13 @@ export class MessageEditor extends LitElement {
 	private handleKeyDown = (e: KeyboardEvent) => {
 		if (e.key === "Enter" && !e.shiftKey) {
 			e.preventDefault();
-			if (!this.isStreaming && !this.processingFiles && (this.value.trim() || this.attachments.length > 0)) {
+			//IYH1HC add: block Enter-to-send while quick selector has no model picked (None)
+			if (
+				!this.isStreaming &&
+				!this.processingFiles &&
+				(this.value.trim() || this.attachments.length > 0) &&
+				(!this.useQuickSelector || this.selectedModelValue)
+			) {
 				this.handleSend();
 			}
 		} else if (e.key === "Escape" && this.isStreaming) {
@@ -306,7 +312,7 @@ export class MessageEditor extends LitElement {
 	//IYH1HC add: combined model + reasoning trigger button (corp quick selector).
 	private renderQuickSelector() {
 		const selected = this.quickModels.find((m) => m.value === this.selectedModelValue);
-		const modelLabel = selected?.label ?? i18n("Default");
+		const modelLabel = selected?.label ?? i18n("None"); //IYH1HC comment: was i18n("Default")
 		const levelLabel = REASONING_LEVELS.find((l) => l.value === String(this.thinkingLevel))?.label ?? "Off";
 		return html`
 			<div class="relative" ${ref(this.quickAnchorRef)}>
@@ -356,7 +362,7 @@ export class MessageEditor extends LitElement {
 	// flyout) to avoid overlapping the chat area.
 	private renderQuickMenuContent() {
 		const selected = this.quickModels.find((m) => m.value === this.selectedModelValue);
-		const modelLabel = selected?.label ?? i18n("Default");
+		const modelLabel = selected?.label ?? i18n("None"); //IYH1HC comment: was i18n("Default")
 		const closeMenu = () => {
 			this.quickMenuOpen = false;
 			this.quickSubmenuOpen = false;
@@ -413,7 +419,7 @@ export class MessageEditor extends LitElement {
 								class="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-accent ${this.selectedModelValue === "" ? "text-accent-foreground" : ""}"
 								@click=${() => pickModel("")}
 							>
-								<span class="flex-1">${i18n("Default")}</span>
+								<span class="flex-1">${i18n("None")}</span>
 								${this.selectedModelValue === "" ? icon(Check, "sm") : ""}
 							</button>
 							${this.quickModels.map((m) => {
@@ -592,7 +598,7 @@ export class MessageEditor extends LitElement {
 										<button
 											type="button"
 											class="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
-											?disabled=${(!this.value.trim() && this.attachments.length === 0) || this.processingFiles}
+											?disabled=${(!this.value.trim() && this.attachments.length === 0) || this.processingFiles || !this.selectedModelValue}
 											@click=${this.handleSend}
 											title=${i18n("Send")}
 										>

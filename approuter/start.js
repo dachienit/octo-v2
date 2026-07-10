@@ -1,6 +1,6 @@
 "use strict";
 
-// Octo approuter entry point.
+// Mirati Studio approuter entry point.
 //
 // Wraps the standard @sap/approuter and mounts the SAP ADT smart-proxy (see
 // lib/adt-proxy.js) ahead of the approuter's own request handling. The proxy is

@@ -41,7 +41,7 @@ let codexLoginUrl = "";
 let codexLoginCode = "";
 let codexAuthError = "";
 let codexAuthBusy = false;
-let serviceFeatures: CoreServiceFeatures = { agentWorkers: true, reminders: true };
+let serviceFeatures: CoreServiceFeatures = { agentWorkers: true, reminders: true, connection: true, llmProviders: null, appTitle: null }; //IYH1HC add connection + llmProviders + appTitle
 //IYH1HC add: per-user LLM key + model selection state for the provider dialog.
 let llmConfig: LlmConfig = { providers: [] };
 let llmConfigLoading = false;
@@ -53,6 +53,8 @@ let modelFilter = ""; //IYH1HC add: model list search box
 let apiKeysExpanded = false; //IYH1HC add: collapsible "API Keys" section state
 //IYH1HC add: Bosch GenAI (custom models) state for the provider dialog.
 let boschModels: CustomModelConfig[] = [];
+//IYH1HC add: per-model collapse state for Bosch GenAI blocks (keyed by model.id). Default collapsed.
+let boschExpanded: Record<string, boolean> = {};
 let boschLoading = false;
 let boschSaving = false;
 let boschError = "";
@@ -130,6 +132,7 @@ const chatPanel = new CoreServiceChatPanel();
 chatPanel.baseUrl = baseUrl;
 chatPanel.channelId = channelId;
 chatPanel.userName = userName;
+chatPanel.agentName = "Mirati"; //IYH1HC add: brand name shown next to assistant messages
 chatPanel.authToken = authToken;
 chatPanel.addEventListener("file-preview-open", () => {
 	if (workspaceOpen && sidebarOpen) {
@@ -188,6 +191,11 @@ function applyAppTheme() {
 function setAppTheme(theme: AppTheme) {
 	localStorage.setItem("theme", theme);
 	applyAppTheme();
+}
+
+//IYH1HC add: apply the configurable browser tab title from service features (falls back to index.html default).
+function applyAppTitle() {
+	if (serviceFeatures.appTitle) document.title = serviceFeatures.appTitle;
 }
 
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
@@ -484,6 +492,7 @@ async function initializeAuth() {
 	chatPanel.userName = userName;
 	chatPanel.authToken = authToken;
 	serviceFeatures = await client.getFeatures();
+	applyAppTitle(); //IYH1HC add
 	await loadWorkspaces();
 }
 
@@ -502,6 +511,7 @@ async function submitAuth(event: Event) {
 		chatPanel.userName = userName;
 		chatPanel.authToken = authToken;
 		serviceFeatures = await client.getFeatures();
+		applyAppTitle(); //IYH1HC add
 		await loadWorkspaces();
 	} catch (err) {
 		authError = err instanceof Error ? err.message : String(err);
@@ -2147,7 +2157,7 @@ function renderCreateWorkspaceDialog() {
 
 function renderProviderDialog() {
 	if (!providerDialogOpen) return "";
-	const providers = [
+	const allProviders = [
 		{ id: "bosch-genai", label: "Bosch GenAI" }, //IYH1HC add: custom LLM Farm models (first option)
 		{ id: "openai-codex", label: "Codex" },
 		{ id: "openai", label: "OpenAI" },
@@ -2156,14 +2166,22 @@ function renderProviderDialog() {
 		{ id: "sap-openai", label: "SAP OpenAI" },
 		{ id: "sap-claude", label: "SAP Claude" },
 	];
+	//IYH1HC add: gate the picker by the service allowlist. null → all providers; otherwise keep configured order.
+	const allowedProviders = serviceFeatures.llmProviders;
+	const providers = allowedProviders ? allProviders.filter((p) => allowedProviders.includes(p.id)) : allProviders;
+	//IYH1HC add: if the persisted selection was filtered out, fall back to the first allowed provider.
+	if (providers.length > 0 && !providers.some((p) => p.id === selectedProvider)) {
+		selectedProvider = providers[0]!.id;
+		localStorage.setItem(providerKey, selectedProvider);
+	}
 	return html`
 		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4" @click=${closeProviderDialog}>
-			<div class="w-full max-w-md rounded border border-border bg-background shadow-xl" @click=${(e: Event) => e.stopPropagation()}>
+			<div class="w-full max-w-2xl rounded border border-border bg-background shadow-xl" @click=${(e: Event) => e.stopPropagation()}>
 				<div class="flex items-center justify-between border-b border-border px-4 py-3">
 					<div class="text-sm font-semibold">LLM provider</div>
 					${Ui5Button({ className: "corp-tight-icon-button", ui5Icon: "decline", onClick: closeProviderDialog, title: "Close" })}
 				</div>
-				<div class="flex flex-col gap-4 p-4">
+				<div class="flex max-h-[70vh] flex-col gap-4 overflow-y-auto p-4">
 					<label class="flex flex-col gap-1">
 						<span class="text-xs font-medium text-muted-foreground">Provider</span>
 						<ui5-select
@@ -2275,7 +2293,7 @@ function renderBoschGenAIConfig() {
 					</ui5-select>
 					<ui5-input
 						class="corp-ui5-input"
-						placeholder="Endpoint (https://...)"
+						placeholder="Endpoint (full model URL from LLM Farm docs)"
 						value=${boschDraft.endpoint}
 						?disabled=${boschSaving}
 						@input=${(e: Event) => { boschDraft.endpoint = getUi5Value(e); }}
@@ -2307,19 +2325,20 @@ function renderBoschGenAIConfig() {
 //IYH1HC add: one editable custom-model block. Fields auto-save on change; the API key
 // field is blank (placeholder only) and only sent when the user types a replacement.
 function renderBoschModelBlock(model: CustomModelConfig) {
+	const open = boschExpanded[model.id] === true; //IYH1HC add: default collapsed
 	return html`
 		<div class="rounded-lg border border-border bg-card">
 			<div class="flex items-center gap-2 px-3 py-2">
-				<span class="min-w-0 flex-1 truncate text-sm font-medium">${model.name}</span>
-				<ui5-button
-					class="corp-tight-icon-button"
-					design="Transparent"
-					icon="delete"
-					?disabled=${boschSaving}
-					title="Delete"
-					@click=${() => void deleteBoschModel(model.id)}
-				></ui5-button>
+				<button
+					type="button"
+					class="flex min-w-0 flex-1 items-center gap-2 text-left hover:opacity-80"
+					@click=${() => { boschExpanded[model.id] = !open; renderApp(); }}
+				>
+					${icon(open ? ChevronDown : ChevronRight, "xs")}
+					<span class="min-w-0 flex-1 truncate text-sm font-medium">${model.name}</span>
+				</button>
 			</div>
+			${open ? html`
 			<div class="flex flex-col gap-2 border-t border-border px-3 py-3">
 				<ui5-input
 					class="corp-ui5-input"
@@ -2337,7 +2356,7 @@ function renderBoschModelBlock(model: CustomModelConfig) {
 				</ui5-select>
 				<ui5-input
 					class="corp-ui5-input"
-					placeholder="Endpoint (https://...)"
+					placeholder="Endpoint (full model URL from LLM Farm docs)"
 					value=${model.endpoint}
 					?disabled=${boschSaving}
 					@change=${(e: Event) => { const v = getUi5Value(e); if (v.trim() && v.trim() !== model.endpoint) void updateBoschModel(model, { endpoint: v.trim() }); }}
@@ -2349,7 +2368,17 @@ function renderBoschModelBlock(model: CustomModelConfig) {
 					?disabled=${boschSaving}
 					@change=${(e: Event) => { const v = getUi5Value(e); if (v.trim()) void updateBoschModel(model, { apiKey: v.trim() }); }}
 				></ui5-input>
+				<ui5-button
+					class="corp-ui5-button corp-wide-button"
+					design="Negative"
+					icon="delete"
+					?disabled=${boschSaving}
+					@click=${() => { if (confirm(`Remove model "${model.name}"? This deletes it permanently.`)) void deleteBoschModel(model.id); }}
+				>
+					Remove
+				</ui5-button>
 			</div>
+			` : ""}
 		</div>
 	`;
 }
@@ -2530,9 +2559,15 @@ function renderWorkspaceSettingsDialog() {
 	if (!serviceFeatures.agentWorkers && workspaceSettingsTab === "workers") {
 		workspaceSettingsTab = "agent";
 	}
+	//IYH1HC add: when the Connection feature is disabled, the tab is hidden — bounce to Agent.
+	if (!serviceFeatures.connection && workspaceSettingsTab === "connection") {
+		workspaceSettingsTab = "agent";
+	}
 	const sap = workspaceSettings.sapConnection ?? {};
 	const promptFile = workspaceSettings.agent?.promptFile ?? "AGENTS.md";
-	const tabColumns = serviceFeatures.agentWorkers ? "grid-cols-4" : "grid-cols-3";
+	//IYH1HC add: Agent + Sandbox always show; Connection and Workers are gated by feature flags.
+	const visibleTabs = 2 + (serviceFeatures.connection ? 1 : 0) + (serviceFeatures.agentWorkers ? 1 : 0);
+	const tabColumns = visibleTabs >= 4 ? "grid-cols-4" : visibleTabs === 3 ? "grid-cols-3" : "grid-cols-2";
 	return html`
 		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4" @click=${closeWorkspaceSettingsDialog}>
 			<form class="w-full max-w-2xl rounded border border-border bg-background shadow-xl" @submit=${saveWorkspaceSettings} @click=${(e: Event) => e.stopPropagation()}>
@@ -2549,13 +2584,15 @@ function renderWorkspaceSettingsDialog() {
 						>
 							Agent
 						</ui5-button>
-						<ui5-button
-							class="corp-ui5-button corp-tab-button"
-							design=${workspaceSettingsTab === "connection" ? "Emphasized" : "Transparent"}
-							@click=${() => { workspaceSettingsTab = "connection"; if (sapConnMode === "local") { if (!sapLocalSystemsLoaded) void loadLocalSystems(); } else if (!sapDestinationsLoaded) { void loadSapDestinations(); } renderApp(); }}
-						>
-							Connection
-						</ui5-button>
+						${serviceFeatures.connection ? html`
+							<ui5-button
+								class="corp-ui5-button corp-tab-button"
+								design=${workspaceSettingsTab === "connection" ? "Emphasized" : "Transparent"}
+								@click=${() => { workspaceSettingsTab = "connection"; if (sapConnMode === "local") { if (!sapLocalSystemsLoaded) void loadLocalSystems(); } else if (!sapDestinationsLoaded) { void loadSapDestinations(); } renderApp(); }}
+							>
+								Connection
+							</ui5-button>
+						` : ""}
 						${serviceFeatures.agentWorkers ? html`
 							<ui5-button
 								class="corp-ui5-button corp-tab-button"
@@ -2719,7 +2756,7 @@ function renderApp() {
 							onClick: toggleSidebar,
 							title: sidebarOpen ? "Collapse sessions" : "Expand sessions",
 						})}
-						<span class="corp-app-title text-base font-semibold text-foreground">Bot Chat</span>
+						<span class="corp-app-title text-base font-semibold text-foreground">Mirati Studio</span>
 					</div>
 					<div class="flex items-center gap-2">
 						${Ui5Button({

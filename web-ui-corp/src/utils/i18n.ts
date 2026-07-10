@@ -210,6 +210,7 @@ declare module "@mariozechner/mini-lit" {
 		Reasoning: string;
 		Model: string;
 		Default: string;
+		None: string; //IYH1HC add
 		Send: string;
 	}
 }
@@ -438,6 +439,7 @@ export const translations = {
 		Reasoning: "Reasoning", // IYH1HC add
 		Model: "Model", // IYH1HC add
 		Default: "Default", // IYH1HC add
+		None: "None", // IYH1HC add
 		Send: "Send", // IYH1HC add
 	},
 	de: {
@@ -663,6 +665,7 @@ export const translations = {
 		Reasoning: "Reasoning", // IYH1HC add
 		Model: "Modell", // IYH1HC add
 		Default: "Standard", // IYH1HC add
+		None: "Keine", // IYH1HC add
 		Send: "Senden", // IYH1HC add
 	},
 };

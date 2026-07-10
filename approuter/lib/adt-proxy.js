@@ -1,9 +1,9 @@
 "use strict";
 
-// SAP ADT smart-proxy for the Octo approuter (principal propagation).
+// SAP ADT smart-proxy for the Mirati Studio approuter (principal propagation).
 //
 // Mounted on the approuter at `/adt-proxy` (see ../start.js). It is the cloud
-// half of the on-prem reach: adt-cli (running inside octo-srv) sends plain
+// half of the on-prem reach: adt-cli (running inside mirati-srv) sends plain
 // `/sap/bc/adt/*` calls here carrying only `Authorization: Bearer <userJwt>`;
 // this handler resolves the named BTP destination with that user JWT and lets
 // the SAP Cloud SDK tunnel the request through the connectivity proxy with a

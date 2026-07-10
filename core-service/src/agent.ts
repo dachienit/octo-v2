@@ -15,6 +15,7 @@ import { join } from "path";
 import * as log from "./log.js";
 import type { BotContext, ChannelInfo, UserInfo } from "./types.js";
 import type { ChannelStore } from "./store.js";
+import { detectSkillFromToolCall } from "./agent-events.js"; //IYH1HC stream add
 
 export interface PendingMessage {
 	userName: string;
@@ -201,18 +202,18 @@ Maximum 5 events can be queued. Don't create excessive immediate or periodic eve
 `
 		: "";
 
-	return `You are mom, a Slack bot assistant. Be concise. No emojis.
+	return `You are Mirati Agent, a Teams bot assistant. Be concise. No emojis.
 
 ## Context
 - For current date/time, use: date
 - You have access to previous conversation context including tool results from prior turns.
 - For older history beyond your context, search log.jsonl (contains user messages and your final responses, but not tool results).
 
-## Slack Formatting (mrkdwn, NOT Markdown)
+## Teams Formatting (mrkdwn, NOT Markdown)
 Bold: *text*, Italic: _text_, Code: \`code\`, Block: \`\`\`code\`\`\`, Links: <url|text>
 Do NOT use **double asterisks** or [markdown](links).
 
-## Slack IDs
+## Teams IDs
 Channels: ${channelMappings}
 
 Users: ${userMappings}
@@ -334,7 +335,7 @@ grep '"userName":"mario"' log.jsonl | tail -20 | jq -c '{date: .date[0:19], text
 - read: Read files
 - write: Create/overwrite files
 - edit: Surgical file edits
-- attach: Share files to Web or Slack
+- attach: Share files to Web or Teams
 
 Each tool requires a "label" parameter (shown to user).
 `;
@@ -436,17 +437,56 @@ function createRunner(
 				}
 			};
 
+			//IYH1HC stream add: structured trail emitter — set only by the HTTP transport when
+			// the client opted in. When present, agent activity is forwarded as typed events
+			// (seq is assigned downstream by the HTTP context) and the legacy Slack-markdown
+			// flattening below is skipped. Slack never sets it, so its path is unchanged.
+			const emit = ctx.emitAgentEvent;
+			let turnIndex = -1; //IYH1HC stream add
+			let lastModel: { provider: string; id: string } | undefined; //IYH1HC stream add: for the run-scope usage event
+
 			const events: CoreAgentEventHandlers = {
-				onToolStart(toolName, label, args) {
+				//IYH1HC stream comment onToolStart(toolName, label, args) {
+				onToolStart(toolName, label, args, toolCallId) {
 					log.logToolStart(logCtx, toolName, label, args);
+					//IYH1HC stream add
+					if (emit) {
+						emit({ type: "tool", seq: 0, phase: "start", toolCallId: toolCallId ?? "", toolName, label, args, ts: Date.now() });
+						const skill = detectSkillFromToolCall(toolName, args);
+						if (skill) {
+							emit({ type: "skill", seq: 0, name: skill.name, path: skill.path, toolCallId: toolCallId ?? "", ts: Date.now() });
+						}
+						return;
+					}
 					enqueue(() => ctx.respond(`_→ ${label}_`, false), "tool label");
 				},
 
-				onToolEnd(toolName, label, args, durationMs, resultText, isError) {
+				//IYH1HC stream comment onToolEnd(toolName, label, args, durationMs, resultText, isError) {
+				onToolEnd(toolName, label, args, durationMs, resultText, isError, toolCallId) {
 					if (isError) {
 						log.logToolError(logCtx, toolName, durationMs, resultText);
 					} else {
 						log.logToolSuccess(logCtx, toolName, durationMs, resultText);
+					}
+
+					//IYH1HC stream add: full result goes out here; the HTTP context truncates the
+					// SSE copy while the trail store keeps the complete text for audit.
+					if (emit) {
+						emit({
+							type: "tool",
+							seq: 0,
+							phase: "end",
+							toolCallId: toolCallId ?? "",
+							toolName,
+							label,
+							args,
+							durationMs,
+							result: resultText,
+							resultTruncated: false,
+							isError,
+							ts: Date.now(),
+						});
+						return;
 					}
 
 					const argsFormatted = formatToolArgsForSlack(toolName, args);
@@ -464,9 +504,15 @@ function createRunner(
 					}
 				},
 
-				onToolUpdate(toolName, label, args, resultText) {
+				//IYH1HC stream comment onToolUpdate(toolName, label, args, resultText) {
+				onToolUpdate(toolName, label, args, resultText, toolCallId) {
 					if (!resultText.trim()) return;
 					log.logInfo(`[${channelId}] ${toolName} update: ${truncate(resultText, 200)}`);
+					//IYH1HC stream add
+					if (emit) {
+						emit({ type: "tool", seq: 0, phase: "update", toolCallId: toolCallId ?? "", toolName, partialResult: resultText });
+						return;
+					}
 					const argsFormatted = formatToolArgsForSlack(toolName, args);
 					let threadMessage = `*… ${toolName}*`;
 					if (label) threadMessage += `: ${label}`;
@@ -478,18 +524,27 @@ function createRunner(
 
 				onMessage(text) {
 					log.logResponse(logCtx, text);
+					//IYH1HC stream add: content already streamed token-by-token as block events
+					if (emit) return;
 					enqueueMessage(text, "main", "response main");
 					enqueueMessage(text, "thread", "response thread", false);
 				},
 
 				onThinking(thinking) {
 					log.logThinking(logCtx, thinking);
+					//IYH1HC stream add: thinking already streamed as block events
+					if (emit) return;
 					enqueueMessage(`_${thinking}_`, "main", "thinking main");
 					enqueueMessage(`_${thinking}_`, "thread", "thinking thread", false);
 				},
 
 				onCompactionStart(reason) {
 					log.logInfo(`Auto-compaction started (reason: ${reason})`);
+					//IYH1HC stream add
+					if (emit) {
+						emit({ type: "compaction", seq: 0, phase: "start", reason });
+						return;
+					}
 					enqueue(() => ctx.respond("_Compacting context..._", false), "compaction start");
 				},
 
@@ -499,14 +554,50 @@ function createRunner(
 					} else if (aborted) {
 						log.logInfo("Auto-compaction aborted");
 					}
+					//IYH1HC stream add
+					emit?.({ type: "compaction", seq: 0, phase: "end", tokensBefore: result?.tokensBefore, aborted });
 				},
 
 				onRetry(attempt, maxAttempts, errorMessage) {
 					log.logWarning(`Retrying (${attempt}/${maxAttempts})`, errorMessage);
+					//IYH1HC stream add
+					if (emit) {
+						emit({ type: "retry", seq: 0, attempt, maxAttempts, errorMessage });
+						return;
+					}
 					enqueue(
 						() => ctx.respond(`_Retrying (${attempt}/${maxAttempts})..._`, false),
 						"retry",
 					);
+				},
+
+				//IYH1HC stream add: token-level structured handlers — inert without emit.
+				onTurnStart() {
+					if (!emit) return;
+					turnIndex++;
+					emit({ type: "turn", seq: 0, phase: "start", turnIndex, ts: Date.now() });
+				},
+				onTurnEnd() {
+					emit?.({ type: "turn", seq: 0, phase: "end", turnIndex: Math.max(turnIndex, 0), ts: Date.now() });
+				},
+				onBlockStart(blockId, kind) {
+					emit?.({ type: "block", seq: 0, phase: "start", blockId, kind, ts: Date.now() });
+				},
+				onBlockDelta(blockId, kind, delta) {
+					emit?.({ type: "block", seq: 0, phase: "delta", blockId, kind, delta });
+				},
+				onBlockEnd(blockId, kind, content) {
+					emit?.({ type: "block", seq: 0, phase: "end", blockId, kind, content });
+				},
+				onToolCall(toolCallId, toolName, args) {
+					emit?.({ type: "tool", seq: 0, phase: "call", toolCallId, toolName, args, ts: Date.now() });
+				},
+				//IYH1HC stream comment onUsage(usage) {
+				//IYH1HC stream comment 	emit?.({ type: "usage", seq: 0, scope: "message", usage });
+				//IYH1HC stream comment },
+				onUsage(usage, _stopReason, model) {
+					if (model?.id) lastModel = model;
+					emit?.({ type: "usage", seq: 0, scope: "message", usage, model });
 				},
 			};
 
@@ -579,6 +670,31 @@ function createRunner(
 				}
 			}
 
+			//IYH1HC stream add: final run usage for the structured trail — emitted regardless of
+			// the cost>0 gate below (custom gateways often report zero cost but real tokens).
+			if (emit) {
+				const messages = coreAgent.messages;
+				const lastAssistant = messages
+					.slice()
+					.reverse()
+					.find((m) => m.role === "assistant" && (m as any).stopReason !== "aborted") as any;
+				const contextTokens = lastAssistant
+					? lastAssistant.usage.input +
+						lastAssistant.usage.output +
+						lastAssistant.usage.cacheRead +
+						lastAssistant.usage.cacheWrite
+					: 0;
+				emit({
+					type: "usage",
+					seq: 0,
+					scope: "run",
+					usage: result.usage,
+					model: lastModel, //IYH1HC stream add
+					contextTokens,
+					contextWindow: coreAgent.modelContextWindow,
+				});
+			}
+
 			// Post usage summary
 			if (result.usage.cost.total > 0) {
 				// Derive context size from last assistant message
@@ -597,8 +713,12 @@ function createRunner(
 				const contextWindow = coreAgent.modelContextWindow;
 
 				const summary = log.logUsageSummary(logCtx, result.usage, contextTokens, contextWindow);
-				enqueue(() => ctx.respondInThread(summary), "usage summary");
-				await queueChain;
+				//IYH1HC stream comment enqueue(() => ctx.respondInThread(summary), "usage summary");
+				//IYH1HC stream add: structured clients get the usage scope:"run" event instead
+				if (!emit) {
+					enqueue(() => ctx.respondInThread(summary), "usage summary");
+					await queueChain;
+				}
 			}
 
 			return { stopReason: result.stopReason, errorMessage: result.errorMessage };

@@ -1,0 +1,21 @@
+{
+  "id": "default",
+  "label": "Default",
+  "description": "General-purpose workspace with no preconfigured SAP skills.",
+  "sandboxImage": "octo/sandbox:local",
+  "settings": {
+    "tools": {
+      "enabled": ["shell", "code", "tests"]
+    },
+    "connectors": {
+      "allowed": ["github", "codex", "claude", "gemini"]
+    }
+  },
+  "skills": [
+    {
+      "name": "default-skill",
+      "label": "Default Skill",
+      "description": "Starter skill scaffold — edit it to create your department's own skill."
+    }
+  ]
+}

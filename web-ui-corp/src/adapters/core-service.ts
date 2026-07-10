@@ -1,3 +1,42 @@
+//IYH1HC stream add: token/cost accounting shape shared by usage events and replay.
+// Kept in manual sync with core-service/src/agent-events.ts (packages do not share types).
+export type AgentUsage = {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+};
+
+//IYH1HC stream add: structured replay block returned by GET /messages when available.
+export type ReplayBlock =
+	| { kind: "thinking"; content: string }
+	| { kind: "text"; content: string }
+	| {
+		kind: "tool";
+		toolCallId: string;
+		toolName: string;
+		label?: string;
+		args: Record<string, unknown>;
+		result?: string;
+		resultTruncated?: boolean;
+		isError?: boolean;
+		durationMs?: number;
+		skill?: { name: string; path: string };
+	};
+
+//IYH1HC stream add: chat history message shape (blocks/usage present for structured runs).
+export type HistoryMessage = {
+	role: "user" | "assistant";
+	text: string;
+	attachments?: string[];
+	thread?: string;
+	files?: Array<{ path: string; title?: string }>;
+	blocks?: ReplayBlock[];
+	usage?: AgentUsage;
+	model?: string;
+};
+
 export type SseEvent =
 	| { type: "status"; status: "thinking" | "working" | "idle" | "stopped" }
 	| { type: "delta"; text: string }
@@ -6,7 +45,34 @@ export type SseEvent =
 	| { type: "file"; path: string; title?: string }
 	| { type: "delete" }
 	| { type: "done" }
-	| { type: "error"; message: string };
+	| { type: "error"; message: string }
+	//IYH1HC stream add: structured agent-trail events (server sends them only when the
+	// request body carried structured: true; legacy delta/thread are then suppressed).
+	| { type: "turn"; seq: number; phase: "start" | "end"; turnIndex: number; ts: number }
+	| { type: "block"; seq: number; phase: "start"; blockId: string; kind: "text" | "thinking"; ts: number }
+	| { type: "block"; seq: number; phase: "delta"; blockId: string; kind: "text" | "thinking"; delta: string }
+	| { type: "block"; seq: number; phase: "end"; blockId: string; kind: "text" | "thinking"; content: string }
+	| { type: "tool"; seq: number; phase: "call"; toolCallId: string; toolName: string; args: Record<string, unknown>; ts: number }
+	| { type: "tool"; seq: number; phase: "start"; toolCallId: string; toolName: string; label?: string; args: Record<string, unknown>; ts: number }
+	| { type: "tool"; seq: number; phase: "update"; toolCallId: string; toolName: string; partialResult: string }
+	| {
+		type: "tool";
+		seq: number;
+		phase: "end";
+		toolCallId: string;
+		toolName: string;
+		label?: string;
+		args: Record<string, unknown>;
+		durationMs: number;
+		result: string;
+		resultTruncated: boolean;
+		isError: boolean;
+		ts: number;
+	}
+	| { type: "skill"; seq: number; name: string; path: string; toolCallId: string; ts: number }
+	| { type: "usage"; seq: number; scope: "message" | "run"; usage: AgentUsage; model?: { provider: string; id: string }; contextTokens?: number; contextWindow?: number }
+	| { type: "compaction"; seq: number; phase: "start" | "end"; reason?: string; tokensBefore?: number; aborted?: boolean }
+	| { type: "retry"; seq: number; attempt: number; maxAttempts: number; errorMessage?: string };
 
 export type AuthUser = {
 	id: string;
@@ -125,6 +191,9 @@ export type ConnectorStatus = AgentWorkerStatus & {
 export type CoreServiceFeatures = {
 	agentWorkers: boolean;
 	reminders: boolean;
+	connection: boolean; //IYH1HC add
+	llmProviders: string[] | null; //IYH1HC add: allowlist of provider ids shown in the UI picker; null → all
+	appTitle: string | null; //IYH1HC add: configurable browser tab title; null → keep index.html default
 };
 
 export type AgentWorkerLoginStart = {
@@ -238,7 +307,7 @@ export type WorkspaceSettings = {
 };
 
 export type WorkspaceTemplate = {
-	id: "sap-cap" | "sap-abap";
+	id: "default" | "sap-cap" | "sap-abap"; //IYH1HC add: "default" generic workspace type
 	label: string;
 	description: string;
 	sandboxImage: string;
@@ -550,7 +619,8 @@ export class CoreServiceClient {
 		const response = await this.fetch(`/sessions/${encodeURIComponent(channelId)}/messages${userQuery}`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ text, userName, attachments, model }), //IYH1HC comment: forward selected model
+			//IYH1HC stream comment body: JSON.stringify({ text, userName, attachments, model }), //IYH1HC comment: forward selected model
+			body: JSON.stringify({ text, userName, attachments, model, structured: true }), //IYH1HC stream add: opt in to the structured trail protocol
 			signal,
 		});
 
@@ -627,14 +697,17 @@ export class CoreServiceClient {
 	async getFeatures(): Promise<CoreServiceFeatures> {
 		try {
 			const response = await this.fetch("/features");
-			if (!response.ok) return { agentWorkers: true, reminders: true };
+			if (!response.ok) return { agentWorkers: true, reminders: true, connection: true, llmProviders: null, appTitle: null }; //IYH1HC add connection + llmProviders + appTitle
 			const data = await response.json() as { features?: Partial<CoreServiceFeatures> };
 			return {
 				agentWorkers: data.features?.agentWorkers !== false,
 				reminders: data.features?.reminders !== false,
+				connection: data.features?.connection !== false, //IYH1HC add
+				llmProviders: Array.isArray(data.features?.llmProviders) ? data.features.llmProviders : null, //IYH1HC add
+				appTitle: typeof data.features?.appTitle === "string" ? data.features.appTitle : null, //IYH1HC add
 			};
 		} catch {
-			return { agentWorkers: true, reminders: true };
+			return { agentWorkers: true, reminders: true, connection: true, llmProviders: null, appTitle: null }; //IYH1HC add connection + llmProviders + appTitle
 		}
 	}
 
@@ -736,7 +809,8 @@ export class CoreServiceClient {
 		});
 	}
 
-	async getMessages(channelId: string): Promise<Array<{ role: "user" | "assistant"; text: string }>> {
+	//IYH1HC stream comment async getMessages(channelId: string): Promise<Array<{ role: "user" | "assistant"; text: string }>> {
+	async getMessages(channelId: string): Promise<HistoryMessage[]> { //IYH1HC stream add
 		try {
 			const response = await this.fetch(`/messages/${encodeURIComponent(channelId)}`);
 			if (!response.ok) return [];

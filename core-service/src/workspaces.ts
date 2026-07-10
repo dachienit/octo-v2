@@ -107,7 +107,7 @@ export interface SessionInfo {
 	lastModified: number;
 }
 
-export type WorkspaceTemplateId = "sap-cap" | "sap-abap";
+export type WorkspaceTemplateId = "default" | "sap-cap" | "sap-abap"; //IYH1HC add: "default" generic workspace type
 
 export interface WorkspaceTemplate {
 	id: WorkspaceTemplateId;
@@ -129,6 +129,23 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = join(__dirname, "..");
 
 export const WORKSPACE_TEMPLATES: WorkspaceTemplate[] = [
+	//IYH1HC add: generic, SAP-agnostic workspace with no preconfigured skills.
+	{
+		id: "default",
+		label: "Default",
+		description: "General-purpose workspace with no preconfigured SAP skills.",
+		sandboxImage: DEFAULT_SANDBOX_IMAGE,
+		skills: [
+			{
+				name: "default-skill",
+				label: "Default Skill",
+				description: "Starter skill scaffold — edit it to create your department's own skill.",
+				content: "",
+			},
+		],
+		settings: { tools: { enabled: ["shell", "code", "tests"] }, connectors: { allowed: ["github", "codex", "claude", "gemini"] } },
+		agentPrompt: "This is a general-purpose workspace.",
+	},
 	{
 		id: "sap-cap",
 		label: "SAP CAP",
@@ -209,7 +226,8 @@ export class WorkspaceStore {
 	ensureDefaultWorkspace(userId: string): WorkspaceSummary {
 		const existing = this.listWorkspaces(userId)[0];
 		if (existing) return existing;
-		return this.createWorkspace({ name: "Default workspace", userId, templateId: "sap-cap" });
+		//IYH1HC add: auto-created first workspace now uses the generic "default" template (was "sap-cap")
+		return this.createWorkspace({ name: "Default workspace", userId, templateId: "default" });
 	}
 
 	listWorkspaceTemplates(): WorkspaceTemplate[] {

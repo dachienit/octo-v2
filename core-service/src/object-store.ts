@@ -1,62 +1,37 @@
-// Whole-tree durability for the data root via an S3-compatible Object Store
-// (snapshot/restore mirror).
+// Whole-tree durability for the data root via the objectstore-service HTTP gateway.
 //
 // On Cloud Foundry the container filesystem is ephemeral, so every file under the
-// data root (auth.sqlite, users/, templates/, workspaces/**) is lost on
-// restart/restage. There is no single chokepoint to intercept per-object writes
-// (the sandbox executor writes files straight to the FS via bash/write tools, and
-// the auth DB is a SQLite file touched by node:sqlite), so instead of an S3
-// storage abstraction we mirror the whole data root:
-//   - boot   → restore()  : download every object back onto the local FS
-//   - run-end/interval/shutdown → snapshot() : upload changed files to the bucket
+// data root (auth.sqlite, users/, workspaces/**) is lost on restart/restage
+// (templates/ is excluded — regenerated from the bundled package on boot).
+// We mirror the whole data root through the shared HTTP gateway
+// (objectstore-service), which fronts the SAP Object Store bucket with its own binding:
+//   - boot                → restore()  : download every object back onto the FS,
+//                           before WorkspaceStore / auth.sqlite touch the data root
+//   - SIGTERM / SIGINT    → snapshot() : full tree upload + delete-sync
+//   - workspace refresh   → snapshot({ workspaceId }) : that workspace's subtree only
 //
-// Scope is the ENTIRE data root, not just sessions/artifacts. auth.sqlite is
-// included so users/memberships/provider-keys survive a restart even before the
-// durable PostgreSQL backend (A3 part 1) is provisioned. Excluded: SQLite
-// sidecar/transient files (-wal/-shm), lock files, last_prompt debug snapshots,
-// and the objectstore-tester's own octo/_tester/ keys.
+// octo holds no S3 credentials and binds no objectstore service; all object I/O is
+// HTTP calls to the gateway with an x-api-key header.
 //
-// Selection mirrors auth-storage.ts detectPostgres(): a bound "objectstore"
-// service in VCAP_SERVICES (CF), else OBJECT_STORE_* env (local/MinIO), else
-// undefined → caller runs ephemeral. Single-writer only: do NOT scale octo-srv
-// instances > 1 while the mirror is active (snapshots would overwrite each other,
-// and delete-sync from one instance could wipe another instance's fresh writes).
+// Keys are the fixed deployment prefix plus the dataRoot-relative path:
+//   <CORE_SERVICE_OBJECTSTORE_PREFIX><rel>
+//   e.g.  robert-bosch-gmbh-rb-bd-vn-hub-d-bt234d00/octo/auth.sqlite
+// The prefix must match the scope bound to the gateway API key (403 otherwise).
 //
-// Trade-offs (accepted vs. the current "lose everything on restart" behavior):
-//   - auth.sqlite is mirrored as a whole-file copy taken right after a
-//     wal_checkpoint(TRUNCATE). A write landing between checkpoint and readFile
-//     could yield a copy off by one transaction; PostgreSQL (A3 part 1) is the
-//     correct long-term fix for the auth DB.
-//   - A file created between two interval snapshots is lost if the app is
-//     SIGKILLed (a normal SIGTERM flushes a final snapshot on shutdown).
-//   - Delete-sync only runs once this process has successfully restored at boot,
-//     so an ephemeral boot never deletes anything from the bucket.
+// Single-writer: the whole prefix maps to one shared local data root. Do NOT scale
+// octo-srv instances > 1 while the mirror is active — two instances would snapshot
+// over each other. Delete-sync only runs once restore() has succeeded, so a failed
+// restore never wipes the bucket.
 
-import {
-	DeleteObjectCommand,
-	GetObjectCommand,
-	HeadBucketCommand,
-	ListObjectsV2Command,
-	PutObjectCommand,
-	S3Client,
-} from "@aws-sdk/client-s3";
 import { access, mkdir, readdir, readFile, stat, writeFile } from "fs/promises";
 import { dirname, join, relative, sep } from "path";
 
-export interface ObjectStoreConfig {
-	bucket: string;
-	region: string;
-	/** Custom endpoint for S3-compatible stores (MinIO/SAP non-AWS); omit for real AWS. */
-	endpoint?: string;
-	accessKeyId: string;
-	secretAccessKey: string;
-}
-
 // A snapshot of the mirror's runtime state, surfaced via GET /objectstore/status
 // so operators can confirm the backend is live even after logs have rotated.
-// Contains no secrets — only the bucket name and operation counters.
+// Contains no secrets — only the gateway/bucket label and operation counters.
 export interface ObjectStoreStatus {
 	bucket: string;
+	prefix: string;
 	restoreCompleted: boolean;
 	restoredCount: number;
 	lastSnapshotAt?: string;
@@ -65,12 +40,7 @@ export interface ObjectStoreStatus {
 	lastError?: string;
 }
 
-// All mirrored keys live under this one bucket prefix so the dataset is easy to
-// list and clean up. Keys are octo/<path-relative-to-dataRoot>, e.g.
-// octo/auth.sqlite, octo/workspaces/<wsId>/sessions/<sid>/log.jsonl.
-const KEY_PREFIX = "octo/";
-
-// The objectstore-tester app writes its self-test keys under octo/_tester/. Never
+// The objectstore-tester app writes its self-test keys under <prefix>/_tester/. Never
 // restore them onto our FS and never delete them during delete-sync.
 const TESTER_PREFIX = "_tester/";
 
@@ -78,63 +48,48 @@ const TESTER_PREFIX = "_tester/";
 // dataRoot-relative, forward-slash path).
 const SKIP_FILE_PATTERNS = [/\.wal$/, /\.shm$/, /\.lock$/, /(^|[\\/])last_prompt\.jsonl$/];
 
+//IYH1HC add: templates/ is regenerated from the bundled package templates on every
+// boot (WorkspaceStore constructor) — never mirror it. Existing templates/** keys
+// already in the bucket are intentionally left untouched (deleteSync also skips them).
+const TEMPLATES_PREFIX = "templates/";
+
 // A relative path (e.g. "workspaces/ws_1/sessions/s_1/log.jsonl") that must not be
 // mirrored — either a transient file or the tester's reserved subtree.
 function shouldSkip(relPath: string): boolean {
 	if (relPath.startsWith(TESTER_PREFIX)) return true;
+	if (relPath.startsWith(TEMPLATES_PREFIX)) return true; //IYH1HC add
 	return SKIP_FILE_PATTERNS.some((re) => re.test(relPath));
 }
 
-// Detect an Object Store target from the environment. Returns undefined when none
-// is configured (→ caller runs ephemeral). No-op-safe off CF.
-export function detectObjectStore(): ObjectStoreConfig | undefined {
-	const vcap = process.env.VCAP_SERVICES;
-	if (vcap) {
-		try {
-			const services = JSON.parse(vcap) as Record<
-				string,
-				Array<{ instance_name?: string; name?: string; credentials?: Record<string, unknown> }>
-			>;
-			// The service *offering* label is "objectstore" (not the instance name
-			// "taf-objectstore"). Prefer the taf-objectstore instance if several bind.
-			const bindings = services["objectstore"] ?? [];
-			const chosen =
-				bindings.find((b) => b.instance_name === "taf-objectstore" || b.name === "taf-objectstore") ?? bindings[0];
-			const creds = chosen?.credentials;
-			if (creds) {
-				// SAP Object Store on AWS ships AWS S3 keys. Other hyperscalers
-				// (Azure/GCP) use a different shape — verify `cf env octo-srv` and
-				// extend this mapping if the landscape is not AWS.
-				const bucket = (creds.bucket as string) || (creds.bucket_name as string);
-				const accessKeyId = (creds.access_key_id as string) || (creds.accessKeyId as string);
-				const secretAccessKey = (creds.secret_access_key as string) || (creds.secretAccessKey as string);
-				const region = (creds.region as string) || "us-east-1";
-				const host = (creds.host as string) || (creds.uri as string) || undefined;
-				const endpoint = host ? (host.startsWith("http") ? host : `https://${host}`) : undefined;
-				if (bucket && accessKeyId && secretAccessKey) {
-					return { bucket, region, endpoint, accessKeyId, secretAccessKey };
-				}
-			}
-		} catch {
-			// Malformed VCAP — fall through to OBJECT_STORE_* / undefined.
-		}
-	}
+// Normalize the fixed key prefix: strip surrounding whitespace and leading slashes,
+// force exactly one trailing slash. Throws on empty — an empty prefix would mirror
+// against the bucket root, which the prefix-scoped API key rejects anyway.
+function normalizePrefix(raw: string): string {
+	const clean = raw.trim().replace(/^\/+/, "").replace(/\/+$/, "");
+	if (!clean) throw new Error("[object-store] CORE_SERVICE_OBJECTSTORE_PREFIX must not be empty");
+	return `${clean}/`;
+}
 
-	// Env fallback for local/MinIO testing.
-	const bucket = process.env.OBJECT_STORE_BUCKET;
-	const accessKeyId = process.env.OBJECT_STORE_ACCESS_KEY_ID;
-	const secretAccessKey = process.env.OBJECT_STORE_SECRET_ACCESS_KEY;
-	if (bucket && accessKeyId && secretAccessKey) {
-		return {
-			bucket,
-			region: process.env.OBJECT_STORE_REGION || "us-east-1",
-			endpoint: process.env.OBJECT_STORE_ENDPOINT || undefined,
-			accessKeyId,
-			secretAccessKey,
-		};
+// Resolve the gateway store from the environment. Returns undefined when no gateway
+// URL is configured (→ caller runs ephemeral). A gateway URL without a prefix is a
+// config bug and throws — even with ALLOW_EPHEMERAL — rather than mirroring under a
+// wrong/empty scope.
+export function resolveObjectStoreGateway(dataRoot: string): ObjectStoreGateway | undefined {
+	const gatewayUrl = process.env.CORE_SERVICE_OBJECTSTORE_GATEWAY_URL;
+	if (!gatewayUrl) return undefined;
+	const rawPrefix = process.env.CORE_SERVICE_OBJECTSTORE_PREFIX;
+	if (!rawPrefix || !rawPrefix.trim()) {
+		throw new Error(
+			"[object-store] CORE_SERVICE_OBJECTSTORE_GATEWAY_URL is set but CORE_SERVICE_OBJECTSTORE_PREFIX is missing — " +
+				"set it to the full key prefix bound to the gateway API key (e.g. \"robert-bosch-gmbh-rb-bd-vn-hub-d-bt234d00/cortex_studio/\").",
+		);
 	}
-
-	return undefined;
+	return new ObjectStoreGateway({
+		gatewayUrl,
+		dataRoot,
+		prefix: normalizePrefix(rawPrefix),
+		apiKey: process.env.CORE_SERVICE_OBJECTSTORE_GATEWAY_API_KEY || undefined,
+	});
 }
 
 interface FileStamp {
@@ -142,15 +97,22 @@ interface FileStamp {
 	size: number;
 }
 
-export class ObjectStoreMirror {
-	private readonly client: S3Client;
-	private readonly bucket: string;
+interface GatewayListPage {
+	objects?: Array<{ key?: string }>;
+	nextToken?: string;
+}
+
+export class ObjectStoreGateway {
+	private readonly gatewayUrl: string;
+	private readonly apiKey: string | undefined;
 	private readonly dataRoot: string;
+	// The fixed key prefix every object lives under (normalized, trailing slash).
+	private readonly prefix: string;
 	// Per-file stamp of the last successfully uploaded version — lets snapshot()
 	// skip unchanged files. In-memory only (rebuilt over the process lifetime).
 	private readonly uploaded = new Map<string, FileStamp>();
-	// Serializes snapshots so a run-end, interval, and shutdown snapshot never
-	// overlap (which would race on the same keys). Each call chains after the last.
+	// Serializes snapshots so a refresh and shutdown snapshot never overlap
+	// (which would race on the same keys). Each call chains after the last.
 	private snapshotChain: Promise<void> = Promise.resolve();
 	// Becomes true once restore() finishes. Delete-sync is gated on this so an
 	// ephemeral boot (restore skipped/failed) can never wipe the bucket.
@@ -161,29 +123,25 @@ export class ObjectStoreMirror {
 	private lastSnapshotDeleted = 0;
 	private lastError: string | undefined;
 
-	constructor(opts: { config: ObjectStoreConfig; dataRoot: string }) {
-		this.bucket = opts.config.bucket;
+	constructor(opts: { gatewayUrl: string; dataRoot: string; prefix: string; apiKey?: string }) {
+		this.gatewayUrl = opts.gatewayUrl.replace(/\/+$/, "");
+		this.apiKey = opts.apiKey;
 		this.dataRoot = opts.dataRoot;
-		this.client = new S3Client({
-			region: opts.config.region,
-			endpoint: opts.config.endpoint,
-			// Path-style is the safe default for S3-compatible stores (MinIO, some
-			// SAP endpoints). Real AWS accepts it too.
-			forcePathStyle: true,
-			credentials: {
-				accessKeyId: opts.config.accessKeyId,
-				secretAccessKey: opts.config.secretAccessKey,
-			},
-		});
+		this.prefix = opts.prefix;
 	}
 
 	get bucketName(): string {
-		return this.bucket;
+		try {
+			return `gateway:${new URL(this.gatewayUrl).host}`;
+		} catch {
+			return `gateway:${this.gatewayUrl}`;
+		}
 	}
 
 	status(): ObjectStoreStatus {
 		return {
-			bucket: this.bucket,
+			bucket: this.bucketName,
+			prefix: this.prefix,
 			restoreCompleted: this.restoreCompleted,
 			restoredCount: this.restoredCount,
 			lastSnapshotAt: this.lastSnapshotAt,
@@ -193,60 +151,53 @@ export class ObjectStoreMirror {
 		};
 	}
 
-	// Throws if the bucket is not reachable — used at boot to choose fail-fast vs
+	// Throws if the gateway is not reachable/ready — used to choose fail-fast vs
 	// ephemeral.
 	async verify(): Promise<void> {
-		await this.client.send(new HeadBucketCommand({ Bucket: this.bucket }));
+		const res = await this.gwFetch("/health", { method: "GET" });
+		if (!res.ok) throw new Error(`gateway /health returned ${res.status}`);
+		const data = (await res.json().catch(() => ({}))) as { ok?: boolean };
+		if (!data.ok) throw new Error("gateway reports object store not bound (ok=false)");
 	}
 
-	// Download every mirrored object back onto the local FS. Only files are
-	// written; empty dirs are recreated by WorkspaceStore on demand.
+	// Download every mirrored object under the fixed prefix back onto the local FS.
+	// Runs once at boot, before WorkspaceStore / auth.sqlite touch the data root.
+	// Only files are written; empty dirs are recreated by WorkspaceStore on demand.
 	async restore(): Promise<void> {
-		let continuationToken: string | undefined;
+		const prefix = this.prefix;
 		let restored = 0;
-		do {
-			const res = await this.client.send(
-				new ListObjectsV2Command({
-					Bucket: this.bucket,
-					Prefix: KEY_PREFIX,
-					ContinuationToken: continuationToken,
-				}),
-			);
-			for (const obj of res.Contents ?? []) {
-				if (!obj.Key || obj.Key.endsWith("/")) continue;
-				const rel = this.keyToRel(obj.Key);
-				if (rel === undefined || shouldSkip(rel)) continue;
-				const localPath = join(this.dataRoot, ...rel.split("/"));
+		for await (const key of this.listKeys(prefix)) {
+			const rel = key.startsWith(prefix) ? key.slice(prefix.length) : undefined;
+			if (rel === undefined || rel === "" || shouldSkip(rel)) continue;
+			const localPath = join(this.dataRoot, ...rel.split("/"));
+			try {
+				const res = await this.gwFetch(`/objects/${encodeURIComponent(key)}`, { method: "GET" });
+				if (res.status === 404) continue;
+				if (!res.ok) throw new Error(`GET object returned ${res.status}`);
+				const bytes = new Uint8Array(await res.arrayBuffer());
+				await mkdir(dirname(localPath), { recursive: true });
+				await writeFile(localPath, bytes);
+				// Seed the stamp so snapshot() doesn't immediately re-upload a file we
+				// just downloaded.
 				try {
-					const got = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: obj.Key }));
-					const body = got.Body as { transformToByteArray?: () => Promise<Uint8Array> } | undefined;
-					if (!body?.transformToByteArray) continue;
-					const bytes = await body.transformToByteArray();
-					await mkdir(dirname(localPath), { recursive: true });
-					await writeFile(localPath, bytes);
-					// Seed the stamp so snapshot() doesn't immediately re-upload a file
-					// we just downloaded.
-					try {
-						const st = await stat(localPath);
-						this.uploaded.set(localPath, { mtimeMs: st.mtimeMs, size: st.size });
-					} catch {
-						// ignore stat failure
-					}
-					restored++;
-				} catch (err) {
-					console.warn(`[object-store] restore failed for ${obj.Key}:`, err instanceof Error ? err.message : err);
+					const st = await stat(localPath);
+					this.uploaded.set(localPath, { mtimeMs: st.mtimeMs, size: st.size });
+				} catch {
+					// ignore stat failure
 				}
+				restored++;
+			} catch (err) {
+				console.warn(`[object-store] restore failed for ${key}:`, err instanceof Error ? err.message : err);
 			}
-			continuationToken = res.IsTruncated ? res.NextContinuationToken : undefined;
-		} while (continuationToken);
+		}
 		this.restoredCount = restored;
 		this.restoreCompleted = true;
-		console.log(`[object-store] restored ${restored} file(s) from bucket ${this.bucket}`);
+		console.log(`[object-store] restored ${restored} file(s) from ${prefix} via ${this.bucketName}`);
 	}
 
 	// Upload changed files. Default (no workspaceId) = full data root, followed by
-	// delete-sync. A workspaceId limits to that workspace's subtree (run-end), with
-	// no delete-sync. Best-effort: a single file error is logged, not thrown.
+	// delete-sync. A workspaceId limits to that workspace's subtree, with no
+	// delete-sync. Best-effort: a single file error is logged, not thrown.
 	// Serialized via chain.
 	snapshot(opts?: { workspaceId?: string; sessionId?: string }): Promise<void> {
 		const prev = this.snapshotChain;
@@ -258,6 +209,7 @@ export class ObjectStoreMirror {
 	}
 
 	private async doSnapshot(opts?: { workspaceId?: string; sessionId?: string }): Promise<void> {
+		const prefix = this.prefix;
 		const isFull = !opts?.workspaceId;
 		// A full snapshot may copy auth.sqlite; checkpoint it first so the WAL is
 		// folded back into the main file and the copy is self-contained.
@@ -272,12 +224,15 @@ export class ObjectStoreMirror {
 				if (shouldSkip(rel)) continue;
 				try {
 					const st = await stat(filePath);
-					const prev = this.uploaded.get(filePath);
-					if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) continue;
+					const prevStamp = this.uploaded.get(filePath);
+					if (prevStamp && prevStamp.mtimeMs === st.mtimeMs && prevStamp.size === st.size) continue;
 					const bytes = await readFile(filePath);
-					await this.client.send(
-						new PutObjectCommand({ Bucket: this.bucket, Key: `${KEY_PREFIX}${rel}`, Body: bytes }),
-					);
+					const res = await this.gwFetch(`/objects/${encodeURIComponent(`${prefix}${rel}`)}`, {
+						method: "PUT",
+						body: bytes,
+						headers: { "content-type": "application/octet-stream" },
+					});
+					if (!res.ok) throw new Error(`PUT object returned ${res.status}`);
 					this.uploaded.set(filePath, { mtimeMs: st.mtimeMs, size: st.size });
 					uploaded++;
 				} catch (err) {
@@ -291,7 +246,7 @@ export class ObjectStoreMirror {
 		let deleted = 0;
 		// Delete-sync only on a full snapshot, and only once this process has
 		// restored — an ephemeral boot must never wipe the bucket.
-		if (isFull && this.restoreCompleted) deleted = await this.deleteSync();
+		if (isFull && this.restoreCompleted) deleted = await this.deleteSync(prefix);
 
 		this.lastSnapshotAt = new Date().toISOString();
 		this.lastSnapshotUploaded = uploaded;
@@ -303,37 +258,49 @@ export class ObjectStoreMirror {
 	}
 
 	// Remove bucket keys whose local file no longer exists (file deleted locally).
-	// Scoped to KEY_PREFIX, skips excluded/tester keys. Returns the count deleted.
-	private async deleteSync(): Promise<number> {
-		let continuationToken: string | undefined;
+	// Scoped to the fixed prefix, skips excluded/tester keys. Returns the count deleted.
+	private async deleteSync(prefix: string): Promise<number> {
 		let deleted = 0;
-		do {
-			const res = await this.client.send(
-				new ListObjectsV2Command({
-					Bucket: this.bucket,
-					Prefix: KEY_PREFIX,
-					ContinuationToken: continuationToken,
-				}),
-			);
-			for (const obj of res.Contents ?? []) {
-				if (!obj.Key || obj.Key.endsWith("/")) continue;
-				const rel = this.keyToRel(obj.Key);
-				if (rel === undefined || shouldSkip(rel)) continue;
-				const localPath = join(this.dataRoot, ...rel.split("/"));
-				if (await this.exists(localPath)) continue;
-				try {
-					await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: obj.Key }));
-					this.uploaded.delete(localPath);
-					deleted++;
-				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					console.warn(`[object-store] delete-sync failed for ${obj.Key}:`, message);
-					this.lastError = message;
-				}
+		for await (const key of this.listKeys(prefix)) {
+			const rel = key.startsWith(prefix) ? key.slice(prefix.length) : undefined;
+			if (rel === undefined || rel === "" || shouldSkip(rel)) continue;
+			const localPath = join(this.dataRoot, ...rel.split("/"));
+			if (await this.exists(localPath)) continue;
+			try {
+				const res = await this.gwFetch(`/objects/${encodeURIComponent(key)}`, { method: "DELETE" });
+				if (!res.ok && res.status !== 404) throw new Error(`DELETE object returned ${res.status}`);
+				this.uploaded.delete(localPath);
+				deleted++;
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				console.warn(`[object-store] delete-sync failed for ${key}:`, message);
+				this.lastError = message;
 			}
-			continuationToken = res.IsTruncated ? res.NextContinuationToken : undefined;
-		} while (continuationToken);
+		}
 		return deleted;
+	}
+
+	// Async-iterate every object key under a prefix, paging through the gateway's
+	// nextToken. Skips folder-marker keys (ending in "/").
+	private async *listKeys(prefix: string): AsyncGenerator<string> {
+		let token: string | undefined;
+		do {
+			const params = new URLSearchParams({ prefix });
+			if (token) params.set("token", token);
+			const res = await this.gwFetch(`/objects?${params.toString()}`, { method: "GET" });
+			if (!res.ok) throw new Error(`list objects returned ${res.status}`);
+			const page = (await res.json()) as GatewayListPage;
+			for (const obj of page.objects ?? []) {
+				if (obj.key && !obj.key.endsWith("/")) yield obj.key;
+			}
+			token = page.nextToken;
+		} while (token);
+	}
+
+	private gwFetch(path: string, init: RequestInit): Promise<Response> {
+		const headers: Record<string, string> = { ...(init.headers as Record<string, string> | undefined) };
+		if (this.apiKey) headers["x-api-key"] = this.apiKey;
+		return fetch(`${this.gatewayUrl}${path}`, { ...init, headers });
 	}
 
 	// Fold the SQLite WAL back into auth.sqlite so a whole-file copy is consistent.
@@ -360,13 +327,13 @@ export class ObjectStoreMirror {
 	// Build the list of local directories to scan for a snapshot.
 	private resolveSnapshotRoots(opts?: { workspaceId?: string; sessionId?: string }): string[] {
 		if (opts?.workspaceId) {
-			// Run-end: mirror the whole workspace subtree (workspace.json, members.json,
-			// sessions/, artifacts/, events/, skills/) so membership and metadata stay
-			// in sync, not just the session that just ran.
+			// Workspace refresh: mirror the whole workspace subtree (workspace.json,
+			// members.json, sessions/, artifacts/, events/, skills/) so membership and
+			// metadata stay in sync, not just the session being viewed.
 			return [join(this.dataRoot, "workspaces", opts.workspaceId)];
 		}
-		// Full snapshot: the entire data root (auth.sqlite, users/, templates/,
-		// workspaces/**). walk() filters files; shouldSkip() filters transients.
+		// Full snapshot: the entire data root (auth.sqlite, users/, workspaces/**).
+		// walk() filters files; shouldSkip() filters transients and templates/.
 		return [this.dataRoot];
 	}
 
@@ -397,12 +364,5 @@ export class ObjectStoreMirror {
 		} catch {
 			return false;
 		}
-	}
-
-	// octo/<rel> → <rel> (forward-slash, relative to dataRoot), or undefined if the
-	// key is outside the mirrored prefix.
-	private keyToRel(key: string): string | undefined {
-		if (!key.startsWith(KEY_PREFIX)) return undefined;
-		return key.slice(KEY_PREFIX.length);
 	}
 }

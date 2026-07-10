@@ -1,7 +1,7 @@
 {
-  "xsappname": "octo",
+  "xsappname": "mirati",
   "tenant-mode": "dedicated",
-  "description": "Octo AI Agent Core Service security descriptor (XSUAA / IAS). Authentication only — no role/scope authorization yet.",
+  "description": "Aymphony AI Agent security descriptor (XSUAA / IAS). Authentication only — no role/scope authorization yet.",
   "scopes": [
     {
       "name": "uaa.user",

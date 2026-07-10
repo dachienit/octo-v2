@@ -1,8 +1,14 @@
 import { html, LitElement } from "lit";
 import { customElement, property, query, state } from "lit/decorators.js";
 import { createRef, ref } from "lit/directives/ref.js";
+import { icon } from "@mariozechner/mini-lit"; //IYH1HC add
+//IYH1HC stream comment import { Sparkles } from "lucide"; //IYH1HC add
+//IYH1HC comment import { Check, Loader, Sparkles, X, Zap } from "lucide"; //IYH1HC stream add: tool status + token counter icons
+import { Check, Download, Loader, Sparkles, X, Zap } from "lucide"; //IYH1HC add: Download icon for file chip download button
 import type { MessageEditor, QuickModelOption } from "./MessageEditor.js"; //IYH1HC add: QuickModelOption
-import { CoreServiceClient, type ActiveModel, type AttachmentPayload, type SseEvent, type WorkspaceTableRows } from "../adapters/core-service.js";
+//IYH1HC stream comment import { CoreServiceClient, type ActiveModel, type AttachmentPayload, type SseEvent, type WorkspaceTableRows } from "../adapters/core-service.js";
+import { CoreServiceClient, type ActiveModel, type AgentUsage, type AttachmentPayload, type ReplayBlock, type SseEvent, type WorkspaceTableRows } from "../adapters/core-service.js"; //IYH1HC stream add
+import "./ThinkingBlock.js"; //IYH1HC stream add: reuse the collapsible thinking renderer
 import type { Attachment } from "../utils/attachment-utils.js";
 import "./MessageEditor.js";
 import "./SandboxedIframe.js";
@@ -201,9 +207,38 @@ class CoreServiceFileViewer extends LitElement {
 	}
 }
 
+//IYH1HC stream add: ordered structured trail block — built live from SSE trail events
+// and reconstructed from replay blocks on page reload.
+type StreamBlock =
+	//IYH1HC stream add(w2): `target` = full received text, `content` = revealed portion —
+	// a rAF loop drains target→content a few chars per frame for a smooth typewriter feel.
+	// `ended` marks that the authoritative block-end event arrived.
+	| { kind: "text"; id: string; content: string; streaming: boolean; target?: string; ended?: boolean }
+	| { kind: "thinking"; id: string; content: string; streaming: boolean; target?: string; ended?: boolean }
+	| {
+		kind: "tool";
+		id: string; // toolCallId
+		toolName: string;
+		label?: string;
+		args?: Record<string, unknown>;
+		partialResult?: string;
+		result?: string;
+		resultTruncated?: boolean;
+		isError?: boolean;
+		durationMs?: number;
+		status: "calling" | "running" | "done" | "error" | "aborted";
+		skill?: { name: string; path: string };
+	}
+	| { kind: "event"; id: string; variant: "compaction" | "retry"; text: string }
+	| { kind: "usage"; id: string; scope: "message" | "run"; usage: AgentUsage; model?: { provider: string; id: string }; contextTokens?: number; contextWindow?: number };
+
+//IYH1HC stream comment type ChatMessage =
+//IYH1HC stream comment 	| { role: "user"; text: string; attachments?: string[] }
+//IYH1HC stream comment 	| { role: "assistant"; text: string; thread?: string; files?: FileRef[] }
+//IYH1HC stream comment 	| { role: "error"; text: string };
 type ChatMessage =
 	| { role: "user"; text: string; attachments?: string[] }
-	| { role: "assistant"; text: string; thread?: string; files?: FileRef[] }
+	| { role: "assistant"; text: string; thread?: string; files?: FileRef[]; blocks?: StreamBlock[]; usage?: AgentUsage; model?: string } //IYH1HC stream add: blocks + usage + model
 	| { role: "error"; text: string };
 
 type FileRef = { path: string; title?: string };
@@ -275,6 +310,7 @@ export class CoreServiceChatPanel extends LitElement {
 	@property() declare baseUrl: string;
 	@property() declare channelId: string;
 	@property() declare userName: string | undefined;
+	@property() declare agentName: string; //IYH1HC add: display name for the assistant (host sets the brand)
 	@property() declare authToken: string | null;
 
 	@state() private declare messages: ChatMessage[];
@@ -283,6 +319,13 @@ export class CoreServiceChatPanel extends LitElement {
 	@state() private declare streamingStatus: string;
 	@state() private declare streamingFiles: FileRef[];
 	@state() private declare isStreaming: boolean;
+	//IYH1HC stream add: ordered structured trail committed once per animation frame
+	@state() private declare streamingBlocks: StreamBlock[];
+	//IYH1HC stream add: live token counter display (ticking estimate + authoritative snaps)
+	@state() private declare liveTokenLabel: string;
+	@state() private declare elapsedSec: number;
+	//IYH1HC stream add(w2): model currently serving the run (from usage events)
+	@state() private declare currentModel: string;
 	@state() private declare rightPanelFile: FileRef | null;
 	@state() private declare rightPanelTable: TableRef | null;
 	@state() private declare rightPanelArtifactUrl: string | null;
@@ -298,13 +341,40 @@ export class CoreServiceChatPanel extends LitElement {
 	private abortController?: AbortController;
 	private scrollContainer?: HTMLElement;
 	private autoScroll = true;
+	//IYH1HC stream add(w2): last observed scrollTop — used to tell an upward USER scroll
+	// (stop auto-follow) apart from a downward programmatic scroll (keep following).
+	private lastScrollTop = 0;
+	//IYH1HC stream add(w2): watches the message list height and pins to the bottom whenever it
+	// grows (typewriter reveal, tool blocks, images) — independent of Lit's update timing, so
+	// auto-follow never gets "stuck" the way an updated()-only approach did.
+	private contentResizeObserver?: ResizeObserver;
+	private observedContent?: Element;
 	private resizingRightPanel = false;
+
+	//IYH1HC stream add: non-reactive streaming buffers — mutated per SSE event, committed to
+	// reactive state once per requestAnimationFrame (pattern from StreamingMessageContainer).
+	private blockOrder: StreamBlock[] = [];
+	private blockIndex = new Map<string, StreamBlock>();
+	private structuredSeen = false;
+	private rafPending = false;
+	//IYH1HC stream add(w2): typewriter reveal loop — persistent rAF while a run streams
+	private revealRafId: number | null = null;
+	private pendingCommit = false;
+	private runUsage: AgentUsage | null = null;
+	// Live token counter: authoritative output tokens accumulate on each usage event;
+	// between snaps the count ticks from received delta chars (~4 chars/token, "~" prefix).
+	private authOutputTokens = 0;
+	private estCharsSinceUsage = 0;
+	private hasAuthUsage = false;
+	private streamStartMs = 0;
+	private elapsedTimer: ReturnType<typeof setInterval> | null = null;
 
 	constructor() {
 		super();
 		this.baseUrl = "http://localhost:3030";
 		this.channelId = "default";
 		this.userName = undefined;
+		this.agentName = "Assistant"; //IYH1HC add: brand-neutral default; host (web-app-corp) overrides
 		this.authToken = null;
 		this.messages = [];
 		this.streamingText = "";
@@ -312,6 +382,10 @@ export class CoreServiceChatPanel extends LitElement {
 		this.streamingStatus = "";
 		this.streamingFiles = [];
 		this.isStreaming = false;
+		this.streamingBlocks = []; //IYH1HC stream add
+		this.liveTokenLabel = ""; //IYH1HC stream add
+		this.elapsedSec = 0; //IYH1HC stream add
+		this.currentModel = ""; //IYH1HC stream add(w2)
 		this.rightPanelFile = null;
 		this.rightPanelTable = null;
 		this.rightPanelArtifactUrl = null;
@@ -382,6 +456,16 @@ export class CoreServiceChatPanel extends LitElement {
 	override disconnectedCallback() {
 		super.disconnectedCallback();
 		this.stopRightPanelResize();
+		//IYH1HC stream add: never leak the elapsed-time ticker
+		if (this.elapsedTimer) {
+			clearInterval(this.elapsedTimer);
+			this.elapsedTimer = null;
+		}
+		//IYH1HC stream add(w2): tear down the auto-follow watcher + reveal loop
+		this.contentResizeObserver?.disconnect();
+		this.contentResizeObserver = undefined;
+		this.observedContent = undefined;
+		this.stopRevealLoop();
 	}
 
 	override willUpdate(changed: Map<string, unknown>) {
@@ -393,35 +477,104 @@ export class CoreServiceChatPanel extends LitElement {
 			this.streamingStatus = "";
 			this.streamingFiles = [];
 			this.isStreaming = false;
+			this.resetStreamBuffers(); //IYH1HC stream add
 			this.rightPanelFile = null;
 			this.rightPanelArtifactUrl = null;
 			this.scrollContainer = undefined;
+			this.autoScroll = true; //IYH1HC stream add(w2): fresh channel starts pinned to bottom
+			this.lastScrollTop = 0; //IYH1HC stream add(w2)
+			//IYH1HC stream add(w2): drop the old observer so updated() re-attaches to the new list
+			this.observedContent = undefined;
 			this.loadHistory();
 		}
 	}
 
 	private async loadHistory() {
 		const msgs = await this.client.getMessages(this.channelId);
-		this.messages = msgs.map((m) => ({ role: m.role, text: m.text, thread: (m as any).thread, files: (m as any).files, attachments: (m as any).attachments }));
+		//IYH1HC stream comment this.messages = msgs.map((m) => ({ role: m.role, text: m.text, thread: (m as any).thread, files: (m as any).files, attachments: (m as any).attachments }));
+		//IYH1HC stream add: map structured replay blocks so a reload shows the same trail
+		this.messages = msgs.map((m) => ({
+			role: m.role,
+			text: m.text,
+			thread: m.thread,
+			files: m.files,
+			attachments: m.attachments,
+			blocks: m.role === "assistant" && m.blocks ? m.blocks.map((b, i) => this.replayBlockToStreamBlock(b, i)) : undefined,
+			usage: m.role === "assistant" ? m.usage : undefined,
+			model: m.role === "assistant" ? m.model : undefined, //IYH1HC stream add(w2)
+		}));
 		this.autoScroll = true;
 	}
 
+	//IYH1HC stream add: convert a server ReplayBlock into the shared StreamBlock render model.
+	private replayBlockToStreamBlock(b: ReplayBlock, index: number): StreamBlock {
+		if (b.kind === "text") return { kind: "text", id: `replay-${index}`, content: b.content, streaming: false };
+		if (b.kind === "thinking") return { kind: "thinking", id: `replay-${index}`, content: b.content, streaming: false };
+		return {
+			kind: "tool",
+			id: b.toolCallId || `replay-${index}`,
+			toolName: b.toolName,
+			label: b.label,
+			args: b.args,
+			result: b.result,
+			resultTruncated: b.resultTruncated,
+			isError: b.isError,
+			durationMs: b.durationMs,
+			status: b.isError ? "error" : b.result !== undefined ? "done" : "aborted",
+			skill: b.skill,
+		};
+	}
+
 	override updated() {
-		if (!this.scrollContainer) {
-			this.scrollContainer = this.querySelector(".overflow-y-auto") as HTMLElement;
-			if (this.scrollContainer) {
-				this.scrollContainer.addEventListener("scroll", this.handleScroll);
-			}
+		//IYH1HC stream comment: re-resolve the scroll container and (re)wire the resize watcher.
+		const container = this.querySelector(".overflow-y-auto") as HTMLElement | null;
+		if (container && container !== this.scrollContainer) {
+			// Container was (re)created — e.g. empty-state → messages-view switch.
+			this.scrollContainer?.removeEventListener("scroll", this.handleScroll);
+			this.scrollContainer = container;
+			this.scrollContainer.addEventListener("scroll", this.handleScroll);
+			this.observeContent(); //IYH1HC stream add(w2)
+		} else if (container) {
+			this.observeContent(); //IYH1HC stream add(w2): content child may have been replaced
 		}
 		if (this.autoScroll && this.scrollContainer) {
 			this.scrollContainer.scrollTop = this.scrollContainer.scrollHeight;
 		}
 	}
 
+	//IYH1HC stream add(w2): (re)attach the ResizeObserver to the current message-list wrapper.
+	private observeContent() {
+		const content = this.scrollContainer?.firstElementChild ?? undefined;
+		if (!content || content === this.observedContent) return;
+		if (!this.contentResizeObserver) {
+			this.contentResizeObserver = new ResizeObserver(() => {
+				if (this.autoScroll && this.scrollContainer) {
+					this.scrollContainer.scrollTop = this.scrollContainer.scrollHeight;
+				}
+			});
+		}
+		if (this.observedContent) this.contentResizeObserver.unobserve(this.observedContent);
+		this.contentResizeObserver.observe(content);
+		this.observedContent = content;
+	}
+
+	//IYH1HC stream comment private handleScroll = () => { this.autoScroll = distanceFromBottom < 50; };
+	//IYH1HC stream add(w2): direction-aware follow control. The old version toggled autoScroll
+	// purely by distance-from-bottom, so a programmatic smooth-scroll passing through
+	// mid-positions (still far from a growing bottom) wrongly disabled auto-follow and the
+	// view got "stuck" needing manual scrolling. Now: reaching the bottom re-enables follow;
+	// only an actual upward scroll (scrollTop decreasing) while away from the bottom disables
+	// it — programmatic scrolls always move toward the bottom, so they never disable it.
 	private handleScroll = () => {
 		if (!this.scrollContainer) return;
 		const { scrollTop, scrollHeight, clientHeight } = this.scrollContainer;
-		this.autoScroll = scrollHeight - scrollTop - clientHeight < 50;
+		const atBottom = scrollHeight - scrollTop - clientHeight < 50;
+		if (atBottom) {
+			this.autoScroll = true;
+		} else if (scrollTop < this.lastScrollTop - 1) {
+			this.autoScroll = false;
+		}
+		this.lastScrollTop = scrollTop;
 	};
 
 	private async handleSend(text: string, attachments: Attachment[] = []) {
@@ -440,6 +593,15 @@ export class CoreServiceChatPanel extends LitElement {
 		this.streamingFiles = [];
 		this.isStreaming = true;
 		this.autoScroll = true;
+		//IYH1HC stream add: reset the structured trail + token counter for this run
+		this.resetStreamBuffers();
+		this.streamStartMs = Date.now();
+		this.elapsedTimer = setInterval(() => {
+			this.elapsedSec = Math.floor((Date.now() - this.streamStartMs) / 1000);
+		}, 1000);
+		//IYH1HC stream add(w2): smooth typewriter reveal + smooth jump to the new user message
+		this.startRevealLoop();
+		this.scrollToBottom(true);
 
 		const attachmentPayloads: AttachmentPayload[] = attachments.map((a) => ({
 			fileName: a.fileName,
@@ -457,15 +619,28 @@ export class CoreServiceChatPanel extends LitElement {
 				this.messages = [...this.messages, { role: "error", text: String(err) }];
 			}
 		} finally {
-			const hasContent = this.streamingText || this.streamingThread || this.streamingFiles.length > 0;
+			//IYH1HC stream add: finalize any block still open (abort mid-stream) and commit
+			// the structured trail into the persisted message list.
+			if (this.elapsedTimer) {
+				clearInterval(this.elapsedTimer);
+				this.elapsedTimer = null;
+			}
+			this.stopRevealLoop(); //IYH1HC stream add(w2): before finalize so no frame races the snap
+			this.finalizeOpenBlocks();
+			this.commitStreamBlocks();
+			//IYH1HC stream comment const hasContent = this.streamingText || this.streamingThread || this.streamingFiles.length > 0;
+			const hasContent = this.streamingText || this.streamingThread || this.streamingFiles.length > 0 || this.blockOrder.length > 0; //IYH1HC stream add
 			if (hasContent) {
 				this.messages = [
 					...this.messages,
 					{
 						role: "assistant",
-						text: this.streamingText,
+						//IYH1HC stream comment text: this.streamingText,
+						text: this.structuredSeen ? this.lastTextBlockContent() : this.streamingText, //IYH1HC stream add
 						thread: this.streamingThread || undefined,
 						files: this.streamingFiles.length > 0 ? [...this.streamingFiles] : undefined,
+						blocks: this.blockOrder.length > 0 ? [...this.blockOrder] : undefined, //IYH1HC stream add
+						usage: this.runUsage ?? undefined, //IYH1HC stream add
 					},
 				];
 			}
@@ -474,19 +649,197 @@ export class CoreServiceChatPanel extends LitElement {
 			this.streamingStatus = "";
 			this.streamingFiles = [];
 			this.isStreaming = false;
+			this.resetStreamBuffers(); //IYH1HC stream add
+			//IYH1HC stream add(w2): settle the view and hand focus back to the editor
+			this.scrollToBottom(true);
+			this.focusEditor();
 		}
+	}
+
+	//IYH1HC stream add(w2): smooth-scroll helper for discrete jumps (send / done / history);
+	// per-frame streaming follow stays instant in updated() — small increments look smooth
+	// and a smooth-behavior chase would lag behind the reveal loop.
+	private scrollToBottom(smooth = false) {
+		requestAnimationFrame(() => {
+			const container = this.scrollContainer ?? (this.querySelector(".overflow-y-auto") as HTMLElement | null);
+			if (!container) return;
+			container.scrollTo({ top: container.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+		});
+	}
+
+	//IYH1HC stream add(w2): keep the user's caret in the editor after a run finishes
+	private focusEditor() {
+		const textarea = (this._editor as unknown as HTMLElement | undefined)?.querySelector?.("textarea");
+		(textarea as HTMLTextAreaElement | null)?.focus({ preventScroll: true });
+	}
+
+	//IYH1HC stream add: streaming buffer lifecycle helpers -------------------------------
+
+	private resetStreamBuffers() {
+		this.blockOrder = [];
+		this.blockIndex = new Map();
+		this.structuredSeen = false;
+		this.rafPending = false;
+		this.runUsage = null;
+		this.authOutputTokens = 0;
+		this.estCharsSinceUsage = 0;
+		this.hasAuthUsage = false;
+		this.streamingBlocks = [];
+		this.liveTokenLabel = "";
+		this.elapsedSec = 0;
+		this.currentModel = ""; //IYH1HC stream add(w2)
+		this.stopRevealLoop(); //IYH1HC stream add(w2)
+		if (this.elapsedTimer) {
+			clearInterval(this.elapsedTimer);
+			this.elapsedTimer = null;
+		}
+	}
+
+	/** Batch reactive updates: mutate buffers freely, commit once per animation frame. */
+	private scheduleCommit() {
+		//IYH1HC stream add(w2): while the reveal loop runs it owns the commits — just flag.
+		this.pendingCommit = true;
+		if (this.revealRafId !== null) return;
+		if (this.rafPending) return;
+		this.rafPending = true;
+		requestAnimationFrame(() => {
+			this.rafPending = false;
+			//IYH1HC stream comment this.commitStreamBlocks();
+			if (this.pendingCommit) { //IYH1HC stream add(w2)
+				this.pendingCommit = false;
+				this.commitStreamBlocks();
+			}
+		});
+	}
+
+	//IYH1HC stream add(w2): typewriter reveal — one persistent rAF loop per run. Each frame
+	// drains a proportional slice of every content block's pending text (older blocks snap
+	// instantly, only the newest unfinished block animates), then commits once if dirty.
+	private startRevealLoop() {
+		if (this.revealRafId !== null) return;
+		const tick = () => {
+			let dirty = this.pendingCommit;
+			this.pendingCommit = false;
+
+			// Index of the last content block that still has text to reveal.
+			let lastPendingIdx = -1;
+			for (let i = 0; i < this.blockOrder.length; i++) {
+				const b = this.blockOrder[i];
+				if ((b.kind === "text" || b.kind === "thinking") && b.target !== undefined && b.content.length < b.target.length) {
+					lastPendingIdx = i;
+				}
+			}
+
+			for (let i = 0; i < this.blockOrder.length; i++) {
+				const b = this.blockOrder[i];
+				if (b.kind !== "text" && b.kind !== "thinking") continue;
+				const target = b.target ?? b.content;
+				if (b.content.length < target.length) {
+					if (i < lastPendingIdx) {
+						b.content = target; // older block — snap, only the newest one animates
+					} else {
+						const pending = target.length - b.content.length;
+						const step = Math.max(2, Math.ceil(pending / 10));
+						b.content = target.slice(0, b.content.length + step);
+					}
+					dirty = true;
+				}
+				if (b.ended && b.streaming && b.content.length >= target.length) {
+					b.streaming = false;
+					dirty = true;
+				}
+			}
+
+			if (dirty) this.commitStreamBlocks();
+			this.revealRafId = requestAnimationFrame(tick);
+		};
+		this.revealRafId = requestAnimationFrame(tick);
+	}
+
+	private stopRevealLoop() {
+		if (this.revealRafId !== null) {
+			cancelAnimationFrame(this.revealRafId);
+			this.revealRafId = null;
+		}
+	}
+
+	private commitStreamBlocks() {
+		this.streamingBlocks = [...this.blockOrder];
+		this.liveTokenLabel = this.formatLiveTokens();
+	}
+
+	private lastTextBlockContent(): string {
+		for (let i = this.blockOrder.length - 1; i >= 0; i--) {
+			const b = this.blockOrder[i];
+			if (b.kind === "text" && b.content.trim()) return b.content;
+		}
+		return "";
+	}
+
+	/** Mark blocks left open by an abort: stop shimmer, flag running tools as aborted. */
+	private finalizeOpenBlocks() {
+		for (const b of this.blockOrder) {
+			//IYH1HC stream add(w2): snap any un-revealed text to the full received target
+			if ((b.kind === "text" || b.kind === "thinking") && b.target !== undefined && b.content.length < b.target.length) {
+				b.content = b.target;
+			}
+			if ((b.kind === "text" || b.kind === "thinking") && b.streaming) b.streaming = false;
+			if (b.kind === "tool" && (b.status === "calling" || b.status === "running")) b.status = "aborted";
+		}
+	}
+
+	private upsertContentBlock(blockId: string, kind: "text" | "thinking"): Extract<StreamBlock, { kind: "text" | "thinking" }> {
+		const key = `block:${blockId}`;
+		const existing = this.blockIndex.get(key);
+		if (existing && (existing.kind === "text" || existing.kind === "thinking")) return existing;
+		const block: Extract<StreamBlock, { kind: "text" | "thinking" }> =
+			kind === "text"
+				? { kind: "text", id: blockId, content: "", streaming: true }
+				: { kind: "thinking", id: blockId, content: "", streaming: true };
+		this.blockIndex.set(key, block);
+		this.blockOrder.push(block);
+		return block;
+	}
+
+	private upsertToolBlock(toolCallId: string, toolName: string): Extract<StreamBlock, { kind: "tool" }> {
+		const key = `tool:${toolCallId}`;
+		let block = this.blockIndex.get(key) as Extract<StreamBlock, { kind: "tool" }> | undefined;
+		if (!block) {
+			block = { kind: "tool", id: toolCallId, toolName, status: "calling" };
+			this.blockIndex.set(key, block);
+			this.blockOrder.push(block);
+		}
+		return block;
+	}
+
+	private formatTokenCount(n: number): string {
+		if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+		if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+		if (n >= 1_000) return `${(n / 1000).toFixed(1)}k`;
+		return String(n);
+	}
+
+	private formatLiveTokens(): string {
+		const estimated = Math.ceil(this.estCharsSinceUsage / 4);
+		const total = this.authOutputTokens + estimated;
+		if (total <= 0) return "";
+		const approx = estimated > 0 || !this.hasAuthUsage ? "~" : "";
+		return `${approx}${this.formatTokenCount(total)} tokens`;
 	}
 
 	private handleSseEvent(event: SseEvent) {
 		switch (event.type) {
 			case "delta":
-				this.streamingText += event.text;
+				//IYH1HC stream comment this.streamingText += event.text;
+				if (!this.structuredSeen) this.streamingText += event.text; //IYH1HC stream add: blocks already carry the content
 				break;
 			case "replace":
-				this.streamingText = event.text;
+				//IYH1HC stream comment this.streamingText = event.text;
+				if (!this.structuredSeen) this.streamingText = event.text; //IYH1HC stream add
 				break;
 			case "thread":
-				this.streamingThread += event.text;
+				//IYH1HC stream comment this.streamingThread += event.text;
+				if (!this.structuredSeen) this.streamingThread += event.text; //IYH1HC stream add
 				break;
 			case "status":
 				this.streamingStatus = event.status;
@@ -497,6 +850,10 @@ export class CoreServiceChatPanel extends LitElement {
 			case "delete":
 				// Bot deleted its current response — clear accumulated text
 				this.streamingText = "";
+				//IYH1HC stream add: silent response — drop the structured trail as well
+				this.blockOrder = [];
+				this.blockIndex = new Map();
+				this.scheduleCommit();
 				break;
 			case "error":
 				this.messages = [...this.messages, { role: "error", text: event.message }];
@@ -504,6 +861,121 @@ export class CoreServiceChatPanel extends LitElement {
 			case "done":
 				// Stream ends naturally; finally block commits the message
 				break;
+
+			//IYH1HC stream add: structured trail events ---------------------------------
+			case "turn":
+				this.structuredSeen = true;
+				break;
+			case "block": {
+				this.structuredSeen = true;
+				// Coalescing may deliver the first delta before a start event — upsert always.
+				const block = this.upsertContentBlock(event.blockId, event.kind);
+				//IYH1HC stream comment if (event.phase === "delta") { block.content += event.delta; ... }
+				//IYH1HC stream add(w2): write into `target`; the reveal loop drains it into
+				// `content` smoothly. `streaming` stays true until reveal catches up.
+				if (event.phase === "delta") {
+					block.target = (block.target ?? block.content) + event.delta;
+					this.estCharsSinceUsage += event.delta.length;
+				} else if (event.phase === "end") {
+					block.target = event.content; // authoritative full content
+					block.ended = true;
+				}
+				this.scheduleCommit();
+				break;
+			}
+			case "tool": {
+				this.structuredSeen = true;
+				const block = this.upsertToolBlock(event.toolCallId, event.toolName);
+				if (event.phase === "call") {
+					block.status = "calling";
+					block.args = event.args;
+				} else if (event.phase === "start") {
+					block.status = "running";
+					block.toolName = event.toolName;
+					block.label = event.label;
+					block.args = event.args;
+				} else if (event.phase === "update") {
+					block.partialResult = event.partialResult;
+				} else {
+					block.status = event.isError ? "error" : "done";
+					block.label = event.label ?? block.label;
+					block.args = event.args;
+					block.result = event.result;
+					block.resultTruncated = event.resultTruncated;
+					block.isError = event.isError;
+					block.durationMs = event.durationMs;
+					block.partialResult = undefined;
+				}
+				this.scheduleCommit();
+				break;
+			}
+			case "skill": {
+				this.structuredSeen = true;
+				const block = this.blockIndex.get(`tool:${event.toolCallId}`) as Extract<StreamBlock, { kind: "tool" }> | undefined;
+				if (block) block.skill = { name: event.name, path: event.path };
+				this.scheduleCommit();
+				break;
+			}
+			case "usage": {
+				this.structuredSeen = true;
+				//IYH1HC stream add(w2): surface which model served this step
+				if (event.model?.id) {
+					this.currentModel = event.model.provider ? `${event.model.provider}/${event.model.id}` : event.model.id;
+				}
+				if (event.scope === "message") {
+					// Snap the live counter to authoritative numbers, chip rendered inline.
+					this.authOutputTokens += event.usage.output;
+					this.estCharsSinceUsage = 0;
+					this.hasAuthUsage = true;
+					this.blockOrder.push({ kind: "usage", id: `usage-${event.seq}`, scope: "message", usage: event.usage, model: event.model });
+				} else {
+					this.runUsage = event.usage;
+					this.blockOrder.push({
+						kind: "usage",
+						id: `usage-${event.seq}`,
+						scope: "run",
+						usage: event.usage,
+						model: event.model, //IYH1HC stream add(w2)
+						contextTokens: event.contextTokens,
+						contextWindow: event.contextWindow,
+					});
+				}
+				this.scheduleCommit();
+				break;
+			}
+			case "compaction": {
+				this.structuredSeen = true;
+				if (event.phase === "start") {
+					this.blockOrder.push({
+						kind: "event",
+						id: `compaction-${event.seq}`,
+						variant: "compaction",
+						text: `Compacting context${event.reason ? ` (${event.reason})` : ""}...`,
+					});
+				} else {
+					this.blockOrder.push({
+						kind: "event",
+						id: `compaction-${event.seq}`,
+						variant: "compaction",
+						text: event.aborted
+							? "Compaction aborted"
+							: `Compaction complete${event.tokensBefore ? ` (${this.formatTokenCount(event.tokensBefore)} tokens before)` : ""}`,
+					});
+				}
+				this.scheduleCommit();
+				break;
+			}
+			case "retry": {
+				this.structuredSeen = true;
+				this.blockOrder.push({
+					kind: "event",
+					id: `retry-${event.seq}`,
+					variant: "retry",
+					text: `Retrying (${event.attempt}/${event.maxAttempts})${event.errorMessage ? `: ${event.errorMessage}` : ""}`,
+				});
+				this.scheduleCommit();
+				break;
+			}
 		}
 	}
 
@@ -539,6 +1011,7 @@ export class CoreServiceChatPanel extends LitElement {
 											.onSend=${(text: string, attachments: Attachment[]) => this.handleSend(text, attachments)}
 											.onAbort=${() => this.handleAbort()}
 										></message-editor>
+										${this.renderPoweredBy()}
 									</div>
 								</div>
 							`
@@ -568,6 +1041,7 @@ export class CoreServiceChatPanel extends LitElement {
 											.onSend=${(text: string, attachments: Attachment[]) => this.handleSend(text, attachments)}
 											.onAbort=${() => this.handleAbort()}
 										></message-editor>
+										${this.renderPoweredBy()}
 									</div>
 								</div>
 							`
@@ -640,6 +1114,8 @@ export class CoreServiceChatPanel extends LitElement {
 
 	private renderFileRightPanel(f: FileRef) {
 		const name = f.title || f.path.split("/").pop() || f.path;
+		//IYH1HC add: the header now also carries a download anchor (icon) next to "open ↗"
+		// so the previewed file can be saved locally without leaving the panel.
 		return html`
 			<div
 				class="w-1.5 shrink-0 cursor-col-resize border-l border-border bg-background hover:bg-accent"
@@ -654,6 +1130,12 @@ export class CoreServiceChatPanel extends LitElement {
 							<a href=${this.rightPanelArtifactUrl} target="_blank" rel="noopener"
 								class="text-xs text-muted-foreground hover:text-foreground">open ↗</a>
 						` : ""}
+						<a
+							href=${this.fileDownloadUrl(f)}
+							download=${name}
+							title="Download"
+							class="inline-flex text-muted-foreground hover:text-foreground"
+						>${icon(Download, "sm")}</a>
 						<button class="text-muted-foreground hover:text-foreground"
 							@click=${() => { this.rightPanelFile = null; }}>✕</button>
 					</div>
@@ -729,27 +1211,81 @@ export class CoreServiceChatPanel extends LitElement {
 		`;
 	}
 
+	//IYH1HC add: 1–2 letter initials from a display name (e.g. "Dat Chien" -> "DC", "Hien" -> "HI").
+	private senderInitials(name: string): string {
+		const parts = name.trim().split(/\s+/).filter(Boolean);
+		if (parts.length === 0) return "U";
+		if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+		return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+	}
+
+	//IYH1HC add: round avatar with the user's initials.
+	private renderUserAvatar() {
+		return html`
+			<div class="h-8 w-8 shrink-0 rounded-full bg-primary/15 text-primary text-xs font-semibold flex items-center justify-center">
+				${this.senderInitials(this.userName || "You")}
+			</div>
+		`;
+	}
+
+	//IYH1HC add: round avatar marking the assistant.
+	private renderAgentAvatar() {
+		return html`
+			<div class="h-8 w-8 shrink-0 rounded-full bg-primary text-primary-foreground flex items-center justify-center">
+				${icon(Sparkles, "sm")}
+			</div>
+		`;
+	}
+
 	private renderMessage(msg: ChatMessage) {
+		//IYH1HC comment: user/assistant messages now lead with an avatar + sender name for clarity.
 		if (msg.role === "user") {
+			//IYH1HC comment: user messages align to the RIGHT (avatar on the right), agent stays on the left.
 			return html`
-				<div class="flex justify-start mx-4">
-					<div class="user-message-container py-2 px-4 rounded-xl flex flex-col gap-2">
-						${msg.attachments?.map((name) => html`
-							<div class="flex items-center gap-1.5 text-xs opacity-70">
-								<span>📎</span><span class="truncate max-w-xs">${name}</span>
-							</div>
-						`)}
-						<markdown-block .content=${msg.text}></markdown-block>
+				<div class="flex flex-row-reverse gap-3 mx-4">
+					${this.renderUserAvatar()}
+					<div class="flex flex-col gap-1 min-w-0 items-end">
+						<span class="text-xs font-semibold text-foreground">${this.userName || "You"}</span>
+						<div class="user-message-container self-end py-2 px-4 rounded-xl flex flex-col gap-2">
+							${msg.attachments?.map((name) => html`
+								<div class="flex items-center gap-1.5 text-xs opacity-70">
+									<span>📎</span><span class="truncate max-w-xs">${name}</span>
+								</div>
+							`)}
+							<markdown-block .content=${msg.text}></markdown-block>
+						</div>
 					</div>
 				</div>
 			`;
 		}
 		if (msg.role === "assistant") {
+			//IYH1HC stream add: structured trail rendering takes precedence — blocks already
+			// contain text/thinking/tool detail in order; legacy text/thread is the fallback.
+			if (msg.blocks && msg.blocks.length > 0) {
+				//IYH1HC stream add(w2): replay carries usage/model on the message (live runs
+				// already have usage chips inside blocks — don't double-render).
+				const hasUsageBlock = msg.blocks.some((b) => b.kind === "usage");
+				return html`
+					<div class="flex gap-3 px-4">
+						${this.renderAgentAvatar()}
+						<div class="flex flex-col gap-2 flex-1 min-w-0">
+							<span class="text-xs font-semibold text-foreground">${this.agentName}</span>
+							${this.renderBlocks(msg.blocks)}
+							${!hasUsageBlock && msg.usage ? this.renderUsageChip(msg.usage, msg.model) : ""}
+							${msg.files?.map((f) => this.renderFile(f))}
+						</div>
+					</div>
+				`;
+			}
 			return html`
-				<div class="px-4 flex flex-col gap-3">
-					${msg.text ? html`<markdown-block .content=${msg.text}></markdown-block>` : ""}
-					${msg.thread ? this.renderThread(msg.thread) : ""}
-					${msg.files?.map((f) => this.renderFile(f))}
+				<div class="flex gap-3 px-4">
+					${this.renderAgentAvatar()}
+					<div class="flex flex-col gap-2 flex-1 min-w-0">
+						<span class="text-xs font-semibold text-foreground">${this.agentName}</span>
+						${msg.text ? html`<markdown-block .content=${msg.text}></markdown-block>` : ""}
+						${msg.thread ? this.renderThread(msg.thread) : ""}
+						${msg.files?.map((f) => this.renderFile(f))}
+					</div>
 				</div>
 			`;
 		}
@@ -763,12 +1299,36 @@ export class CoreServiceChatPanel extends LitElement {
 		return "";
 	}
 
+	//IYH1HC add: build a direct download URL for a chat file chip — the /file endpoint
+	// already supports ?download=1 (Content-Disposition: attachment); auth rides on the
+	// session cookie, same as the file viewer's existing Download anchor.
+	private fileDownloadUrl(f: FileRef): string {
+		return `${this.baseUrl}/file?path=${encodeURIComponent(f.path)}&download=1`;
+	}
+
 	private renderFile(f: FileRef) {
 		const name = f.title || f.path.split("/").pop() || f.path;
 		const isActive = this.rightPanelFile?.path === f.path;
+		//IYH1HC comment: the chip was a single <button>; an anchor cannot legally nest inside
+		// a button, so the outer element becomes a clickable <div> to host the download link.
+		//IYH1HC comment return html`
+		//IYH1HC comment 	<button
+		//IYH1HC comment 		class="flex items-center gap-2 px-3 py-2 rounded-lg border text-sm text-left transition-colors
+		//IYH1HC comment 			${isActive
+		//IYH1HC comment 				? "border-primary bg-primary/10 text-primary"
+		//IYH1HC comment 				: "border-border bg-muted/30 hover:bg-muted/60 text-foreground"}"
+		//IYH1HC comment 		@click=${() => this.openRightPanel(f)}
+		//IYH1HC comment 	>
+		//IYH1HC comment 		<span>📄</span>
+		//IYH1HC comment 		<span class="truncate">${name}</span>
+		//IYH1HC comment 		<span class="ml-auto text-xs text-muted-foreground shrink-0">open ↗</span>
+		//IYH1HC comment 	</button>
+		//IYH1HC comment `;
+		//IYH1HC add: outer div keeps the old chip look; the download anchor stops propagation
+		// so clicking it saves the file without opening the preview panel.
 		return html`
-			<button
-				class="flex items-center gap-2 px-3 py-2 rounded-lg border text-sm text-left transition-colors
+			<div
+				class="flex items-center gap-2 px-3 py-2 rounded-lg border text-sm text-left cursor-pointer transition-colors
 					${isActive
 						? "border-primary bg-primary/10 text-primary"
 						: "border-border bg-muted/30 hover:bg-muted/60 text-foreground"}"
@@ -777,26 +1337,235 @@ export class CoreServiceChatPanel extends LitElement {
 				<span>📄</span>
 				<span class="truncate">${name}</span>
 				<span class="ml-auto text-xs text-muted-foreground shrink-0">open ↗</span>
-			</button>
+				<a
+					href=${this.fileDownloadUrl(f)}
+					download=${name}
+					title="Download"
+					class="inline-flex text-muted-foreground hover:text-foreground shrink-0"
+					@click=${(e: Event) => e.stopPropagation()}
+				>${icon(Download, "sm")}</a>
+			</div>
 		`;
 	}
 
 	private renderStreaming() {
-		const hasContent = this.streamingText || this.streamingThread || this.streamingFiles.length > 0;
+		//IYH1HC stream comment const hasContent = this.streamingText || this.streamingThread || this.streamingFiles.length > 0;
+		const hasContent = this.streamingText || this.streamingThread || this.streamingFiles.length > 0 || this.streamingBlocks.length > 0; //IYH1HC stream add
 
+		//IYH1HC comment: streaming output now shares the assistant avatar + name layout for consistency.
 		if (!hasContent) {
 			const label = this.streamingStatus || "thinking";
-			return html`<div class="px-4 text-sm text-muted-foreground italic animate-pulse">${label}...</div>`;
+			return html`
+				<div class="flex gap-3 px-4">
+					${this.renderAgentAvatar()}
+					<div class="flex flex-col gap-1 min-w-0">
+						<span class="text-xs font-semibold text-foreground">${this.agentName}</span>
+						<div class="text-sm text-muted-foreground italic animate-pulse">${label}...</div>
+					</div>
+				</div>
+			`;
 		}
 		return html`
-			<div class="px-4 flex flex-col gap-3">
-				${this.streamingStatus
-					? html`<div class="text-xs text-muted-foreground italic">${this.streamingStatus}...</div>`
-					: ""}
-				${this.streamingText ? html`<markdown-block .content=${this.streamingText}></markdown-block>` : ""}
-				${this.streamingThread ? this.renderThread(this.streamingThread) : ""}
-				${this.streamingFiles.map((f) => this.renderFile(f))}
+			<div class="flex gap-3 px-4">
+				${this.renderAgentAvatar()}
+				<div class="flex flex-col gap-2 flex-1 min-w-0">
+					<span class="text-xs font-semibold text-foreground">${this.agentName}</span>
+					${this.streamingBlocks.length > 0 ? this.renderBlocks(this.streamingBlocks, true) : ""}
+					${this.streamingText ? html`<markdown-block .content=${this.streamingText}></markdown-block>` : ""}
+					${this.streamingThread ? this.renderThread(this.streamingThread) : ""}
+					${this.streamingFiles.map((f) => this.renderFile(f))}
+					${this.renderStreamingStatusBar()}
+				</div>
 			</div>
+		`;
+	}
+
+	//IYH1HC stream add(w2): centered branding footer under the message editor
+	private renderPoweredBy() {
+		return html`
+			<div class="text-center text-[11px] text-muted-foreground pt-1.5">
+				<a
+					href="https://inside-docupedia.bosch.com/confluence2/spaces/octo/pages/1130492559/Octo+-+AI+Agent+Framework"
+					target="_blank"
+					rel="noopener"
+					class="hover:text-foreground hover:underline"
+				>Powered by Octo AI</a>
+			</div>
+		`;
+	}
+
+	//IYH1HC stream add: structured trail rendering ---------------------------------------
+
+	/** Live status bar: spinner + status label + elapsed time + ticking token counter. */
+	private renderStreamingStatusBar() {
+		const label = this.streamingStatus || "working";
+		return html`
+			<div class="flex items-center gap-2 text-xs text-muted-foreground pt-1">
+				<span class="animate-spin inline-flex">${icon(Loader, "sm")}</span>
+				<span class="italic">${label}...</span>
+				${this.currentModel ? html`<span class="px-1.5 py-0.5 rounded bg-muted/60 text-[10px]">${this.currentModel}</span>` : ""}
+				${this.elapsedSec > 0 ? html`<span>${this.elapsedSec}s</span>` : ""}
+				${this.liveTokenLabel
+					? html`<span class="inline-flex items-center gap-0.5">${icon(Zap, "sm")}${this.liveTokenLabel}</span>`
+					: ""}
+			</div>
+		`;
+	}
+
+	private renderBlocks(blocks: StreamBlock[], streaming = false) {
+		return html`
+			<div class="flex flex-col gap-1.5">
+				${blocks.map((b) => this.renderBlock(b, streaming))}
+			</div>
+		`;
+	}
+
+	private renderBlock(block: StreamBlock, streaming: boolean) {
+		switch (block.kind) {
+			case "thinking":
+				return html`<thinking-block .content=${block.content} .isStreaming=${streaming && block.streaming}></thinking-block>`;
+			case "text":
+				return html`<markdown-block .content=${block.content}></markdown-block>`;
+			case "tool":
+				return this.renderToolBlock(block);
+			case "event":
+				return html`<div class="py-0.5 text-xs italic text-muted-foreground">${block.text}</div>`;
+			case "usage":
+				//IYH1HC stream comment return block.scope === "run" ? this.renderRunUsageSummary(block) : this.renderUsageChip(block.usage);
+				return block.scope === "run" ? this.renderRunUsageSummary(block) : this.renderUsageChip(block.usage, block.model); //IYH1HC stream add(w2)
+		}
+	}
+
+	private renderToolStatusIcon(status: Extract<StreamBlock, { kind: "tool" }>["status"]) {
+		switch (status) {
+			case "calling":
+			case "running":
+				return html`<span class="animate-spin inline-flex text-muted-foreground">${icon(Loader, "sm")}</span>`;
+			case "done":
+				return html`<span class="inline-flex text-green-600">${icon(Check, "sm")}</span>`;
+			case "error":
+				return html`<span class="inline-flex text-destructive">${icon(X, "sm")}</span>`;
+			case "aborted":
+				return html`<span class="inline-flex text-muted-foreground">⊘</span>`;
+		}
+	}
+
+	private renderToolBlock(block: Extract<StreamBlock, { kind: "tool" }>) {
+		const duration = block.durationMs !== undefined ? ` (${(block.durationMs / 1000).toFixed(1)}s)` : "";
+		const statusText = block.status === "calling" ? " — preparing" : block.status === "running" ? " — running" : block.status === "aborted" ? " — aborted" : "";
+		const argsJson = block.args && Object.keys(block.args).length > 0 ? JSON.stringify(block.args, null, 2) : "";
+		const bodyResult = block.result ?? block.partialResult ?? "";
+		const hasBody = argsJson || bodyResult;
+
+		const header = html`
+			<span class="inline-flex items-center gap-1.5 min-w-0">
+				${this.renderToolStatusIcon(block.status)}
+				<span class="font-medium">${block.toolName}</span>
+				${block.label ? html`<span class="truncate text-muted-foreground">: ${block.label}</span>` : ""}
+				<span class="text-muted-foreground shrink-0">${duration}${statusText}</span>
+				${block.skill
+					? html`<span class="shrink-0 px-1.5 py-0.5 rounded bg-primary/10 text-primary text-[10px] font-medium" title=${block.skill.path}>skill: ${block.skill.name}</span>`
+					: ""}
+			</span>
+		`;
+
+		if (!hasBody) {
+			return html`<div class="py-0.5 text-sm border-l-2 border-border pl-3">${header}</div>`;
+		}
+		return html`
+			<details class="group border-l-2 border-border pl-3 text-sm">
+				<summary class="cursor-pointer flex items-center gap-1.5 py-0.5 text-foreground/90 hover:text-foreground select-none [&::-webkit-details-marker]:hidden [&::marker]:hidden">
+					<span class="text-[10px] transition-transform duration-150 group-open:rotate-90">▶</span>
+					${header}
+				</summary>
+				<div class="mt-1 ml-3.5 flex flex-col gap-1.5">
+					${argsJson
+						? html`
+							<div class="text-[11px] uppercase tracking-wide text-muted-foreground">Arguments</div>
+							<pre class="text-xs bg-muted/40 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">${argsJson}</pre>`
+						: ""}
+					${bodyResult
+						? html`
+							<div class="text-[11px] uppercase tracking-wide text-muted-foreground">${block.result !== undefined ? "Result" : "Progress"}</div>
+							<pre class="text-xs bg-muted/40 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">${bodyResult}</pre>
+							${block.resultTruncated
+								? html`<div class="text-xs italic text-muted-foreground">Result truncated — full text is kept in the session audit trail (trail.jsonl).</div>`
+								: ""}`
+						: ""}
+				</div>
+			</details>
+		`;
+	}
+
+	/** Per-step authoritative usage chip: model / in / out / cache / cost. */
+	//IYH1HC stream comment private renderUsageChip(usage: AgentUsage) {
+	private renderUsageChip(usage: AgentUsage, model?: { provider: string; id: string } | string) { //IYH1HC stream add(w2)
+		const cost = usage.cost?.total ? ` · $${usage.cost.total.toFixed(4)}` : "";
+		const cache = usage.cacheRead || usage.cacheWrite
+			? ` · cache ${this.formatTokenCount(usage.cacheRead)}R/${this.formatTokenCount(usage.cacheWrite)}W`
+			: "";
+		//IYH1HC stream add(w2): which model served this step, shown ahead of the numbers
+		const modelLabel = typeof model === "string" ? model : model?.id ? model.id : "";
+		const modelTitle = typeof model === "object" && model?.provider ? `${model.provider}/${model.id}` : modelLabel;
+		return html`
+			<div class="inline-flex items-center gap-1 self-start px-2 py-0.5 rounded-full bg-muted/50 text-[11px] text-muted-foreground">
+				${icon(Zap, "sm")}
+				${modelLabel ? html`<span class="font-medium text-foreground/70" title=${modelTitle}>${modelLabel}</span><span>·</span>` : ""}
+				<span>↑ ${this.formatTokenCount(usage.input)} · ↓ ${this.formatTokenCount(usage.output)}${cache}${cost}</span>
+			</div>
+		`;
+	}
+
+	/** Final run summary: token + cost breakdown table, context window fill. */
+	private renderRunUsageSummary(block: Extract<StreamBlock, { kind: "usage" }>) {
+		const u = block.usage;
+		const rows: Array<[string, number, number]> = [
+			["Input", u.input, u.cost?.input ?? 0],
+			["Output", u.output, u.cost?.output ?? 0],
+			["Cache read", u.cacheRead, u.cost?.cacheRead ?? 0],
+			["Cache write", u.cacheWrite, u.cost?.cacheWrite ?? 0],
+		];
+		const totalTokens = u.input + u.output + u.cacheRead + u.cacheWrite;
+		const context = block.contextTokens && block.contextWindow
+			? `${this.formatTokenCount(block.contextTokens)} / ${this.formatTokenCount(block.contextWindow)} context`
+			: block.contextTokens
+				? `${this.formatTokenCount(block.contextTokens)} context`
+				: "";
+		return html`
+			<details class="group border border-border rounded-lg px-3 py-1.5 text-xs self-start min-w-64">
+				<summary class="cursor-pointer flex items-center gap-1.5 select-none text-muted-foreground hover:text-foreground [&::-webkit-details-marker]:hidden [&::marker]:hidden">
+					<span class="text-[10px] transition-transform duration-150 group-open:rotate-90">▶</span>
+					${icon(Zap, "sm")}
+					<span class="font-medium text-foreground">Run summary</span>
+					${block.model?.id ? html`<span class="px-1.5 py-0.5 rounded bg-muted/60 text-[10px]" title=${`${block.model.provider}/${block.model.id}`}>${block.model.id}</span>` : ""}
+					<span>${this.formatTokenCount(totalTokens)} tokens · $${(u.cost?.total ?? 0).toFixed(4)}</span>
+					${context ? html`<span class="text-muted-foreground">· ${context}</span>` : ""}
+				</summary>
+				<table class="mt-1.5 w-full">
+					<thead>
+						<tr class="text-muted-foreground text-left">
+							<th class="font-normal pr-4"></th>
+							<th class="font-normal pr-4 text-right">Tokens</th>
+							<th class="font-normal text-right">Cost</th>
+						</tr>
+					</thead>
+					<tbody>
+						${rows.map(
+							([name, tokens, cost]) => html`
+								<tr>
+									<td class="pr-4">${name}</td>
+									<td class="pr-4 text-right">${tokens.toLocaleString()}</td>
+									<td class="text-right">$${cost.toFixed(4)}</td>
+								</tr>`,
+						)}
+						<tr class="border-t border-border font-medium">
+							<td class="pr-4">Total</td>
+							<td class="pr-4 text-right">${totalTokens.toLocaleString()}</td>
+							<td class="text-right">$${(u.cost?.total ?? 0).toFixed(4)}</td>
+						</tr>
+					</tbody>
+				</table>
+			</details>
 		`;
 	}
 }

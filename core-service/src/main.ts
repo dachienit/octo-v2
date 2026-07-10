@@ -46,8 +46,7 @@ import { downloadChannel } from "./download.js";
 import { createEventsWatcher, createWorkspaceEventsWatcher } from "./events.js";
 import { createHttpContext, HttpServer } from "./http.js";
 import * as log from "./log.js";
-//IYH1HC add: object store mirror for durable sessions/artifacts (A3 part 2).
-import { detectObjectStore, ObjectStoreMirror } from "./object-store.js";
+import { ObjectStoreGateway, resolveObjectStoreGateway } from "./object-store.js";
 import { parseSandboxArg, type SandboxConfig, validateSandbox } from "@octo/core-agent";
 import { markWorkspaceSandboxActive, markWorkspaceSandboxIdle, resolveWorkspaceSandbox, startWorkspaceSandboxIdleCleanup } from "./sandbox-manager.js";
 import { createSlackContext, SlackBot as SlackBotClass } from "./slack.js";
@@ -63,6 +62,15 @@ const MOM_SLACK_APP_TOKEN = process.env.MOM_SLACK_APP_TOKEN;
 const MOM_SLACK_BOT_TOKEN = process.env.MOM_SLACK_BOT_TOKEN;
 const AGENT_WORKERS_ENABLED = !["0", "false", "off", "no"].includes((process.env.CORE_SERVICE_AGENT_WORKERS_ENABLED ?? "true").toLowerCase());
 const REMINDERS_ENABLED = !["0", "false", "off", "no"].includes((process.env.CORE_SERVICE_REMINDERS_ENABLED ?? "true").toLowerCase());
+//IYH1HC add
+const CONNECTION_ENABLED = !["0", "false", "off", "no"].includes((process.env.CORE_SERVICE_CONNECTION_ENABLED ?? "true").toLowerCase());
+//IYH1HC add: optional allowlist of LLM provider ids shown in the UI picker. Unset/empty → all providers.
+const LLM_PROVIDERS_ALLOWLIST = (process.env.CORE_SERVICE_LLM_PROVIDERS ?? "")
+	.split(",")
+	.map((id) => id.trim())
+	.filter(Boolean);
+//IYH1HC add: optional browser tab title for the web app. Unset/empty → keep the index.html default.
+const APP_TITLE = (process.env.CORE_SERVICE_APP_TITLE ?? "").trim();
 
 interface ParsedArgs {
 	workingDir?: string;
@@ -150,35 +158,36 @@ if (!hasSlack && !hasHttp) {
 
 await validateSandbox(sandbox);
 
-//IYH1HC add: A3 part 2 — restore sessions/artifacts from the Object Store BEFORE
-//IYH1HC add: WorkspaceStore reads workingDir. Gating mirrors createAuthStorage:
-//IYH1HC add: bound + reachable → mirror runs regardless of the flag; missing/unreachable
-//IYH1HC add: → CORE_SERVICE_OBJECTSTORE_ALLOW_EPHEMERAL=true warns + runs ephemeral,
-//IYH1HC add: otherwise fail-fast in production (the CF FS is ephemeral; silent loss is worse).
-const osConfig = detectObjectStore();
+// Restore the whole data root from the object store BEFORE WorkspaceStore touches
+// workingDir (its constructor mkdirs and writes default templates) and before
+// auth.sqlite is opened (inside httpServer.start()). Missing/unreachable gateway →
+// CORE_SERVICE_OBJECTSTORE_ALLOW_EPHEMERAL=true warns + runs ephemeral, otherwise
+// fail-fast in production (the CF FS is ephemeral; silent loss is worse).
 const allowObjectStoreEphemeral = process.env.CORE_SERVICE_OBJECTSTORE_ALLOW_EPHEMERAL === "true";
-let objectStore: ObjectStoreMirror | undefined;
-if (osConfig) {
-	const mirror = new ObjectStoreMirror({ config: osConfig, dataRoot: workingDir });
+let objectStore: ObjectStoreGateway | undefined;
+const gateway = resolveObjectStoreGateway(workingDir); // throws on gateway URL without prefix
+if (gateway) {
 	try {
-		await mirror.verify();
-		await mirror.restore();
-		objectStore = mirror;
-		console.log(`[object-store] backend enabled (bucket ${mirror.bucketName}), workspace tree restored`);
+		await gateway.verify();
+		await gateway.restore();
+		objectStore = gateway;
+		console.log(`[object-store] gateway enabled (${gateway.bucketName}); tree restored at boot`);
 	} catch (err) {
 		if (process.env.NODE_ENV === "production" && !allowObjectStoreEphemeral) throw err;
+		// objectStore stays undefined: never snapshot a tree we failed to restore —
+		// uploading from a fresh empty data root would clobber the bucket contents.
 		console.warn(
-			"[object-store] WARNING: object store unreachable, running with ephemeral sessions/artifacts:",
+			"[object-store] WARNING: verify/restore failed, running ephemeral (mirror disabled):",
 			err instanceof Error ? err.message : err,
 		);
 	}
 } else if (process.env.NODE_ENV === "production" && !allowObjectStoreEphemeral) {
 	throw new Error(
-		"[object-store] No objectstore binding while NODE_ENV=production — bind taf-objectstore " +
-			"or set CORE_SERVICE_OBJECTSTORE_ALLOW_EPHEMERAL=true to accept ephemeral sessions/artifacts.",
+		"[object-store] No CORE_SERVICE_OBJECTSTORE_GATEWAY_URL while NODE_ENV=production — set it to the " +
+			"objectstore-service route or set CORE_SERVICE_OBJECTSTORE_ALLOW_EPHEMERAL=true to accept an ephemeral data root.",
 	);
 } else {
-	console.log("[object-store] no binding — workspace tree is ephemeral");
+	console.log("[object-store] no gateway URL — data root is ephemeral");
 }
 
 const workspaceStore = new WorkspaceStore(workingDir);
@@ -338,12 +347,6 @@ const handler: BotHandler = {
 			} finally {
 				state.running = false;
 				markWorkspaceSandboxIdle(sandbox, { workspaceId: state.workspaceId, image: workspaceImage });
-				//IYH1HC add: snapshot this run's sessions/artifacts to the Object Store.
-				//IYH1HC add: Fire-and-forget so the session queue isn't blocked; the mirror
-				//IYH1HC add: serializes overlapping snapshots internally.
-				// void objectStore ?.snapshot({ workspaceId: state.workspaceId, sessionId: channelId })
-				//	.catch((err) => log.logWarning("[object-store] run-end snapshot error", err instanceof Error ? err.message : String(err)));
-				
 			}
 		});
 		state.queue = run.catch(() => {});
@@ -435,10 +438,13 @@ if (hasHttp) {
 		workingDir,
 		workspaceStore,
 		sandboxConfig: sandbox,
-		features: { agentWorkers: AGENT_WORKERS_ENABLED, reminders: REMINDERS_ENABLED },
+		features: { agentWorkers: AGENT_WORKERS_ENABLED, reminders: REMINDERS_ENABLED, connection: CONNECTION_ENABLED, llmProviders: LLM_PROVIDERS_ALLOWLIST.length > 0 ? LLM_PROVIDERS_ALLOWLIST : null, appTitle: APP_TITLE || null }, //IYH1HC add connection + llmProviders allowlist + appTitle
 		handler,
 		//IYH1HC add: expose mirror state at GET /objectstore/status (undefined → ephemeral).
 		getObjectStoreStatus: () => objectStore?.status(),
+		//IYH1HC add: gateway store instance for the fire-and-forget workspace snapshot on
+		//IYH1HC add: workspace tree reads (the UI refresh button path).
+		objectStore,
 	});
 	await httpServer.start(); //IYH1HC comment: await — start() is now async (auth storage bootstrap)
 }
@@ -470,20 +476,6 @@ if (hasSlack) {
 	bot.start();
 }
 
-//IYH1HC add: periodic full snapshot so changes between run-end snapshots (and any
-//IYH1HC add: file written outside a run) reach the bucket. <=0 disables. The mirror
-//IYH1HC add: serializes against run-end snapshots, so overlaps are safe.
-//const snapshotIntervalMs = parsePositiveIntEnv("CORE_SERVICE_OBJECTSTORE_SNAPSHOT_INTERVAL_MS", 300_000);
-let snapshotTimer: NodeJS.Timeout | undefined;
-/* if (objectStore && snapshotIntervalMs > 0) {
-	snapshotTimer = setInterval(() => {
-		void objectStore ?.snapshot()
-			.catch((err) => log.logWarning("[object-store] interval snapshot error", err instanceof Error ? err.message : String(err)));
-	}, snapshotIntervalMs);
-	snapshotTimer.unref?.();
-	log.logInfo(`Object store snapshot interval enabled (${snapshotIntervalMs}ms)`);
-} */
-
 // Handle shutdown
 //IYH1HC add: shared async shutdown so SIGINT/SIGTERM both flush a final snapshot
 //IYH1HC add: (best-effort within CF's ~10s grace) before exiting.
@@ -492,8 +484,10 @@ async function shutdown(): Promise<void> {
 	stopSandboxIdleCleanup?.();
 	eventsWatcher?.stop();
 	workspaceEventsWatcher?.stop();
-	if (snapshotTimer) clearInterval(snapshotTimer);
 	try {
+		// Full-tree snapshot with delete-sync. Chains behind any in-flight refresh
+		// snapshot; mtime stamps limit the upload to changed files, so this fits
+		// CF's ~10s SIGTERM grace in the normal case.
 		await objectStore?.snapshot();
 	} catch (err) {
 		log.logWarning("[object-store] shutdown snapshot error", err instanceof Error ? err.message : String(err));
